@@ -142,6 +142,32 @@ Two operational findings from this work:
   model fails with `no ANE resources (transient; retry)` (status 0x5) while
   another holds its kernels. The shim now retries with exponential backoff.
 
+## Model formats
+
+The same model in both formats produces the same text on the ANE:
+
+| format | file | decode |
+|---|---|---|
+| GGUF Q8_0 | `smollm2-135m-q8_0.gguf` (145 MB) | 25–30 tok/s |
+| HF safetensors F16 | `SmolLM2-135M-Instruct/` (269 MB) | 28–32 tok/s |
+
+F16 is faster because it skips the Q8_0 → fp16 conversion and can use the
+embedding straight from the mapping.
+
+## int8 weights: negative result
+
+`constexpr_affine_dequantize` — the MIL op CoreML uses for quantised weights —
+is rejected by `ANECCompile` with `InvalidMILProgram` in every configuration
+tried: two container layouts (the fp16 chunk format and maderix's int8 header),
+three `axis` values, and an fp16-input control that isolates the op from the
+dtype. The control also fails, so the op is absent from this ANE's MIL dialect
+rather than merely int8 being unsupported. This matches the prior art (Orion:
+"quantization is not yet supported"; Espresso: "INT8/quantized weights:
+unsupported"). Reproduce with `probe/ane_int8_probe.m`.
+
+Consequence: weight traffic stays fp16, and the measured ~12–15 GB/s of weight
+bandwidth remains the decode ceiling.
+
 ## Bugs found and fixed during development
 
 These are worth recording because each one produced *plausible-looking* output

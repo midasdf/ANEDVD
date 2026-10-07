@@ -13,7 +13,8 @@ this program. *Vandal* — it drives the ANE through undocumented private
 frameworks, which Apple does not support and App Store review rejects.
 
 It loads **GGUF** models (Q8_0, Q4_0/1, Q5_0/1, F16, F32, BF16, K-quants where
-implemented), generates text from the CLI, and serves an OpenAI- and
+implemented) and **HuggingFace directories** (safetensors + `config.json` +
+`tokenizer.json`), generates text from the CLI, and serves an OpenAI- and
 Anthropic-compatible HTTP API with a built-in WebUI.
 
 ## Verified on this machine
@@ -42,6 +43,8 @@ decode: 40 tokens in 1.57 s (25.4 tok/s)
 ANE: 6776 evals, 1293.2 ms total, 23.09 ms/token (82% of wall time)
 ```
 
+* **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at 25–30 tok/s, HF
+  safetensors F16 at 28–32 tok/s (no dequantisation), same output.
 * **SmolLM2-135M-Instruct (Q8_0)**: 30 layers, 121 ANE kernels, **25.4 tok/s** decode.
 * **Qwen2.5-0.5B-Instruct (Q8_0)**: 24 layers, 97 ANE kernels, **10.1 tok/s** decode,
   GQA + QKV biases + RoPE θ=10⁶ — answers "The capital of France is Paris."
@@ -91,9 +94,14 @@ crashes on ARC Objective-C), Zig 0.17.
 | `anedvd bench` | matmul throughput sweep (128 … 4096) |
 | `anedvd selftest` | tiny transformer: ANE engine vs CPU reference |
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
-| `anedvd run --model <m.gguf> --prompt "…" [--max-tokens N] [--temp T] [--top-k K]` | generate text on the ANE |
+| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K]` | generate text on the ANE |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |
 | `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
+
+`--model` accepts either a `.gguf` file or a HuggingFace model directory
+(`model.safetensors` + `config.json` + `tokenizer.json`, multi-shard aware).
+The format is chosen by the path: anything ending in `.gguf` is read as GGUF,
+everything else as an HF directory.
 
 Overrides for unusual models: `--rope-hf` / `--rope-adjacent` force the RoPE
 convention, `--fuse` enables the experimental fused FFN.
@@ -305,10 +313,17 @@ quantisation rather than unified memory:
    product is a 1×1 `conv`.
 3. **`sigmoid` and `mul` do compile** (used by the experimental fused FFN), but
    see the known issue below.
-4. **Compile budget**: 121 `ANECCompile()` calls in one process worked here.
+4. **int8 weights are not reachable.** `constexpr_affine_dequantize` is rejected
+   with `InvalidMILProgram` for every layout and axis tried — including with an
+   fp16 input, so the op itself is unavailable in this MIL dialect, not just the
+   int8 dtype. That matches Orion ("quantization not yet supported") and
+   Espresso ("INT8/quantized weights: unsupported"). See
+   [`probe/ane_int8_probe.m`](probe/ane_int8_probe.m) to reproduce. Weight
+   bandwidth therefore stays at fp16: ~12–15 GB/s, the current ceiling.
+5. **Compile budget**: 121 `ANECCompile()` calls in one process worked here.
    Published reports put the daemon's limit near 119 on M4/macOS 15, so the
    engine keeps the per-layer kernel count low and reports `ane.compileCount()`.
-5. **The RoPE convention is architecture-dependent — and getting it wrong does
+6. **The RoPE convention is architecture-dependent — and getting it wrong does
    not produce garbage, it produces fluent repetition.** `convert_hf_to_gguf.py`
    permutes Q/K rows of Llama-family models into llama.cpp's *adjacent-pair*
    layout (`LLAMA_ROPE_TYPE_NORM`), while Qwen2 (and other `rotate_half`
@@ -318,18 +333,18 @@ quantisation rather than unified memory:
    architecture table lives in
    [`src/load_gguf.zig`](src/load_gguf.zig) (`ropeIsAdjacent`), and
    `--rope-hf` / `--rope-adjacent` override it.
-6. **Qwen2 adds biases to Q/K/V** (`attn_q.bias` …); Llama does not. Missing them
+7. **Qwen2 adds biases to Q/K/V** (`attn_q.bias` …); Llama does not. Missing them
    yields multilingual garbage rather than an error. They are applied after the
    ANE projection (a vector add is not worth a kernel).
-7. **The ANE program pool is global.** Two processes cannot each hold a full
+8. **The ANE program pool is global.** Two processes cannot each hold a full
    model's kernels; the second gets a transient "no ANE resources" error. See
    the unified-memory section above.
-8. **Throughput is weight-bandwidth-bound**: a 4096×4096 fp16 matmul runs in
+9. **Throughput is weight-bandwidth-bound**: a 4096×4096 fp16 matmul runs in
    1.41 ms ≈ 24 GFLOP/s (≈12 GB/s of weights), while a 128×128 matmul takes
    81 µs — almost all of it launch overhead. Qwen2.5-0.5B's 66.8 ms/token is
    ≈15 GB/s of fp16 weights: the ANE's DRAM share, not the MAC array, is the
    ceiling. Quantised weights are the only large win left.
-9. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
+10. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
    the ANE's generated text token-for-token on both models.
 
 ## Known issues
@@ -343,12 +358,8 @@ quantisation rather than unified memory:
   `sigmoid`/`mul`/multi-conv programs the ANE mis-handles is the main open item.
 * K-quants are implemented but only lightly exercised; Q8_0/Q4_0/F16 are the
   best-tested paths.
-* HF safetensors loading exists and is tested ([`src/safetensors.zig`](src/safetensors.zig),
-  [`src/hf.zig`](src/hf.zig), cross-checked against real checkpoints) but is not
-  wired into the engine — only the GGUF path can generate today. The tokenizer
-  already reads HF `tokenizer.json`, so the remaining work is name mapping
-  (`model.layers.N.self_attn.q_proj.weight` → the engine's layer struct) and a
-  `config.json` → `model.Config` adapter.
+* `check` and `cpu` are still GGUF-only (`run`, `serve` and `selftest` handle
+  both formats). Wiring `check`'s per-kernel diff to `model_open` is mechanical.
 * The engine keeps the KV cache in fp32 on the CPU; attention is CPU-bound for
   long contexts.
 
@@ -363,7 +374,8 @@ quantisation rather than unified memory:
 | [`src/engine.zig`](src/engine.zig) | transformer decode loop, kernel construction |
 | [`src/cpu.zig`](src/cpu.zig) | RMSNorm, RoPE (both conventions), attention, SwiGLU, sampling |
 | [`src/gguf.zig`](src/gguf.zig) | GGUF v2/v3 reader + dequantisation (15 ggml types, bit-exact vs ggml) |
-| [`src/load_gguf.zig`](src/load_gguf.zig) | GGUF → `ModelWeights`: config keys, weight layout, RoPE convention, biases |
+| [`src/load_gguf.zig`](src/load_gguf.zig) | GGUF → runtime weights + per-layer matrices |
+| [`src/load_hf.zig`](src/load_hf.zig), [`src/model_open.zig`](src/model_open.zig) | HF safetensors → the same, plus format detection for `--model` |
 | [`src/tokenizer.zig`](src/tokenizer.zig) | byte-level BPE from GGUF vocab or HF `tokenizer.json` |
 | [`src/safetensors.zig`](src/safetensors.zig), [`src/hf.zig`](src/hf.zig) | HF checkpoint + `config.json` readers (not yet wired) |
 | [`docs/RESULTS.md`](docs/RESULTS.md) | measurements, accuracy tables, and the bugs found |

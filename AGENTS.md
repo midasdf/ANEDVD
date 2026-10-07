@@ -21,9 +21,10 @@ measurements live in `docs/RESULTS.md`.
 | `src/webui.html` | built-in chat UI, embedded with `@embedFile` |
 | `src/cpu.zig` | RMSNorm, RoPE (adjacent + half-split), attention, SwiGLU, sampling |
 | `src/model.zig` | format-independent `Config` / `LayerWeights` / `ModelWeights` |
-| `src/load_gguf.zig` | GGUF → `ModelWeights` (config keys, RoPE convention, biases) |
+| `src/load_gguf.zig`, `src/load_hf.zig` | format → runtime weights + per-layer matrices |
+| `src/model_open.zig` | `--model` accepts a .gguf file or an HF directory |
 | `src/gguf.zig`, `src/tokenizer.zig` | GGUF reader + 15 ggml dequantisers; byte-level BPE |
-| `src/safetensors.zig`, `src/hf.zig` | HF checkpoint readers (tested, **not wired into the engine**) |
+| `src/safetensors.zig`, `src/hf.zig` | HF checkpoint + config.json readers |
 | `src/sys.zig`, `src/buf.zig` | libc-based file IO + LE readers; growable byte buffer |
 | `probe/*.m` | standalone Objective-C probes that established the ANE facts |
 | `research/*.md` | extracted Orion constraints, Espresso API notes, entitlement analysis |

@@ -655,24 +655,24 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     }
 
     sys.print("loading {s}\n", .{model_path});
-    var g = try gguf.Gguf.load(allocator, model_path);
-    defer g.deinit();
-    var tok = try tokenizer_mod.Tokenizer.fromGguf(allocator, &g);
-    defer tok.deinit();
-    const cfg = try load_gguf.loadConfig(&g);
-    sys.print("  {s}: {d} layers, hidden {d}, vocab {d}\n", .{ cfg.arch, cfg.layers, cfg.hidden, cfg.vocab });
-
     const t_rt0 = sys.nowNs();
-    var rt = try load_gguf.loadRuntime(allocator, &g, cfg, false);
+    var loaded = try model_open.open(allocator, model_path, .{
+        .progress = true,
+        .rope_hf = rope_hf,
+        .rope_adjacent = rope_adj,
+    });
+    defer loaded.deinit();
     const t_rt1 = sys.nowNs();
-    if (rope_hf) rt.config.rope_adjacent = false;
-    if (rope_adj) rt.config.rope_adjacent = true;
-    sys.print("  rope: {s}\n", .{if (rt.config.rope_adjacent) "adjacent pairs (llama.cpp NORM)" else "half-split (llama.cpp NEOX)"});
-    if (rt.norms.len > 0 and rt.norms[0].qkv_bias != null) sys.print("  attention biases: present\n", .{});
-    var layers_src = load_gguf.GgufLayers{ .g = &g, .cfg = rt.config };
-    var head_src = load_gguf.GgufHead{ .g = &g, .cfg = rt.config, .embed = rt.embed };
+    const tok = &loaded.tokenizer;
+    const cfg = loaded.config;
+    sys.print("  {s} ({s}): {d} layers, hidden {d}, vocab {d}\n", .{
+        cfg.arch, if (loaded.format == .gguf) "GGUF" else "safetensors", cfg.layers, cfg.hidden, cfg.vocab,
+    });
+    sys.print("  rope: {s}\n", .{if (cfg.rope_adjacent) "adjacent pairs (llama.cpp NORM)" else "half-split (llama.cpp NEOX)"});
+    if (loaded.rt.norms.len > 0 and loaded.rt.norms[0].qkv_bias != null) sys.print("  attention biases: present\n", .{});
+
     const t_c0 = sys.nowNs();
-    var eng = try engine_mod.Engine.init(allocator, rt, layers_src.source(), head_src.source(), .{
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
         .max_seq = 1024,
         .verbose = true,
         .fuse_ffn = fuse,
@@ -680,7 +680,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     defer eng.deinit();
     const t_c1 = sys.nowNs();
     sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
-    sys.print("  startup: runtime {d:.2} s + kernels {d:.2} s\n", .{
+    sys.print("  startup: weights {d:.2} s + kernels {d:.2} s\n", .{
         @as(f64, @floatFromInt(t_rt1 - t_rt0)) / 1e9,
         @as(f64, @floatFromInt(t_c1 - t_c0)) / 1e9,
     });
@@ -854,6 +854,7 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 // ---------------------------------------------------------------------------
 
 const server_mod = @import("server.zig");
+const model_open = @import("model_open.zig");
 const generate_mod = @import("generate.zig");
 
 fn fileStem(path: []const u8) []const u8 {
@@ -869,7 +870,7 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     };
     const host = argStr(argv, "--host") orelse "127.0.0.1";
     const port: u16 = @intCast(argValue(argv, "--port", 8080));
-    const model_name = argStr(argv, "--name") orelse fileStem(model_path);
+    const model_name = argStr(argv, "--name") orelse model_open.modelName(model_path);
     const system = argStr(argv, "--system");
     const max_seq: u32 = argValue(argv, "--max-seq", 2048);
     const default_max_tokens: u32 = argValue(argv, "--max-tokens", 512);
@@ -883,23 +884,20 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     }
 
     sys.print("loading {s}\n", .{model_path});
-    var g = try gguf.Gguf.load(allocator, model_path);
-    defer g.deinit();
-    var tok = try tokenizer_mod.Tokenizer.fromGguf(allocator, &g);
-    defer tok.deinit();
-    const cfg = try load_gguf.loadConfig(&g);
-    sys.print("  {s}: {d} layers, hidden {d}, vocab {d}, rope {s}\n", .{
-        cfg.arch,                                            cfg.layers, cfg.hidden, cfg.vocab,
+    var loaded = try model_open.open(allocator, model_path, .{
+        .progress = true,
+        .rope_hf = rope_hf,
+        .rope_adjacent = rope_adj,
+    });
+    defer loaded.deinit();
+    const tok = &loaded.tokenizer;
+    const cfg = loaded.config;
+    sys.print("  {s} ({s}): {d} layers, hidden {d}, vocab {d}, rope {s}\n", .{
+        cfg.arch,                                            if (loaded.format == .gguf) "GGUF" else "safetensors", cfg.layers, cfg.hidden, cfg.vocab,
         if (cfg.rope_adjacent) "adjacent" else "half-split",
     });
 
-    var rt = try load_gguf.loadRuntime(allocator, &g, cfg, false);
-    if (rope_hf) rt.config.rope_adjacent = false;
-    if (rope_adj) rt.config.rope_adjacent = true;
-
-    var layers_src = load_gguf.GgufLayers{ .g = &g, .cfg = rt.config };
-    var head_src = load_gguf.GgufHead{ .g = &g, .cfg = rt.config, .embed = rt.embed };
-    var eng = try engine_mod.Engine.init(allocator, rt, layers_src.source(), head_src.source(), .{
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
         .max_seq = max_seq,
         .verbose = true,
         .fuse_ffn = fuse,
@@ -907,7 +905,7 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     defer eng.deinit();
     sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
 
-    var session = generate_mod.Session.init(allocator, &eng, &tok);
+    var session = generate_mod.Session.init(allocator, &eng, tok);
     if (tok.eosId()) |eos| {
         const stops = try allocator.alloc(u32, 1);
         stops[0] = eos;

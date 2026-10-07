@@ -1,0 +1,217 @@
+// load_hf.zig — turn a HuggingFace model directory (safetensors + config.json)
+// into the engine's Runtime / LayerSource / HeadSource.
+//
+// Layout: PyTorch stores a linear layer as [out_features, in_features] in C
+// order, which is exactly the ANE 1x1-conv weight layout, so no transpose is
+// needed. RoPE is the HF half-split convention (`rope_adjacent = false`), unlike
+// llama-family GGUF files whose Q/K rows are permuted at conversion time.
+
+const std = @import("std");
+const safetensors = @import("safetensors.zig");
+const hf = @import("hf.zig");
+const model = @import("model.zig");
+const sys = @import("sys.zig");
+
+pub const Error = error{
+    MissingTensor,
+    DimensionMismatch,
+    UnsupportedArchitecture,
+};
+
+/// All safetensors shards of one model directory.
+pub const Shards = struct {
+    allocator: std.mem.Allocator,
+    list: []safetensors.Safetensors,
+
+    pub fn open(allocator: std.mem.Allocator, dir: []const u8) !Shards {
+        const paths = try hf.findShards(allocator, dir);
+        defer hf.freeShards(allocator, paths);
+        const list = try allocator.alloc(safetensors.Safetensors, paths.len);
+        var opened: usize = 0;
+        errdefer {
+            for (list[0..opened]) |*s| s.deinit();
+            allocator.free(list);
+        }
+        for (paths, 0..) |p, i| {
+            list[i] = try safetensors.Safetensors.load(allocator, p);
+            opened += 1;
+        }
+        return .{ .allocator = allocator, .list = list };
+    }
+
+    pub fn deinit(self: *Shards) void {
+        for (self.list) |*s| s.deinit();
+        self.allocator.free(self.list);
+        self.* = undefined;
+    }
+
+    pub fn find(self: *const Shards, name: []const u8) ?safetensors.Tensor {
+        for (self.list) |*s| {
+            if (s.tensor(name)) |t| return t;
+        }
+        return null;
+    }
+
+    pub fn readF16(self: *const Shards, allocator: std.mem.Allocator, name: []const u8) ![]f16 {
+        for (self.list) |*s| {
+            if (s.has(name)) return s.readF16(allocator, name);
+        }
+        return Error.MissingTensor;
+    }
+
+    pub fn readF32(self: *const Shards, allocator: std.mem.Allocator, name: []const u8) ![]f32 {
+        for (self.list) |*s| {
+            if (s.has(name)) return s.readF32(allocator, name);
+        }
+        return Error.MissingTensor;
+    }
+};
+
+/// Translate an HF config into the engine's format-independent config.
+pub fn toModelConfig(c: hf.Config) !model.Config {
+    if (c.intermediate_size == 0) return Error.UnsupportedArchitecture;
+    if (c.hidden_size == 0 or c.num_hidden_layers == 0 or c.num_attention_heads == 0) {
+        return Error.UnsupportedArchitecture;
+    }
+    return .{
+        .arch = if (std.mem.startsWith(u8, c.arch, "Qwen")) "qwen2" else "llama",
+        .hidden = c.hidden_size,
+        .layers = c.num_hidden_layers,
+        .heads = c.num_attention_heads,
+        .kv_heads = c.num_key_value_heads,
+        .head_dim = c.head_dim,
+        .inter = c.intermediate_size,
+        .vocab = c.vocab_size,
+        .eps = c.rms_norm_eps,
+        .rope_theta = c.rope_theta,
+        .tie_embeddings = c.tie_word_embeddings,
+        // HF keeps the rotate_half (half-split) RoPE layout.
+        .rope_adjacent = false,
+    };
+}
+
+/// Load a Linear weight as fp16 in [out][in] order, validating the shape.
+fn linear(allocator: std.mem.Allocator, sh: *const Shards, name: []const u8, in_dim: u32, out_dim: u32) ![]f16 {
+    const t = sh.find(name) orelse return Error.MissingTensor;
+    if (t.numel() != @as(usize, in_dim) * out_dim) return Error.DimensionMismatch;
+    if (t.rank() != 2 or t.shape[0] != out_dim or t.shape[1] != in_dim) return Error.DimensionMismatch;
+    return sh.readF16(allocator, name);
+}
+
+fn norm(allocator: std.mem.Allocator, sh: *const Shards, name: []const u8, n: u32) ![]f32 {
+    const v = try sh.readF32(allocator, name);
+    if (v.len != n) {
+        allocator.free(v);
+        return Error.DimensionMismatch;
+    }
+    return v;
+}
+
+pub fn loadRuntime(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.Config, progress: bool) !model.Runtime {
+    var rt = model.Runtime{ .allocator = allocator, .config = cfg };
+    errdefer rt.deinit();
+    if (progress) sys.print("  runtime weights: embedding + norms\n", .{});
+    rt.embed = try linear(allocator, sh, "model.embed_tokens.weight", cfg.hidden, cfg.vocab);
+    rt.embed_owned = true;
+    rt.final_norm = try norm(allocator, sh, "model.norm.weight", cfg.hidden);
+    rt.norms = try allocator.alloc(model.Norm, cfg.layers);
+    @memset(rt.norms, .{});
+    var buf: [192]u8 = undefined;
+    for (rt.norms, 0..) |*n, i| {
+        const li: u32 = @intCast(i);
+        n.attn = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.input_layernorm.weight", .{li}) catch unreachable, cfg.hidden);
+        n.ffn = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.post_attention_layernorm.weight", .{li}) catch unreachable, cfg.hidden);
+        if (sh.find(std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.bias", .{li}) catch unreachable) != null) {
+            const bq = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.bias", .{li}) catch unreachable);
+            defer allocator.free(bq);
+            const bk = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_proj.bias", .{li}) catch unreachable);
+            defer allocator.free(bk);
+            const bv = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.v_proj.bias", .{li}) catch unreachable);
+            defer allocator.free(bv);
+            if (bq.len + bk.len + bv.len != cfg.qkvDim()) return Error.DimensionMismatch;
+            const all = try allocator.alloc(f32, cfg.qkvDim());
+            @memcpy(all[0..bq.len], bq);
+            @memcpy(all[bq.len..][0..bk.len], bk);
+            @memcpy(all[bq.len + bk.len ..][0..bv.len], bv);
+            n.qkv_bias = all;
+        }
+    }
+    return rt;
+}
+
+pub fn loadLayer(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.Config, index: u32) !model.Matrices {
+    var m = model.Matrices{};
+    errdefer m.deinit(allocator);
+    var buf: [192]u8 = undefined;
+    const q = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.qDim());
+    defer allocator.free(q);
+    const k = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
+    defer allocator.free(k);
+    const v = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.v_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
+    defer allocator.free(v);
+    m.qkv = try allocator.alloc(f16, q.len + k.len + v.len);
+    @memcpy(m.qkv[0..q.len], q);
+    @memcpy(m.qkv[q.len..][0..k.len], k);
+    @memcpy(m.qkv[q.len + k.len ..][0..v.len], v);
+    m.o = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.o_proj.weight", .{index}) catch unreachable, cfg.qDim(), cfg.hidden);
+    m.gate = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.gate_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
+    m.up = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.up_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
+    m.down = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.down_proj.weight", .{index}) catch unreachable, cfg.inter, cfg.hidden);
+    return m;
+}
+
+pub fn loadHead(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.Config, embed: []const f16) !model.HeadWeights {
+    if (sh.find("lm_head.weight") == null) return .{ .data = embed, .owned = false };
+    return .{ .data = try linear(allocator, sh, "lm_head.weight", cfg.hidden, cfg.vocab), .owned = true };
+}
+
+pub const HfLayers = struct {
+    shards: *const Shards,
+    cfg: model.Config,
+
+    pub fn source(self: *HfLayers) model.LayerSource {
+        return .{ .ctx = self, .loadFn = loadFn };
+    }
+    fn loadFn(ctx: *anyopaque, allocator: std.mem.Allocator, index: u32) anyerror!model.Matrices {
+        const self: *HfLayers = @ptrCast(@alignCast(ctx));
+        return loadLayer(allocator, self.shards, self.cfg, index);
+    }
+};
+
+pub const HfHead = struct {
+    shards: *const Shards,
+    cfg: model.Config,
+    embed: []const f16,
+
+    pub fn source(self: *HfHead) model.HeadSource {
+        return .{ .ctx = self, .loadFn = loadFn };
+    }
+    fn loadFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!model.HeadWeights {
+        const self: *HfHead = @ptrCast(@alignCast(ctx));
+        return loadHead(allocator, self.shards, self.cfg, self.embed);
+    }
+};
+
+test "hf config maps to the engine config with half-split RoPE" {
+    const c = hf.Config{
+        .arch = "Qwen2ForCausalLM",
+        .hidden_size = 896,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 14,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 4864,
+        .vocab_size = 151936,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1e6,
+        .tie_word_embeddings = false,
+        .max_position_embeddings = 32768,
+        .bos_token_id = null,
+        .eos_token_id = null,
+    };
+    const m = try toModelConfig(c);
+    try std.testing.expectEqual(@as(u32, 896), m.hidden);
+    try std.testing.expectEqual(@as(u32, 1152), m.qkvDim());
+    try std.testing.expectEqualStrings("qwen2", m.arch);
+    try std.testing.expect(!m.rope_adjacent);
+}
