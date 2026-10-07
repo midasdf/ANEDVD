@@ -1,0 +1,38 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // The ANE shim is Objective-C with ARC. Zig's bundled clang crashes on it,
+    // so compile it with the system toolchain and link the object file.
+    const shim_cc = b.addSystemCommand(&.{ "/usr/bin/clang", "-fobjc-arc", "-O2", "-Wall", "-c" });
+    shim_cc.addFileArg(b.path("src/ane/shim.m"));
+    shim_cc.addArg("-o");
+    const shim_obj = shim_cc.addOutputFileArg("shim.o");
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addObjectFile(shim_obj);
+    mod.addIncludePath(b.path("src/ane"));
+    mod.linkFramework("Foundation", .{});
+    mod.linkFramework("IOSurface", .{});
+
+    const exe = b.addExecutable(.{
+        .name = "anedvd",
+        .root_module = mod,
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
+    b.step("run", "Run anedvd").dependOn(&run_cmd.step);
+
+    const unit_tests = b.addTest(.{ .root_module = mod });
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
+}
