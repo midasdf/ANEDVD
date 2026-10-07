@@ -61,6 +61,8 @@ pub const Stats = struct {
     completion_tokens: u32 = 0,
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
+    /// Time spent inside ANE evaluations during the decode phase.
+    decode_ane_ns: u64 = 0,
     stop_reason: StopReason = .stop,
 
     pub fn decodeToksPerSec(self: Stats) f64 {
@@ -224,6 +226,7 @@ pub const Session = struct {
         }
 
         var pos: u32 = @intCast(ids.len);
+        const ane_before = eng.stats.ane_eval_ns;
         const d0 = nowNs();
         var produced: u32 = 0;
         while (produced < params.max_tokens and pos < max_seq) : (produced += 1) {
@@ -251,6 +254,7 @@ pub const Session = struct {
         }
         if (stats.stop_reason == .stop and produced >= params.max_tokens) stats.stop_reason = .length;
         stats.decode_ns = nowNs() - d0;
+        stats.decode_ane_ns = eng.stats.ane_eval_ns - ane_before;
         stats.completion_tokens = produced;
         return stats;
     }

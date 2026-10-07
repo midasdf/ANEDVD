@@ -21,6 +21,7 @@ const USAGE =
     \\  anedvd bench [--size N] [--iters K]
     \\                                  measure ANE matmul throughput
     \\  anedvd width [--size N]         cost of extra activation columns (prefill batching)
+    \\  anedvd attnbench [--ctx N]      CPU attention cost breakdown (dot / softmax / AV)
     \\  anedvd selftest [--split]       ANE engine vs CPU reference on a tiny model
     \\  anedvd check <model.gguf>       load a real GGUF, compile all ANE kernels, run a step
     \\  anedvd run --model <m.gguf> --prompt "..." [--max-tokens N] [--temp T] [--top-k K]
@@ -56,6 +57,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdProbe(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         return cmdBench(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "attnbench")) {
+        return cmdAttnBench(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "width")) {
         return cmdWidthSweep(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "selftest")) {
@@ -661,7 +664,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     const t_c0 = sys.nowNs();
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
-        .max_seq = 1024,
+        .max_seq = argValue(argv, "--max-seq", 2048),
         .verbose = true,
         .fuse_ffn = fuse,
         .chunk = chunk,
@@ -730,10 +733,12 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         @as(f64, @floatFromInt(stats.prefill_ns)) / 1e9,
         if (stats.prefill_ns > 0) @as(f64, @floatFromInt(stats.prompt_tokens)) / (@as(f64, @floatFromInt(stats.prefill_ns)) / 1e9) else 0,
     });
-    sys.print("decode: {d} tokens in {d:.2} s ({d:.1} tok/s)\n", .{
+    sys.print("decode: {d} tokens in {d:.2} s ({d:.1} tok/s; ANE {d:.0}%, CPU {d:.0}%)\n", .{
         stats.completion_tokens,
         @as(f64, @floatFromInt(stats.decode_ns)) / 1e9,
         stats.decodeToksPerSec(),
+        if (stats.decode_ns > 0) 100.0 * @as(f64, @floatFromInt(stats.decode_ane_ns)) / @as(f64, @floatFromInt(stats.decode_ns)) else 0,
+        if (stats.decode_ns > 0) 100.0 - 100.0 * @as(f64, @floatFromInt(stats.decode_ane_ns)) / @as(f64, @floatFromInt(stats.decode_ns)) else 0,
     });
     sys.print("ANE: {d} evals for {d} tokens ({d:.1} kernels/token), {d:.1} ms total, {d:.2} ms/token\n", .{
         eng.stats.ane_evals,
@@ -1106,4 +1111,81 @@ fn chatEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
     sys.writeAll(1, piece);
     sink.out.appendSlice(sink.allocator, piece) catch return false;
     return true;
+}
+
+/// Micro-benchmark for the CPU attention path, which dominates decode at long
+/// context. Reports the dot-product, softmax and value-accumulation shares.
+fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    const ctx: usize = argValue(argv, "--ctx", 1024);
+    const heads: u32 = argValue(argv, "--heads", 14);
+    const kv_heads: u32 = argValue(argv, "--kv-heads", 2);
+    const hd: u32 = argValue(argv, "--head-dim", 64);
+    const iters: u32 = argValue(argv, "--iters", 200);
+    const kv_dim: usize = @as(usize, kv_heads) * hd;
+
+    const k = try allocator.alloc(f32, ctx * kv_dim);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, ctx * kv_dim);
+    defer allocator.free(v);
+    const q = try allocator.alloc(f32, @as(usize, heads) * hd);
+    defer allocator.free(q);
+    const out = try allocator.alloc(f32, @as(usize, heads) * hd);
+    defer allocator.free(out);
+    const scores = try allocator.alloc(f32, ctx);
+    defer allocator.free(scores);
+    var seed: u32 = 7;
+    for (k) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+    }
+    for (v) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+    }
+    for (q) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+    }
+
+    // Whole attention.
+    cpu.attentionDecode(out, q, k, v, ctx, heads, kv_heads, hd, scores);
+    var t0 = sys.nowNs();
+    for (0..iters) |_| cpu.attentionDecode(out, q, k, v, ctx, heads, kv_heads, hd, scores);
+    const full_ns = (sys.nowNs() - t0) / iters;
+
+    // Dot products only (no softmax, no AV).
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const group = heads / kv_heads;
+    t0 = sys.nowNs();
+    for (0..iters) |_| {
+        for (0..heads) |h| {
+            const kvh = h / group;
+            const q_h = q[h * hd ..][0..hd];
+            for (0..ctx) |t| {
+                const k_t = k[t * kv_dim + kvh * hd ..][0..hd];
+                scores[t] = cpu.dotF32(q_h, k_t) * scale;
+            }
+        }
+    }
+    const dot_ns = (sys.nowNs() - t0) / iters;
+
+    // Softmax only.
+    t0 = sys.nowNs();
+    for (0..iters) |_| {
+        for (0..heads) |_| cpu.softmax(scores);
+    }
+    const soft_ns = (sys.nowNs() - t0) / iters;
+
+    const full_us = @as(f64, @floatFromInt(full_ns)) / 1000.0;
+    const dot_us = @as(f64, @floatFromInt(dot_ns)) / 1000.0;
+    const soft_us = @as(f64, @floatFromInt(soft_ns)) / 1000.0;
+    const rest_us = if (full_ns > dot_ns + soft_ns)
+        @as(f64, @floatFromInt(full_ns - dot_ns - soft_ns)) / 1000.0
+    else
+        0;
+    sys.print("CPU attention at ctx={d} (heads {d}/{d}, head_dim {d})\n", .{ ctx, heads, kv_heads, hd });
+    sys.print("  full        {d:>9.1} us\n", .{full_us});
+    sys.print("  dot only    {d:>9.1} us  ({d:.0}%)\n", .{ dot_us, 100.0 * dot_us / full_us });
+    sys.print("  softmax     {d:>9.1} us  ({d:.0}%)\n", .{ soft_us, 100.0 * soft_us / full_us });
+    sys.print("  AV + rest   {d:>9.1} us  ({d:.0}%)\n", .{ rest_us, 100.0 * rest_us / full_us });
 }
