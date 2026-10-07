@@ -20,6 +20,7 @@ const USAGE =
     \\  anedvd probe [--size N]         compile+run an ANE matmul and check it vs CPU
     \\  anedvd bench [--size N] [--iters K]
     \\                                  measure ANE matmul throughput
+    \\  anedvd width [--size N]         cost of extra activation columns (prefill batching)
     \\  anedvd selftest [--fuse]        ANE engine vs CPU reference on a tiny model
     \\  anedvd check <model.gguf>       load a real GGUF, compile all ANE kernels, run a step
     \\  anedvd run --model <m.gguf> --prompt "..." [--max-tokens N] [--temp T] [--top-k K]
@@ -31,6 +32,7 @@ const USAGE =
     \\                                  and a built-in WebUI at /
     \\
     \\model flags: --rope-hf | --rope-adjacent   force the RoPE convention
+    \\             --chunk N                      activation width (default 64; prompt batching)
     \\             --fuse                         experimental fused FFN (known wrong)
     \\
 ;
@@ -52,6 +54,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdProbe(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         return cmdBench(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "width")) {
+        return cmdWidthSweep(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "selftest")) {
         var fuse = false;
         for (argv) |a| if (std.mem.eql(u8, a, "--fuse")) {
@@ -119,9 +123,13 @@ const ProbeResult = struct {
 /// Compile a 1x1 conv (matmul) kernel for [cin] -> [cout] and check it against
 /// a CPU reference. Returns the error metrics.
 fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32) !ProbeResult {
+    return runMatmulProbeWidth(allocator, cin, cout, iters, 1);
+}
+
+fn runMatmulProbeWidth(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32, width: u32) !ProbeResult {
     const w32 = try allocator.alloc(f32, @as(usize, cout) * cin);
     defer allocator.free(w32);
-    const x32 = try allocator.alloc(f32, cin);
+    const x32 = try allocator.alloc(f32, @as(usize, cin) * width);
     defer allocator.free(x32);
     fillLcg(w32, 12345);
     fillLcg(x32, 777);
@@ -135,7 +143,7 @@ fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32)
     const sym = try weights.symbol(&sym_buf);
 
     const program = try mil.build(allocator, .{
-        .inputs = &.{.{ .name = "i0", .channels = cin }},
+        .inputs = &.{.{ .name = "i0", .channels = cin, .width = width }},
         .ops = &.{.{ .conv = .{
             .x = "i0",
             .w = "w0",
@@ -144,6 +152,7 @@ fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32)
             .cout = cout,
             .blob_offset = 64,
             .file = sym,
+            .width = width,
         } }},
         .outputs = &.{"o0"},
     });
@@ -158,7 +167,7 @@ fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32)
 
     try kernel.writeInputF16(0, x16);
     try kernel.eval();
-    const y16 = try allocator.alloc(f16, cout);
+    const y16 = try allocator.alloc(f16, @as(usize, cout) * width);
     defer allocator.free(y16);
     try kernel.readOutputF16(0, y16);
 
@@ -166,12 +175,14 @@ fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32)
     var max_err: f32 = 0;
     var max_mag: f32 = 0;
     for (0..cout) |o| {
-        var acc: f32 = 0;
-        for (0..cin) |c| acc += w32[o * cin + c] * x32[c];
-        const got: f32 = @floatCast(y16[o]);
-        const e = @abs(got - acc);
-        if (e > max_err) max_err = e;
-        if (@abs(acc) > max_mag) max_mag = @abs(acc);
+        for (0..width) |j| {
+            var acc: f32 = 0;
+            for (0..cin) |c| acc += w32[o * cin + c] * x32[c * width + j];
+            const got: f32 = @floatCast(y16[o * width + j]);
+            const e = @abs(got - acc);
+            if (e > max_err) max_err = e;
+            if (@abs(acc) > max_mag) max_mag = @abs(acc);
+        }
     }
 
     // Timing.
@@ -572,6 +583,18 @@ fn predictNextTokens(allocator: std.mem.Allocator, g: *const gguf.Gguf, eng: *en
     }
     if (ids.items.len == 0) return;
 
+    // Run the prompt both ways so a batched-prefill bug cannot hide.
+    {
+        const seq = try allocator.dupe(u32, ids.items);
+        defer allocator.free(seq);
+        var seq_logits: []f32 = undefined;
+        for (seq, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
+        const batch_logits = try eng.prefill(seq, 0);
+        var max_d: f32 = 0;
+        for (seq_logits, batch_logits) |a, b| max_d = @max(max_d, @abs(a - b));
+        sys.print("    sequential vs batched prefill: max|diff| = {e:.5} ({s})\n", .{ max_d, if (max_d < 1e-2) "ok" else "MISMATCH" });
+    }
+
     var logits: []f32 = undefined;
     var ref_st: ?RefState = null;
     defer if (ref_st) |*st| {
@@ -645,6 +668,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const max_tokens: u32 = argValue(argv, "--max-tokens", 48);
     const temperature = argF32(argv, "--temp", 0.0);
     const top_k: usize = argValue(argv, "--top-k", 40);
+    const chunk: u32 = argValue(argv, "--chunk", 64);
     var fuse = false;
     var rope_hf = false;
     var rope_adj = false;
@@ -676,6 +700,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         .max_seq = 1024,
         .verbose = true,
         .fuse_ffn = fuse,
+        .chunk = chunk,
     });
     defer eng.deinit();
     const t_c1 = sys.nowNs();
@@ -703,9 +728,32 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     // Prefill.
     const t0 = sys.nowNs();
-    var logits: []f32 = undefined;
-    for (ids, 0..) |id, pos| logits = try eng.forward(id, @intCast(pos));
+    const ane_before = eng.stats.ane_eval_ns;
+    var logits: []f32 = try eng.prefill(ids, 0);
+    const ane_after = eng.stats.ane_eval_ns;
     const t_prefill = sys.nowNs();
+    _ = ane_before;
+    _ = ane_after;
+
+    // A/B: the same prompt through the per-token path must give the same logits.
+    var ab = false;
+    for (argv) |a| if (std.mem.eql(u8, a, "--ab")) {
+        ab = true;
+    };
+    if (ab) {
+        var seq_logits: []f32 = undefined;
+        for (ids, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
+        var max_d: f32 = 0;
+        var argmax_seq: u32 = 0;
+        var argmax_batch: u32 = 0;
+        for (seq_logits, logits, 0..) |a, b, i| {
+            max_d = @max(max_d, @abs(a - b));
+            if (a > seq_logits[argmax_seq]) argmax_seq = @intCast(i);
+            if (b > logits[argmax_batch]) argmax_batch = @intCast(i);
+        }
+        sys.print("A/B sequential vs batched: max|diff| = {e:.6}, argmax {d} vs {d}\n", .{ max_d, argmax_seq, argmax_batch });
+        logits = try eng.prefill(ids, 0);
+    }
 
     // Decode.
     var rng: u32 = 0x12345678;
@@ -713,8 +761,13 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     var pos: u32 = @intCast(ids.len);
     var produced: u32 = 0;
     var printed_any = false;
+    var debug_gen = false;
+    for (argv) |a| if (std.mem.eql(u8, a, "--debug-gen")) {
+        debug_gen = true;
+    };
     while (produced < max_tokens and pos < 1000) : (produced += 1) {
         const next = if (temperature <= 0) cpu.argmax(logits) else cpu.sampleTopK(logits, temperature, top_k, &rng);
+        if (debug_gen) sys.print("[gen] pos={d} next={d} eos={?d} top_logit={d:.2} produced={d}\n", .{ pos, next, eos, logits[next], produced });
         if (eos != null and next == eos.?) break;
         const bytes = try tok.tokenBytes(allocator, next);
         defer allocator.free(bytes);
@@ -874,6 +927,7 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const system = argStr(argv, "--system");
     const max_seq: u32 = argValue(argv, "--max-seq", 2048);
     const default_max_tokens: u32 = argValue(argv, "--max-tokens", 512);
+    const chunk: u32 = argValue(argv, "--chunk", 64);
     var fuse = false;
     var rope_hf = false;
     var rope_adj = false;
@@ -901,6 +955,7 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         .max_seq = max_seq,
         .verbose = true,
         .fuse_ffn = fuse,
+        .chunk = chunk,
     });
     defer eng.deinit();
     sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
@@ -924,4 +979,25 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         },
     };
     try srv.run();
+}
+
+/// Measures how the per-eval cost grows with the activation width. The ANE
+/// reads the weights once per eval regardless of width, so a decode-shaped
+/// kernel (width 1) and a prefill-shaped one (width 32..128) should cost almost
+/// the same — which is what makes batched prefill worth implementing.
+fn cmdWidthSweep(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    const size = argValue(argv, "--size", 2048);
+    const iters = argValue(argv, "--iters", 30);
+    sys.print("ANE conv cost vs activation width ({d} -> {d}, fp16, weights read once)\n", .{ size, size });
+    sys.print("{s:>7} {s:>12} {s:>12} {s:>12}\n", .{ "width", "us/eval", "vs w=1", "GFLOP/s" });
+    var base_us: f64 = 0;
+    for ([_]u32{ 1, 8, 32, 64, 128 }) |w| {
+        const r = runMatmulProbeWidth(allocator, size, size, iters, w) catch |e| {
+            sys.print("{d:>7} FAILED: {s}\n", .{ w, @errorName(e) });
+            continue;
+        };
+        if (w == 1) base_us = r.eval_us;
+        const gflops = 2.0 * @as(f64, @floatFromInt(size)) * @as(f64, @floatFromInt(size)) * @as(f64, @floatFromInt(w)) / 1e9 / (r.eval_us / 1e6);
+        sys.print("{d:>7} {d:>12.2} {d:>11.2}x {d:>12.1}\n", .{ w, r.eval_us, if (base_us > 0) r.eval_us / base_us else 1, gflops });
+    }
 }

@@ -15,6 +15,10 @@ const Buf = @import("../buf.zig").Buf;
 pub const Input = struct {
     name: []const u8,
     channels: u32,
+    /// Spatial width. The same kernel can process one token (width 1) or a
+    /// chunk of prompt tokens (width > 1) because the ANE is weight-bandwidth
+    /// bound: the weights are read once either way.
+    width: u32 = 1,
 };
 
 pub const Op = union(enum) {
@@ -27,6 +31,7 @@ pub const Op = union(enum) {
         cout: u32,
         blob_offset: u64,
         file: []const u8,
+        width: u32 = 1,
     },
     /// y = a + b (same shape).
     add: struct {
@@ -34,12 +39,14 @@ pub const Op = union(enum) {
         b: []const u8,
         y: []const u8,
         channels: u32,
+        width: u32 = 1,
     },
     /// y = sigmoid(x)
     sigmoid: struct {
         x: []const u8,
         y: []const u8,
         channels: u32,
+        width: u32 = 1,
     },
     /// y = a * b (same shape)
     mul: struct {
@@ -47,6 +54,7 @@ pub const Op = union(enum) {
         b: []const u8,
         y: []const u8,
         channels: u32,
+        width: u32 = 1,
     },
 };
 
@@ -81,7 +89,7 @@ pub fn build(allocator: std.mem.Allocator, spec: Spec) ![]u8 {
     try b.appendSlice("\n{\n    func main<ios18>(");
     for (spec.inputs, 0..) |in, i| {
         if (i > 0) try b.appendSlice(", ");
-        try b.print("tensor<fp16, [1, {d}, 1, 1]> {s}", .{ in.channels, in.name });
+        try b.print("tensor<fp16, [1, {d}, 1, {d}]> {s}", .{ in.channels, in.width, in.name });
     }
     try b.appendSlice(") {\n");
     try b.appendSlice(CONST_HEADER);
@@ -94,26 +102,26 @@ pub fn build(allocator: std.mem.Allocator, spec: Spec) ![]u8 {
                     .{ c.cout, c.cin, c.w, c.w, c.cout, c.cin, c.file, c.blob_offset },
                 );
                 try b.print(
-                    "        tensor<fp16, [1, {d}, 1, 1]> {s} = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = {s}, x = {s})[name = string(\"{s}\")];\n",
-                    .{ c.cout, c.y, c.w, c.x, c.y },
+                    "        tensor<fp16, [1, {d}, 1, {d}]> {s} = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = {s}, x = {s})[name = string(\"{s}\")];\n",
+                    .{ c.cout, c.width, c.y, c.w, c.x, c.y },
                 );
             },
             .add => |a| {
                 try b.print(
-                    "        tensor<fp16, [1, {d}, 1, 1]> {s} = add(x = {s}, y = {s})[name = string(\"{s}\")];\n",
-                    .{ a.channels, a.y, a.a, a.b, a.y },
+                    "        tensor<fp16, [1, {d}, 1, {d}]> {s} = add(x = {s}, y = {s})[name = string(\"{s}\")];\n",
+                    .{ a.channels, a.width, a.y, a.a, a.b, a.y },
                 );
             },
             .sigmoid => |s| {
                 try b.print(
-                    "        tensor<fp16, [1, {d}, 1, 1]> {s} = sigmoid(x = {s})[name = string(\"{s}\")];\n",
-                    .{ s.channels, s.y, s.x, s.y },
+                    "        tensor<fp16, [1, {d}, 1, {d}]> {s} = sigmoid(x = {s})[name = string(\"{s}\")];\n",
+                    .{ s.channels, s.width, s.y, s.x, s.y },
                 );
             },
             .mul => |m| {
                 try b.print(
-                    "        tensor<fp16, [1, {d}, 1, 1]> {s} = mul(x = {s}, y = {s})[name = string(\"{s}\")];\n",
-                    .{ m.channels, m.y, m.a, m.b, m.y },
+                    "        tensor<fp16, [1, {d}, 1, {d}]> {s} = mul(x = {s}, y = {s})[name = string(\"{s}\")];\n",
+                    .{ m.channels, m.width, m.y, m.a, m.b, m.y },
                 );
             },
         }

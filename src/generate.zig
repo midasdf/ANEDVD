@@ -177,9 +177,10 @@ pub const Session = struct {
         }
         stats.prompt_tokens = @intCast(ids.len);
 
+        // One batched pass over the whole prompt: the ANE is weight-bandwidth
+        // bound, so a chunk of tokens costs about the same as a single one.
         const p0 = nowNs();
-        var logits: []f32 = undefined;
-        for (ids, 0..) |id, pos| logits = try eng.forward(id, @intCast(pos));
+        var logits: []f32 = try eng.prefill(ids, 0);
         stats.prefill_ns = nowNs() - p0;
 
         var pos: u32 = @intCast(ids.len);

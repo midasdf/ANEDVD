@@ -27,6 +27,7 @@ Anthropic-compatible HTTP API with a built-in WebUI.
 | Zig | 0.17.0 |
 
 ```console
+$ zig build                       # defaults to ReleaseFast
 $ ./zig-out/bin/anedvd run --model models/smollm2-135m-q8_0.gguf \
       --prompt "What is the capital of France?" --max-tokens 40
 prompt (16 tokens): <|im_start|>user
@@ -43,8 +44,12 @@ decode: 40 tokens in 1.57 s (25.4 tok/s)
 ANE: 6776 evals, 1293.2 ms total, 23.09 ms/token (82% of wall time)
 ```
 
-* **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at 25–30 tok/s, HF
-  safetensors F16 at 28–32 tok/s (no dequantisation), same output.
+* **Prompt batching works**: a whole chunk of prompt tokens goes through the ANE
+  in one pass, because the ANE reads the weights once per evaluation regardless
+  of width (measured below). SmolLM2-135M prefill went from ~25 to **258 tok/s**,
+  Qwen2.5-0.5B from ~17 to **277 tok/s**.
+* **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at ~31 tok/s decode, HF
+  safetensors F16 at ~31 tok/s (no dequantisation), same output.
 * **SmolLM2-135M-Instruct (Q8_0)**: 30 layers, 121 ANE kernels, **25.4 tok/s** decode.
 * **Qwen2.5-0.5B-Instruct (Q8_0)**: 24 layers, 97 ANE kernels, **10.1 tok/s** decode,
   GQA + QKV biases + RoPE θ=10⁶ — answers "The capital of France is Paris."
@@ -94,7 +99,7 @@ crashes on ARC Objective-C), Zig 0.17.
 | `anedvd bench` | matmul throughput sweep (128 … 4096) |
 | `anedvd selftest` | tiny transformer: ANE engine vs CPU reference |
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
-| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K]` | generate text on the ANE |
+| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--chunk N] [--ab]` | generate text on the ANE |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |
 | `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
 
@@ -104,7 +109,30 @@ The format is chosen by the path: anything ending in `.gguf` is read as GGUF,
 everything else as an HF directory.
 
 Overrides for unusual models: `--rope-hf` / `--rope-adjacent` force the RoPE
-convention, `--fuse` enables the experimental fused FFN.
+convention, `--chunk N` sets the activation width (default 64), `--ab` runs the
+prompt through both the batched and the per-token path and compares the logits,
+`--fuse` enables the experimental fused FFN.
+
+### Prompt batching: why a chunk costs the same as a token
+
+Every kernel is compiled for a fixed activation width (`--chunk`, default 64).
+A decode step fills only column 0; a prefill step fills up to 64 columns. That
+sounds wasteful until you measure `anedvd width`:
+
+```
+ANE conv cost vs activation width (2048 -> 2048, fp16, weights read once)
+  width      us/eval       vs w=1      GFLOP/s
+      1       304.97        1.00x         27.5
+      8       286.93        0.94x        233.9
+     32       305.47        1.00x        878.8
+     64       290.23        0.95x       1849.8
+    128       321.40        1.05x       3340.8
+```
+
+The cost is flat: the ANE is reading weights, not doing arithmetic, so 128
+columns cost 5% more than one. One kernel set therefore serves both paths, with
+no extra compiles and no measurable decode penalty. `run --ab` verifies that the
+batched path is bit-identical to the per-token one.
 
 ## HTTP API and WebUI
 
@@ -216,7 +244,12 @@ above).
 
 Per layer: `qkv` (fused Wq|Wk|Wv), `o`, `gate_up`, `down` — 4 kernels; plus one
 `lm_head` kernel. Kernel launch overhead is ~90–110 µs, which is why the
-projections are fused as much as the data dependencies allow.
+projections are fused as much as the data dependencies allow, and why prompt
+tokens are batched into one pass instead of one pass per token.
+
+Build with `zig build` for a ReleaseFast binary (the default). The Zig side does
+real work — attention, batching, GGUF dequantisation — and Debug is roughly 8×
+slower there; `zig build -Doptimize=debug` is still available while developing.
 
 ### ANE tensor layout (verified, not guessed)
 
@@ -303,27 +336,32 @@ quantisation rather than unified memory:
 
 ## Findings worth knowing (all reproduced locally)
 
-1. **No entitlement, no SIP changes, no signing.** The ANE is reached over XPC
+1. **The ANE is weight-bandwidth bound, not compute bound.** At 2048×2048 a
+   1x1 conv takes ~300 µs whether it processes 1 column or 128; a 4096×4096 one
+   takes 1.4 ms ≈ 24 GFLOP/s but ≈12 GB/s of weights. Every design decision
+   here follows from that (fused projections, prompt batching, and the fact that
+   int8 would be the only way to go substantially faster).
+2. **No entitlement, no SIP changes, no signing.** The ANE is reached over XPC
    through `aned`; the kernel-level `com.apple.ane.iokit-user-access` entitlement
    only gates the in-process `H11ANEIn` user client, which this project does not
    use. Codesigning *with* ANE entitlements while SIP is enabled gets the process
    SIGKILLed at launch (exit 137) — don't.
-2. **`matmul` is not usable.** An ANE program containing MIL `matmul` compiles
+3. **`matmul` is not usable.** An ANE program containing MIL `matmul` compiles
    but fails at evaluation with `kIOReturnUnsupported (0x1d)`. Every matrix
    product is a 1×1 `conv`.
-3. **`sigmoid` and `mul` do compile** (used by the experimental fused FFN), but
+4. **`sigmoid` and `mul` do compile** (used by the experimental fused FFN), but
    see the known issue below.
-4. **int8 weights are not reachable.** `constexpr_affine_dequantize` is rejected
+5. **int8 weights are not reachable.** `constexpr_affine_dequantize` is rejected
    with `InvalidMILProgram` for every layout and axis tried — including with an
    fp16 input, so the op itself is unavailable in this MIL dialect, not just the
    int8 dtype. That matches Orion ("quantization not yet supported") and
    Espresso ("INT8/quantized weights: unsupported"). See
    [`probe/ane_int8_probe.m`](probe/ane_int8_probe.m) to reproduce. Weight
    bandwidth therefore stays at fp16: ~12–15 GB/s, the current ceiling.
-5. **Compile budget**: 121 `ANECCompile()` calls in one process worked here.
+6. **Compile budget**: 121 `ANECCompile()` calls in one process worked here.
    Published reports put the daemon's limit near 119 on M4/macOS 15, so the
    engine keeps the per-layer kernel count low and reports `ane.compileCount()`.
-6. **The RoPE convention is architecture-dependent — and getting it wrong does
+7. **The RoPE convention is architecture-dependent — and getting it wrong does
    not produce garbage, it produces fluent repetition.** `convert_hf_to_gguf.py`
    permutes Q/K rows of Llama-family models into llama.cpp's *adjacent-pair*
    layout (`LLAMA_ROPE_TYPE_NORM`), while Qwen2 (and other `rotate_half`
@@ -333,18 +371,17 @@ quantisation rather than unified memory:
    architecture table lives in
    [`src/load_gguf.zig`](src/load_gguf.zig) (`ropeIsAdjacent`), and
    `--rope-hf` / `--rope-adjacent` override it.
-7. **Qwen2 adds biases to Q/K/V** (`attn_q.bias` …); Llama does not. Missing them
+8. **Qwen2 adds biases to Q/K/V** (`attn_q.bias` …); Llama does not. Missing them
    yields multilingual garbage rather than an error. They are applied after the
    ANE projection (a vector add is not worth a kernel).
-8. **The ANE program pool is global.** Two processes cannot each hold a full
+9. **The ANE program pool is global.** Two processes cannot each hold a full
    model's kernels; the second gets a transient "no ANE resources" error. See
    the unified-memory section above.
-9. **Throughput is weight-bandwidth-bound**: a 4096×4096 fp16 matmul runs in
-   1.41 ms ≈ 24 GFLOP/s (≈12 GB/s of weights), while a 128×128 matmul takes
-   81 µs — almost all of it launch overhead. Qwen2.5-0.5B's 66.8 ms/token is
-   ≈15 GB/s of fp16 weights: the ANE's DRAM share, not the MAC array, is the
-   ceiling. Quantised weights are the only large win left.
-10. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
+10. **Weight bandwidth is the decode ceiling**: Qwen2.5-0.5B reads ~1 GB of
+   fp16 weights per token, which is 28–35 ms at the ANE's ~12–15 GB/s share of
+   DRAM. Quantised weights would be the only large win left, and int8 is not
+   reachable (finding 5).
+11. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
    the ANE's generated text token-for-token on both models.
 
 ## Known issues

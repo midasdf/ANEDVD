@@ -259,6 +259,40 @@ pub const Kernel = struct {
         gatherF16(base, info, out);
     }
 
+    /// Write one column (spatial position) of an input tensor. Used by the
+    /// decode path, where the kernel is compiled for `chunk` columns but only
+    /// column 0 carries data — the rest stays zero from `zeroInputs()`.
+    pub fn writeInputColumnF16(self: *const Kernel, idx: usize, col: usize, values: []const f16) !void {
+        const info = self.in_info[idx];
+        if (values.len != info.channelsUsize()) return Error.WrongShape;
+        if (col >= info.widthUsize()) return Error.WrongShape;
+        if (ane_shim_input_lock(self.handle, @intCast(idx)) == 0) return Error.SurfaceLockFailed;
+        defer _ = ane_shim_input_unlock(self.handle, @intCast(idx));
+        const base = ane_shim_input_base(self.handle, @intCast(idx)) orelse return Error.SurfaceUnavailable;
+        const elem = info.elemSize();
+        for (0..info.channelsUsize()) |c| {
+            const off = c * info.plane_stride + col * elem;
+            const v: u16 = @bitCast(values[c]);
+            base[off] = @truncate(v);
+            base[off + 1] = @truncate(v >> 8);
+        }
+    }
+
+    /// Read one column of an output tensor (channels only).
+    pub fn readOutputColumnF16(self: *const Kernel, idx: usize, col: usize, out: []f16) !void {
+        const info = self.out_info[idx];
+        if (out.len != info.channelsUsize()) return Error.WrongShape;
+        if (col >= info.widthUsize()) return Error.WrongShape;
+        if (ane_shim_output_lock(self.handle, @intCast(idx)) == 0) return Error.SurfaceLockFailed;
+        defer _ = ane_shim_output_unlock(self.handle, @intCast(idx));
+        const base = ane_shim_output_base(self.handle, @intCast(idx)) orelse return Error.SurfaceUnavailable;
+        const elem = info.elemSize();
+        for (0..info.channelsUsize()) |c| {
+            const off = c * info.plane_stride + col * elem;
+            out[c] = @bitCast(@as(u16, base[off]) | (@as(u16, base[off + 1]) << 8));
+        }
+    }
+
     /// Zero every input surface (padding included). Called once at startup so
     /// later partial writes cannot leak stale bytes into a kernel.
     pub fn zeroInputs(self: *const Kernel) void {

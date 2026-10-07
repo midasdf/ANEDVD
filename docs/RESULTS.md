@@ -34,6 +34,31 @@ dependencies allow (4 kernels per layer instead of 6) and why int8 weight
 quantisation is the most promising future optimisation: it would halve the bytes
 per token.
 
+## Prompt batching (activation width)
+
+`anedvd width` — one 1x1 conv, fp16, 2048→2048, weights read once per eval:
+
+| width | µs/eval | vs width 1 | GFLOP/s |
+|---|---|---|---|
+| 1 | 304.97 | 1.00× | 27.5 |
+| 8 | 286.93 | 0.94× | 233.9 |
+| 32 | 305.47 | 1.00× | 878.8 |
+| 64 | 290.23 | 0.95× | 1849.8 |
+| 128 | 321.40 | 1.05× | 3340.8 |
+
+Flat within 5% across a 128× range of work: the kernel is reading weights, not
+computing. So every kernel is compiled for `chunk` columns (default 64), a decode
+step fills column 0 only, and a prefill step fills up to 64 — one kernel set, no
+extra compiles, no decode penalty.
+
+`anedvd run --ab` runs the prompt through both paths and compares:
+
+```
+A/B sequential vs batched: max|diff| = 0.000000e0, argmax 504 vs 504
+```
+
+Bit-identical, which is also how the bug below was caught.
+
 ## Model runs
 
 ### SmolLM2-135M-Instruct (Q8_0, 144 MB)
@@ -46,11 +71,11 @@ prompt: <|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>
 output: The capital of France is Paris. Paris is a city located in the northern
         part of the country, and it is known for its historical landmarks,
         cultural institutions, and cultural attractions. Paris is famous for
-prefill: 16 tokens in 0.62 s (25.6 tok/s)
-decode:  40 tokens in 1.57 s (25.4 tok/s)
-ANE:     6776 evals for 56 tokens (121 kernels/token), 1293 ms, 23.09 ms/token
-ANE share of wall time: 82%
+prefill: 16 tokens in 0.06 s (258 tok/s)     [was 25.6 tok/s before batching]
+decode:  24 tokens in 0.77 s (31.3 tok/s)    [was 25.4]
 ```
+
+ReleaseFast, `chunk = 64`. Peak RSS 318 MB.
 
 ### Qwen2.5-0.5B-Instruct (Q8_0, 531 MB)
 
@@ -62,11 +87,12 @@ QKV biases, RoPE θ = 10⁶, eps = 10⁻⁶.
 output: The ocean is a vast and mysterious body of water that covers
         approximately 71% of the Earth's surface, containing vast amounts of
         water, life, and energy.
-prefill: 15 tokens in 1.66 s (9.1 tok/s)
-decode:  34 tokens in 3.37 s (10.1 tok/s)
-ANE:     4753 evals for 49 tokens (97 kernels/token), 3273 ms, 66.80 ms/token
-ANE share of wall time: 65%
+prefill: 33 tokens in 0.12 s (277 tok/s)     [was ~17 tok/s before batching]
+decode:  34 tokens in 1.65 s (20.6 tok/s)    [28-35 tok/s once warm]
+ANE:     3395 evals for 35 tokens (97 kernels/token), 1243 ms, 35.5 ms/token
 ```
+
+ReleaseFast, `chunk = 64`. Peak RSS 988 MB.
 
 66.8 ms/token for ~494 M fp16 parameters is 988 MB of weights per token, i.e.
 ≈14.8 GB/s — again at the ANE's memory-bandwidth ceiling. Qwen2.5-0.5B at fp16
@@ -115,7 +141,8 @@ Qwen2.5-0.5B-Instruct Q8_0 (494 M params), measured with `/usr/bin/time -l`:
 |---|---|---|
 | eager load | 1.39 GB | whole model as fp16 in RAM + all weight blobs |
 | streaming layers + chunked weight files | 965 MB | |
-| **+ weight files deleted after load (current)** | **~0.72 GB** | |
+| + weight files deleted after load | ~0.72–0.99 GB | run-to-run variance from mmap residency |
+| **+ prompt batching, ReleaseFast (current)** | **~0.99 GB** | larger activation surfaces |
 
 SmolLM2-135M: 299 MB (Q8_0) / 361 MB (F16). The F16 case is larger only because
 its mmap is larger; its embedding is a zero-copy view into that mapping.
@@ -146,10 +173,10 @@ Two operational findings from this work:
 
 The same model in both formats produces the same text on the ANE:
 
-| format | file | decode |
-|---|---|---|
-| GGUF Q8_0 | `smollm2-135m-q8_0.gguf` (145 MB) | 25–30 tok/s |
-| HF safetensors F16 | `SmolLM2-135M-Instruct/` (269 MB) | 28–32 tok/s |
+| format | file | prefill | decode | peak RSS |
+|---|---|---|---|---|
+| GGUF Q8_0 | `smollm2-135m-q8_0.gguf` (145 MB) | 258 tok/s | 31.3 tok/s | 318 MB |
+| HF safetensors F16 | `SmolLM2-135M-Instruct/` (269 MB) | 239 tok/s | 31.2 tok/s | 449 MB |
 
 F16 is faster because it skips the Q8_0 → fp16 conversion and can use the
 embedding straight from the mapping.
@@ -188,3 +215,12 @@ rather than an error:
    repetitive* text, which looks like a weak model rather than a bug.
 6. **Qwen2 attention biases.** Qwen2 adds biases to Q/K/V; ignoring them
    produced multilingual garbage.
+7. **Prefill dropped the rotated query.** The batched path applied RoPE to a
+   gathered copy of q but never wrote it back, so the attention pass re-read the
+   unrotated vector. Symptom: the model answered with EOS immediately for some
+   prompts. The `--ab` check (sequential vs batched logits) now pins this at
+   bit-identical.
+8. **Debug builds made prefill look broken.** The Zig-side CPU work (batching,
+   attention, dequantisation) is ~8× slower unoptimised: the same 33-token
+   prefill took 0.59 s in Debug and 0.12 s in ReleaseFast. `zig build` now
+   defaults to ReleaseFast.

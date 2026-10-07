@@ -27,6 +27,11 @@ const weights = @import("ane/weights.zig");
 pub const Options = struct {
     max_seq: u32 = 2048,
     verbose: bool = true,
+    /// Activation width every kernel is compiled for. The ANE reads the weights
+    /// once per evaluation regardless of width (measured: width 128 costs 5%
+    /// more than width 1), so one token and a whole prompt chunk cost the same.
+    /// Must be a multiple of 32 for the planar layout to stay contiguous.
+    chunk: u32 = 64,
     /// EXPERIMENTAL: fuse gate/up/SiLU/down into one ANE program (3 BLOBFILEs).
     /// Off by default: the fused program is numerically wrong at real model
     /// sizes (see README "Known issues"), while the split path is exact.
@@ -76,6 +81,8 @@ pub const Engine = struct {
     v_cache: [][]f32,
     max_seq: u32,
 
+    /// All activation buffers are `[channel * chunk + column]`.
+    chunk: usize,
     x: []f32,
     h: []f32,
     qkv: []f32,
@@ -87,6 +94,17 @@ pub const Engine = struct {
     scores: []f32,
     in16: []f16,
     out16: []f16,
+    /// Single-column staging for the decode path (the padded columns stay zero
+    /// in the IOSurfaces, so only column 0 is written and read).
+    dec_in: []f16,
+    dec_out: []f16,
+    /// Width-1 staging for the lm-head kernel.
+    head_in: []f16,
+    /// Contiguous scratch for one column's q/k/v/attention vectors.
+    sq: []f32,
+    sk: []f32,
+    sv: []f32,
+    sa: []f32,
 
     stats: Stats = .{},
 
@@ -115,6 +133,13 @@ pub const Engine = struct {
         self.allocator.free(self.scores);
         self.allocator.free(self.in16);
         self.allocator.free(self.out16);
+        self.allocator.free(self.dec_in);
+        self.allocator.free(self.dec_out);
+        self.allocator.free(self.head_in);
+        self.allocator.free(self.sq);
+        self.allocator.free(self.sk);
+        self.allocator.free(self.sv);
+        self.allocator.free(self.sa);
         self.* = undefined;
     }
 
@@ -143,6 +168,7 @@ pub const Engine = struct {
         self.head = &.{};
         self.norms = rt.norms;
         self.max_seq = opts.max_seq;
+        self.chunk = opts.chunk;
         self.stats = .{};
 
         const L: usize = cfg.layers;
@@ -161,14 +187,15 @@ pub const Engine = struct {
             if (opts.verbose) sys.print("  layer {d}/{d}: loading weights + compiling ANE kernels\n", .{ i + 1, L });
             var m = try layers.load(allocator, @intCast(i));
             defer m.deinit(allocator); // matrices are baked into the kernels now
-            self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, opts);
+            self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, opts, opts.chunk);
             built += 1;
         }
         if (opts.verbose) sys.print("  lm head: loading weights + compiling ANE kernel ({d} -> {d})\n", .{ cfg.hidden, cfg.vocab });
         const hw = try head.load(allocator);
         defer if (hw.owned) allocator.free(hw.data);
         self.head = hw.data;
-        self.head_kernel = try makeConvKernel(allocator, cfg.hidden, cfg.vocab, hw.data, "lm_head");
+        // The head stays width 1: a [vocab][chunk] output surface would be tens of MB.
+        self.head_kernel = try makeConvKernel(allocator, cfg.hidden, cfg.vocab, hw.data, "lm_head", 1);
 
         const kv_dim: usize = cfg.kvDim();
         self.k_cache = try allocator.alloc([]f32, L);
@@ -180,18 +207,27 @@ pub const Engine = struct {
             @memset(self.v_cache[i], 0);
         }
 
-        self.x = try allocator.alloc(f32, cfg.hidden);
-        self.h = try allocator.alloc(f32, cfg.hidden);
-        self.qkv = try allocator.alloc(f32, cfg.qkvDim());
-        self.attn = try allocator.alloc(f32, cfg.qDim());
-        self.proj = try allocator.alloc(f32, cfg.hidden);
-        self.gu = try allocator.alloc(f32, 2 * cfg.inter);
-        self.act = try allocator.alloc(f32, cfg.inter);
+        const ch: usize = self.chunk;
+        self.x = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
+        self.h = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
+        self.qkv = try allocator.alloc(f32, @as(usize, cfg.qkvDim()) * ch);
+        self.attn = try allocator.alloc(f32, @as(usize, cfg.qDim()) * ch);
+        self.proj = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
+        self.gu = try allocator.alloc(f32, @as(usize, 2 * cfg.inter) * ch);
+        self.act = try allocator.alloc(f32, @as(usize, cfg.inter) * ch);
         self.logits = try allocator.alloc(f32, cfg.vocab);
         self.scores = try allocator.alloc(f32, opts.max_seq);
         const stage = @max(@max(cfg.hidden, cfg.qkvDim()), @max(cfg.qDim(), @max(2 * cfg.inter, cfg.inter)));
-        self.in16 = try allocator.alloc(f16, stage);
-        self.out16 = try allocator.alloc(f16, @max(stage, cfg.vocab));
+        self.in16 = try allocator.alloc(f16, @as(usize, stage) * ch);
+        self.out16 = try allocator.alloc(f16, @as(usize, stage) * ch);
+        self.dec_in = try allocator.alloc(f16, stage);
+        self.dec_out = try allocator.alloc(f16, stage);
+        self.head_in = try allocator.alloc(f16, cfg.hidden);
+        const vec = @max(cfg.qDim(), @max(cfg.kvDim(), cfg.inter));
+        self.sq = try allocator.alloc(f32, vec);
+        self.sk = try allocator.alloc(f32, vec);
+        self.sv = try allocator.alloc(f32, vec);
+        self.sa = try allocator.alloc(f32, vec);
         return self;
     }
 
@@ -202,172 +238,341 @@ pub const Engine = struct {
         for (dst, src) |*d, s| d.* = @floatCast(s);
     }
 
+    /// Gather channel `col` of a `[channel * ch + col]` buffer into `dst`.
+    fn gatherColumn(dst: []f32, src: []const f32, ch: usize, col: usize) void {
+        for (dst, 0..) |*d, c| d.* = src[c * ch + col];
+    }
+
+    /// Scatter `src` into channel `col` of a `[channel * ch + col]` buffer.
+    fn scatterColumn(dst: []f32, src: []const f32, ch: usize, col: usize) void {
+        for (src, 0..) |v, c| dst[c * ch + col] = v;
+    }
+
     /// One decode step for `token` at position `pos`. Returns the logits slice
     /// (owned by the engine, valid until the next call).
+    ///
+    /// Kernels are compiled for `chunk` columns, but a decode step only fills
+    /// column 0: the padded columns stay zero, so the ANE's extra output columns
+    /// are harmless — and measurably free, because the weights are read once per
+    /// evaluation regardless of width.
     pub fn forward(self: *Engine, token: u32, pos: u32) ![]f32 {
         const cfg = self.config;
+        const ch = self.chunk;
         const hidden: usize = cfg.hidden;
         const kv_dim: usize = cfg.kvDim();
         const q_dim: usize = cfg.qDim();
         const inter: usize = cfg.inter;
         const t_start = sys.nowNs();
 
-        f16ToF32Into(self.x, self.embed[@as(usize, token) * hidden ..][0..hidden]);
+        for (0..hidden) |c| {
+            self.x[c * ch] = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+        }
 
         for (self.kernels, 0..) |*k, li| {
             const norm = &self.norms[li];
 
-            // ---- attention: qkv projection on ANE ----
-            cpu.rmsnorm(self.h, self.x, norm.attn, cfg.eps);
-            f32ToF16Into(self.in16[0..hidden], self.h);
-            try k.qkv.writeInputF16(0, self.in16[0..hidden]);
+            // ---- attention: qkv projection on ANE (column 0) ----
+            rmsnormColumn(self.dec_in[0..hidden], self.x, norm.attn, cfg.eps, ch);
+            try k.qkv.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
             var t0 = sys.nowNs();
             try k.qkv.eval();
             self.stats.ane_eval_ns += sys.nowNs() - t0;
             self.stats.ane_evals += 1;
-            try k.qkv.readOutputF16(0, self.out16[0..cfg.qkvDim()]);
-            f16ToF32Into(self.qkv, self.out16[0..cfg.qkvDim()]);
-            if (norm.qkv_bias) |b| cpu.addInPlace(self.qkv, b);
-
-            const q = self.qkv[0..q_dim];
-            const kk = self.qkv[q_dim..][0..kv_dim];
-            const vv = self.qkv[q_dim + kv_dim ..][0..kv_dim];
-            if (cfg.rope_adjacent) {
-                cpu.ropeAdjacent(q, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
-                cpu.ropeAdjacent(kk, cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
-            } else {
-                cpu.rope(q, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
-                cpu.rope(kk, cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            try k.qkv.readOutputColumnF16(0, 0, self.dec_out[0..cfg.qkvDim()]);
+            for (0..cfg.qkvDim()) |c| self.qkv[c * ch] = @floatCast(self.dec_out[c]);
+            if (norm.qkv_bias) |b| {
+                for (b, 0..) |v, c| self.qkv[c * ch] += v;
             }
 
-            @memcpy(self.k_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim], kk);
-            @memcpy(self.v_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim], vv);
-
-            cpu.attentionDecode(self.attn, q, self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores);
+            gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, 0);
+            gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, 0);
+            gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, 0);
+            self.ropeAndCache(li, pos, cfg, kv_dim);
+            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores);
+            scatterColumn(self.attn[0..], self.sa[0..q_dim], ch, 0);
 
             // ---- attention output projection on ANE ----
-            f32ToF16Into(self.in16[0..q_dim], self.attn);
-            try k.o.writeInputF16(0, self.in16[0..q_dim]);
+            for (0..q_dim) |c| self.dec_in[c] = @floatCast(self.attn[c * ch]);
+            try k.o.writeInputColumnF16(0, 0, self.dec_in[0..q_dim]);
             t0 = sys.nowNs();
             try k.o.eval();
             self.stats.ane_eval_ns += sys.nowNs() - t0;
             self.stats.ane_evals += 1;
-            try k.o.readOutputF16(0, self.out16[0..hidden]);
-            f16ToF32Into(self.proj, self.out16[0..hidden]);
-            if (norm.o_bias) |b| cpu.addInPlace(self.proj, b);
-            cpu.addInPlace(self.x, self.proj);
+            try k.o.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
+            for (0..hidden) |c| {
+                var v = @as(f32, @floatCast(self.dec_out[c]));
+                if (norm.o_bias) |b| v += b[c];
+                self.x[c * ch] += v;
+            }
 
             // ---- feed-forward on ANE ----
-            cpu.rmsnorm(self.h, self.x, norm.ffn, cfg.eps);
-            f32ToF16Into(self.in16[0..hidden], self.h);
-            try k.ffn.writeInputF16(0, self.in16[0..hidden]);
+            rmsnormColumn(self.dec_in[0..hidden], self.x, norm.ffn, cfg.eps, ch);
+            try k.ffn.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
             t0 = sys.nowNs();
             try k.ffn.eval();
             self.stats.ane_eval_ns += sys.nowNs() - t0;
             self.stats.ane_evals += 1;
 
             if (k.ffn_split) {
-                try k.ffn.readOutputF16(0, self.out16[0 .. 2 * inter]);
-                f16ToF32Into(self.gu, self.out16[0 .. 2 * inter]);
-                cpu.siluMul(self.act, self.gu[0..inter], self.gu[inter..][0..inter]);
-                f32ToF16Into(self.in16[0..inter], self.act);
+                try k.ffn.readOutputColumnF16(0, 0, self.dec_out[0 .. 2 * inter]);
+                const gate = self.sq[0..inter];
+                const up = self.sk[0..inter];
+                for (0..inter) |c| {
+                    gate[c] = @floatCast(self.dec_out[c]);
+                    up[c] = @floatCast(self.dec_out[inter + c]);
+                }
+                cpu.siluMul(self.sa[0..inter], gate, up);
+                for (0..inter) |c| self.dec_in[c] = @floatCast(self.sa[c]);
                 const dk = &k.down.?;
-                try dk.writeInputF16(0, self.in16[0..inter]);
+                try dk.writeInputColumnF16(0, 0, self.dec_in[0..inter]);
                 t0 = sys.nowNs();
                 try dk.eval();
                 self.stats.ane_eval_ns += sys.nowNs() - t0;
                 self.stats.ane_evals += 1;
-                try dk.readOutputF16(0, self.out16[0..hidden]);
+                try dk.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
             } else {
-                try k.ffn.readOutputF16(0, self.out16[0..hidden]);
+                try k.ffn.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
             }
-            f16ToF32Into(self.proj, self.out16[0..hidden]);
-            cpu.addInPlace(self.x, self.proj);
+            for (0..hidden) |c| self.x[c * ch] += @floatCast(self.dec_out[c]);
         }
 
-        // ---- final norm + lm head on ANE ----
-        cpu.rmsnorm(self.h, self.x, self.final_norm, cfg.eps);
-        f32ToF16Into(self.in16[0..hidden], self.h);
-        try self.head_kernel.writeInputF16(0, self.in16[0..hidden]);
+        // ---- final norm + lm head (width-1 kernel) ----
+        rmsnormColumn(self.head_in[0..hidden], self.x, self.final_norm, cfg.eps, ch);
+        try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
         const t4 = sys.nowNs();
         try self.head_kernel.eval();
         self.stats.ane_eval_ns += sys.nowNs() - t4;
         self.stats.ane_evals += 1;
         try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
-        f16ToF32Into(self.logits, self.out16[0..cfg.vocab]);
+        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
 
         self.stats.total_ns += sys.nowNs() - t_start;
         self.stats.tokens += 1;
         return self.logits;
     }
 
+    fn ropeAndCache(self: *Engine, li: usize, pos: u32, cfg: model.Config, kv_dim: usize) void {
+        if (cfg.rope_adjacent) {
+            cpu.ropeAdjacent(self.sq, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
+            cpu.ropeAdjacent(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+        } else {
+            cpu.rope(self.sq, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
+            cpu.rope(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+        }
+        @memcpy(self.k_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim], self.sk[0..kv_dim]);
+        @memcpy(self.v_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim], self.sv[0..kv_dim]);
+    }
+
+    /// Process up to `chunk` prompt tokens in one pass and return the logits for
+    /// the last one. This is where the weight-bandwidth-bound behaviour of the
+    /// ANE pays off: a whole chunk costs the same as a single token.
+    pub fn prefill(self: *Engine, ids: []const u32, start_pos: u32) ![]f32 {
+        const cfg = self.config;
+        const ch = self.chunk;
+        const hidden: usize = cfg.hidden;
+        const kv_dim: usize = cfg.kvDim();
+        const q_dim: usize = cfg.qDim();
+        const inter: usize = cfg.inter;
+
+        var done: usize = 0;
+        while (done < ids.len) {
+            const n = @min(ch, ids.len - done);
+            const base_pos: u32 = start_pos + @as(u32, @intCast(done));
+
+            for (0..n) |j| {
+                const row = self.embed[@as(usize, ids[done + j]) * hidden ..][0..hidden];
+                for (0..hidden) |c| self.x[c * ch + j] = @floatCast(row[c]);
+            }
+            for (n..ch) |j| {
+                for (0..hidden) |c| self.x[c * ch + j] = 0;
+            }
+
+            for (self.kernels, 0..) |*k, li| {
+                const norm = &self.norms[li];
+
+                // ---- qkv projection for the whole chunk ----
+                rmsnormChunk(self.in16[0 .. hidden * ch], self.x, norm.attn, cfg.eps, ch, n);
+                try k.qkv.writeInputF16(0, self.in16[0 .. hidden * ch]);
+                var t0 = sys.nowNs();
+                try k.qkv.eval();
+                self.stats.ane_eval_ns += sys.nowNs() - t0;
+                self.stats.ane_evals += 1;
+                const qkv_len = @as(usize, cfg.qkvDim()) * ch;
+                try k.qkv.readOutputF16(0, self.out16[0..qkv_len]);
+                for (0..qkv_len) |i| self.qkv[i] = @floatCast(self.out16[i]);
+                if (norm.qkv_bias) |b| {
+                    for (0..n) |j| for (b, 0..) |v, c| {
+                        self.qkv[c * ch + j] += v;
+                    };
+                }
+
+                // ---- RoPE + KV cache, one position at a time ----
+                // The rotated query is written back into the chunk buffer so the
+                // attention pass below sees it (the decode path keeps it in sq).
+                for (0..n) |j| {
+                    const pos = base_pos + @as(u32, @intCast(j));
+                    gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, j);
+                    gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, j);
+                    gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, j);
+                    self.ropeAndCache(li, pos, cfg, kv_dim);
+                    scatterColumn(self.qkv[0..], self.sq[0..q_dim], ch, j);
+                }
+
+                // ---- causal attention, one position at a time ----
+                for (0..n) |j| {
+                    const pos = base_pos + @as(u32, @intCast(j));
+                    gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, j);
+                    cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores);
+                    scatterColumn(self.attn[0..], self.sa[0..q_dim], ch, j);
+                }
+
+                // ---- attention output projection ----
+                f32ToF16Chunk(self.in16[0 .. q_dim * ch], self.attn, ch, n);
+                try k.o.writeInputF16(0, self.in16[0 .. q_dim * ch]);
+                t0 = sys.nowNs();
+                try k.o.eval();
+                self.stats.ane_eval_ns += sys.nowNs() - t0;
+                self.stats.ane_evals += 1;
+                const proj_len = hidden * ch;
+                try k.o.readOutputF16(0, self.out16[0..proj_len]);
+                for (0..n) |j| {
+                    for (0..hidden) |c| {
+                        var v = @as(f32, @floatCast(self.out16[c * ch + j]));
+                        if (norm.o_bias) |b| v += b[c];
+                        self.x[c * ch + j] += v;
+                    }
+                }
+
+                // ---- feed-forward ----
+                rmsnormChunk(self.in16[0 .. hidden * ch], self.x, norm.ffn, cfg.eps, ch, n);
+                try k.ffn.writeInputF16(0, self.in16[0 .. hidden * ch]);
+                t0 = sys.nowNs();
+                try k.ffn.eval();
+                self.stats.ane_eval_ns += sys.nowNs() - t0;
+                self.stats.ane_evals += 1;
+
+                if (k.ffn_split) {
+                    const gu_len = @as(usize, 2 * inter) * ch;
+                    try k.ffn.readOutputF16(0, self.out16[0..gu_len]);
+                    const gate = self.sq[0..inter];
+                    const up = self.sk[0..inter];
+                    for (0..n) |j| {
+                        for (0..inter) |c| {
+                            gate[c] = @floatCast(self.out16[c * ch + j]);
+                            up[c] = @floatCast(self.out16[(inter + c) * ch + j]);
+                        }
+                        cpu.siluMul(self.sa[0..inter], gate, up);
+                        for (0..inter) |c| self.in16[c * ch + j] = @floatCast(self.sa[c]);
+                    }
+                    const dk = &k.down.?;
+                    try dk.writeInputF16(0, self.in16[0 .. inter * ch]);
+                    t0 = sys.nowNs();
+                    try dk.eval();
+                    self.stats.ane_eval_ns += sys.nowNs() - t0;
+                    self.stats.ane_evals += 1;
+                    try dk.readOutputF16(0, self.out16[0..proj_len]);
+                } else {
+                    try k.ffn.readOutputF16(0, self.out16[0..proj_len]);
+                }
+                for (0..n) |j| {
+                    for (0..hidden) |c| self.x[c * ch + j] += @floatCast(self.out16[c * ch + j]);
+                }
+            }
+
+            // Logits for the last real column, via the width-1 head kernel.
+            const last = n - 1;
+            for (0..hidden) |c| self.h[c * ch] = self.x[c * ch + last];
+            rmsnormColumn(self.head_in[0..hidden], self.h, self.final_norm, cfg.eps, ch);
+            try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
+            const th = sys.nowNs();
+            try self.head_kernel.eval();
+            self.stats.ane_eval_ns += sys.nowNs() - th;
+            self.stats.ane_evals += 1;
+            try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
+            for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
+
+            done += n;
+            self.stats.tokens += 1;
+        }
+        return self.logits;
+    }
+
     /// Compare each ANE kernel against a CPU matmul with the same weights, to
-    /// localise a broken kernel when end-to-end output looks wrong.
+    /// localise a broken kernel when end-to-end output looks wrong. Uses column
+    /// 0 of the chunked kernels.
     pub fn diagnose(self: *Engine, token: u32, lw: *const model.Matrices) !void {
         const cfg = self.config;
+        const ch = self.chunk;
         const hidden: usize = cfg.hidden;
         const q_dim: usize = cfg.qDim();
         const inter: usize = cfg.inter;
 
-        f16ToF32Into(self.x, self.embed[@as(usize, token) * hidden ..][0..hidden]);
-        cpu.rmsnorm(self.h, self.x, self.norms[0].attn, cfg.eps);
+        for (0..hidden) |c| self.x[c * ch] = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+        rmsnormColumn(self.dec_in[0..hidden], self.x, self.norms[0].attn, cfg.eps, ch);
 
         const ref = try self.allocator.alloc(f32, cfg.vocab);
         defer self.allocator.free(ref);
+        const h32 = try self.allocator.alloc(f32, @max(hidden, @max(cfg.qkvDim(), inter)));
+        defer self.allocator.free(h32);
+        const got = try self.allocator.alloc(f32, @max(cfg.qkvDim(), @max(hidden, inter)));
+        defer self.allocator.free(got);
 
         // --- qkv ---
-        f32ToF16Into(self.in16[0..hidden], self.h);
-        try self.kernels[0].qkv.writeInputF16(0, self.in16[0..hidden]);
+        try self.kernels[0].qkv.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
         try self.kernels[0].qkv.eval();
-        try self.kernels[0].qkv.readOutputF16(0, self.out16[0..cfg.qkvDim()]);
-        f16ToF32Into(self.qkv, self.out16[0..cfg.qkvDim()]);
-        cpu.matmulF16(ref[0..cfg.qkvDim()], lw.qkv, self.h, cfg.qkvDim(), hidden);
-        reportKernel("qkv", self.qkv, ref[0..cfg.qkvDim()]);
+        try self.kernels[0].qkv.readOutputColumnF16(0, 0, self.dec_out[0..cfg.qkvDim()]);
+        for (0..hidden) |c| h32[c] = @floatCast(self.dec_in[c]);
+        for (0..cfg.qkvDim()) |c| got[c] = @floatCast(self.dec_out[c]);
+        cpu.matmulF16(ref[0..cfg.qkvDim()], lw.qkv, h32[0..hidden], cfg.qkvDim(), hidden);
+        reportKernel("qkv", got[0..cfg.qkvDim()], ref[0..cfg.qkvDim()]);
 
-        // --- o projection (input: the ANE qkv's q part, so both use the same x) ---
-        f32ToF16Into(self.in16[0..q_dim], self.qkv[0..q_dim]);
-        try self.kernels[0].o.writeInputF16(0, self.in16[0..q_dim]);
+        // --- o projection (fed with the ANE qkv's q part so both see the same x) ---
+        for (0..q_dim) |c| self.dec_in[c] = @floatCast(self.dec_out[c]);
+        try self.kernels[0].o.writeInputColumnF16(0, 0, self.dec_in[0..q_dim]);
         try self.kernels[0].o.eval();
-        try self.kernels[0].o.readOutputF16(0, self.out16[0..hidden]);
-        f16ToF32Into(self.proj, self.out16[0..hidden]);
-        cpu.matmulF16(ref[0..hidden], lw.o, self.qkv[0..q_dim], hidden, q_dim);
-        reportKernel("o", self.proj, ref[0..hidden]);
+        try self.kernels[0].o.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
+        for (0..q_dim) |c| h32[c] = @floatCast(self.dec_in[c]);
+        for (0..hidden) |c| got[c] = @floatCast(self.dec_out[c]);
+        cpu.matmulF16(ref[0..hidden], lw.o, h32[0..q_dim], hidden, q_dim);
+        reportKernel("o", got[0..hidden], ref[0..hidden]);
 
-        // --- fused FFN ---
-        f32ToF16Into(self.in16[0..hidden], self.h);
-        try self.kernels[0].ffn.writeInputF16(0, self.in16[0..hidden]);
+        // --- feed-forward ---
+        rmsnormColumn(self.dec_in[0..hidden], self.x, self.norms[0].ffn, cfg.eps, ch);
+        try self.kernels[0].ffn.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
         try self.kernels[0].ffn.eval();
+        for (0..hidden) |c| h32[c] = @floatCast(self.dec_in[c]);
         if (self.kernels[0].ffn_split) {
-            try self.kernels[0].ffn.readOutputF16(0, self.out16[0 .. 2 * inter]);
-            f16ToF32Into(self.gu, self.out16[0 .. 2 * inter]);
-            cpu.matmulF16(ref[0..inter], lw.gate, self.h, inter, hidden);
-            reportKernel("gate", self.gu[0..inter], ref[0..inter]);
-            cpu.matmulF16(ref[0..inter], lw.up, self.h, inter, hidden);
-            reportKernel("up", self.gu[inter..][0..inter], ref[0..inter]);
+            try self.kernels[0].ffn.readOutputColumnF16(0, 0, self.dec_out[0 .. 2 * inter]);
+            for (0..inter) |c| got[c] = @floatCast(self.dec_out[c]);
+            cpu.matmulF16(ref[0..inter], lw.gate, h32[0..hidden], inter, hidden);
+            reportKernel("gate", got[0..inter], ref[0..inter]);
+            for (0..inter) |c| got[c] = @floatCast(self.dec_out[inter + c]);
+            cpu.matmulF16(ref[0..inter], lw.up, h32[0..hidden], inter, hidden);
+            reportKernel("up", got[0..inter], ref[0..inter]);
         } else {
-            try self.kernels[0].ffn.readOutputF16(0, self.out16[0..hidden]);
-            f16ToF32Into(self.proj, self.out16[0..hidden]);
+            try self.kernels[0].ffn.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
             const g = try self.allocator.alloc(f32, inter);
             defer self.allocator.free(g);
             const u = try self.allocator.alloc(f32, inter);
             defer self.allocator.free(u);
             const a = try self.allocator.alloc(f32, inter);
             defer self.allocator.free(a);
-            cpu.matmulF16(g, lw.gate, self.h, inter, hidden);
-            cpu.matmulF16(u, lw.up, self.h, inter, hidden);
+            cpu.matmulF16(g, lw.gate, h32[0..hidden], inter, hidden);
+            cpu.matmulF16(u, lw.up, h32[0..hidden], inter, hidden);
             cpu.siluMul(a, g, u);
             cpu.matmulF16(ref[0..hidden], lw.down, a, hidden, inter);
-            reportKernel("ffn(fused)", self.proj, ref[0..hidden]);
+            for (0..hidden) |c| got[c] = @floatCast(self.dec_out[c]);
+            reportKernel("ffn(fused)", got[0..hidden], ref[0..hidden]);
         }
 
         // --- lm head ---
-        cpu.rmsnorm(self.h, self.x, self.final_norm, cfg.eps);
-        f32ToF16Into(self.in16[0..hidden], self.h);
-        try self.head_kernel.writeInputF16(0, self.in16[0..hidden]);
+        rmsnormColumn(self.head_in[0..hidden], self.x, self.final_norm, cfg.eps, ch);
+        try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
         try self.head_kernel.eval();
         try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
-        f16ToF32Into(self.logits, self.out16[0..cfg.vocab]);
-        cpu.matmulF16(ref, self.head, self.h, cfg.vocab, hidden);
+        for (0..hidden) |c| h32[c] = @floatCast(self.head_in[c]);
+        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
+        cpu.matmulF16(ref, self.head, h32[0..hidden], cfg.vocab, hidden);
         reportKernel("lm_head", self.logits, ref);
     }
 
@@ -395,14 +600,47 @@ fn reportKernel(name: []const u8, got: []const f32, ref: []const f32) void {
     });
 }
 
+/// out[c] = f16(x[c * ch] * rsqrt(mean(x^2) + eps) * weight[c]) for column 0.
+fn rmsnormColumn(out: []f16, x: []const f32, weight: []const f32, eps: f32, ch: usize) void {
+    const n = weight.len;
+    var acc: f32 = 0;
+    for (0..n) |c| {
+        const v = x[c * ch];
+        acc += v * v;
+    }
+    const inv = 1.0 / @sqrt(acc / @as(f32, @floatFromInt(n)) + eps);
+    for (0..n) |c| out[c] = @floatCast(x[c * ch] * inv * weight[c]);
+}
+
+/// Same, for the first `cols` columns of a `[channel * ch + col]` buffer.
+fn rmsnormChunk(out: []f16, x: []const f32, weight: []const f32, eps: f32, ch: usize, cols: usize) void {
+    const n = weight.len;
+    for (0..cols) |j| {
+        var acc: f32 = 0;
+        for (0..n) |c| {
+            const v = x[c * ch + j];
+            acc += v * v;
+        }
+        const inv = 1.0 / @sqrt(acc / @as(f32, @floatFromInt(n)) + eps);
+        for (0..n) |c| out[c * ch + j] = @floatCast(x[c * ch + j] * inv * weight[c]);
+    }
+}
+
+fn f32ToF16Chunk(out: []f16, x: []const f32, ch: usize, cols: usize) void {
+    const n = out.len / ch;
+    for (0..n) |c| {
+        for (0..cols) |j| out[c * ch + j] = @floatCast(x[c * ch + j]);
+    }
+}
+
 /// Create a single-conv kernel: cin -> cout, weights already in ANE layout.
-fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const f16, label: []const u8) !ane.Kernel {
+fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const f16, label: []const u8, width: u32) !ane.Kernel {
     _ = label;
     std.debug.assert(w.len == @as(usize, cin) * cout);
     var sym_buf: [64]u8 = undefined;
     const sym = try weights.symbol(&sym_buf);
     const program = try mil.build(allocator, .{
-        .inputs = &.{.{ .name = "i0", .channels = cin }},
+        .inputs = &.{.{ .name = "i0", .channels = cin, .width = width }},
         .ops = &.{.{ .conv = .{
             .x = "i0",
             .w = "w0",
@@ -411,6 +649,7 @@ fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const 
             .cout = cout,
             .blob_offset = 64,
             .file = sym,
+            .width = width,
         } }},
         .outputs = &.{"o0"},
     });
@@ -430,6 +669,7 @@ fn makeFusedFfnKernel(
     gate: []const f16,
     up: []const f16,
     down: []const f16,
+    width: u32,
 ) !ane.Kernel {
     const sizes = [_]usize{ gate.len * 2, up.len * 2, down.len * 2 };
     var offsets: [3]u64 = undefined;
@@ -438,14 +678,14 @@ fn makeFusedFfnKernel(
     var sym_buf: [64]u8 = undefined;
     const sym = try weights.symbol(&sym_buf);
     const program = try mil.build(allocator, .{
-        .inputs = &.{.{ .name = "i0", .channels = hidden }},
+        .inputs = &.{.{ .name = "i0", .channels = hidden, .width = width }},
         .ops = &.{
-            .{ .conv = .{ .x = "i0", .w = "w0", .y = "t0", .cin = hidden, .cout = inter, .blob_offset = offsets[0], .file = sym } },
-            .{ .conv = .{ .x = "i0", .w = "w1", .y = "t1", .cin = hidden, .cout = inter, .blob_offset = offsets[1], .file = sym } },
-            .{ .sigmoid = .{ .x = "t0", .y = "t2", .channels = inter } },
-            .{ .mul = .{ .a = "t0", .b = "t2", .y = "t3", .channels = inter } },
-            .{ .mul = .{ .a = "t3", .b = "t1", .y = "t4", .channels = inter } },
-            .{ .conv = .{ .x = "t4", .w = "w2", .y = "o0", .cin = inter, .cout = hidden, .blob_offset = offsets[2], .file = sym } },
+            .{ .conv = .{ .x = "i0", .w = "w0", .y = "t0", .cin = hidden, .cout = inter, .blob_offset = offsets[0], .file = sym, .width = width } },
+            .{ .conv = .{ .x = "i0", .w = "w1", .y = "t1", .cin = hidden, .cout = inter, .blob_offset = offsets[1], .file = sym, .width = width } },
+            .{ .sigmoid = .{ .x = "t0", .y = "t2", .channels = inter, .width = width } },
+            .{ .mul = .{ .a = "t0", .b = "t2", .y = "t3", .channels = inter, .width = width } },
+            .{ .mul = .{ .a = "t3", .b = "t1", .y = "t4", .channels = inter, .width = width } },
+            .{ .conv = .{ .x = "t4", .w = "w2", .y = "o0", .cin = inter, .cout = hidden, .blob_offset = offsets[2], .file = sym, .width = width } },
         },
         .outputs = &.{"o0"},
     });
@@ -460,14 +700,14 @@ fn makeFusedFfnKernel(
     }});
 }
 
-fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.Matrices, opts: Options) !LayerKernels {
-    var qkv = try makeConvKernel(allocator, cfg.hidden, cfg.qkvDim(), lw.qkv, "qkv");
+fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.Matrices, opts: Options, width: u32) !LayerKernels {
+    var qkv = try makeConvKernel(allocator, cfg.hidden, cfg.qkvDim(), lw.qkv, "qkv", width);
     errdefer qkv.deinit();
-    var o = try makeConvKernel(allocator, cfg.qDim(), cfg.hidden, lw.o, "o");
+    var o = try makeConvKernel(allocator, cfg.qDim(), cfg.hidden, lw.o, "o", width);
     errdefer o.deinit();
 
     if (opts.fuse_ffn) {
-        if (makeFusedFfnKernel(allocator, cfg.hidden, cfg.inter, lw.gate, lw.up, lw.down)) |fk| {
+        if (makeFusedFfnKernel(allocator, cfg.hidden, cfg.inter, lw.gate, lw.up, lw.down, width)) |fk| {
             return .{ .qkv = qkv, .o = o, .ffn = fk, .ffn_split = false };
         } else |e| {
             if (opts.verbose) {
@@ -480,9 +720,9 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     defer allocator.free(gu);
     @memcpy(gu[0..lw.gate.len], lw.gate);
     @memcpy(gu[lw.gate.len..], lw.up);
-    var gu_k = try makeConvKernel(allocator, cfg.hidden, 2 * cfg.inter, gu, "gate_up");
+    var gu_k = try makeConvKernel(allocator, cfg.hidden, 2 * cfg.inter, gu, "gate_up", width);
     errdefer gu_k.deinit();
-    var down_k = try makeConvKernel(allocator, cfg.inter, cfg.hidden, lw.down, "down");
+    var down_k = try makeConvKernel(allocator, cfg.inter, cfg.hidden, lw.down, "down", width);
     errdefer down_k.deinit();
     return .{ .qkv = qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k };
 }

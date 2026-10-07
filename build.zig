@@ -2,7 +2,10 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseFast: the engine spends a real amount of time in Zig
+    // code (prompt batching, attention, dequantisation) where Debug is ~8x
+    // slower. `zig build -Doptimize=Debug` is still available for development.
+    const optimize = b.option(std.builtin.Optimize, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
 
     // The ANE shim is Objective-C with ARC. Zig's bundled clang crashes on it,
     // so compile it with the system toolchain and link the object file.

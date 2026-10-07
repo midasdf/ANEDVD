@@ -31,7 +31,7 @@ measurements live in `docs/RESULTS.md`.
 | `tests/fixtures/`, `tools/` | dequant/tokenizer fixtures and the independent Python cross-checks |
 
 ```sh
-zig build            # zig-out/bin/anedvd
+zig build            # zig-out/bin/anedvd (ReleaseFast by default; -Doptimize=debug to develop)
 zig build test       # unit tests (gguf/tokenizer fixtures need cwd = repo root)
 zig build run -- info
 zig fmt src build.zig
@@ -46,6 +46,12 @@ zig fmt src build.zig
   `std.enums.fromInt`. `main` takes `std.process.Init` for args.
 * **Zig's bundled clang crashes on the ARC Objective-C shim**, so `build.zig`
   compiles `src/ane/shim.m` with `/usr/bin/clang` and links the object file.
+* **Kernels are compiled for a fixed activation width** (`Options.chunk`, default
+  64): decode fills column 0, prefill fills a whole chunk. The ANE costs the
+  same either way (weights are read once), so do not "fix" this by building
+  width-1 kernels — that just makes prefill 10x slower.
+* **Use `run --ab`** after touching the prefill path: it asserts the batched and
+  per-token logits are bit-identical.
 * **The ANE fails silently.** A wrong weight-blob offset, a transposed weight or
   a mis-strided IOSurface all *compile and run* and return plausible numbers.
   Always validate a new kernel against a CPU matmul (`anedvd check`).
