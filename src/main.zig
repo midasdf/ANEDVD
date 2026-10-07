@@ -263,8 +263,8 @@ fn matmulF16(out: []f32, w: []const f16, x: []const f32, out_dim: usize, in_dim:
 }
 
 const RefState = struct {
-    k: [][]f32,
-    v: [][]f32,
+    k: [][]f16,
+    v: [][]f16,
 };
 
 /// Pure-CPU reference forward, mirroring engine.forward exactly.
@@ -317,8 +317,10 @@ fn refForward(
             cpu.rope(q, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
             cpu.rope(kk, cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
         }
-        @memcpy(st.k[li][@as(usize, pos) * kv_dim ..][0..kv_dim], kk);
-        @memcpy(st.v[li][@as(usize, pos) * kv_dim ..][0..kv_dim], vv);
+        for (0..kv_dim) |i| {
+            st.k[li][@as(usize, pos) * kv_dim + i] = @floatCast(kk[i]);
+            st.v[li][@as(usize, pos) * kv_dim + i] = @floatCast(vv[i]);
+        }
         cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, scores);
         matmulF16(proj, lw.o, attn, hidden, q_dim);
         if (lw.o_bias) |b| cpu.addInPlace(proj, b);
@@ -418,8 +420,8 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
     defer engine.deinit();
 
     var st = RefState{
-        .k = try allocator.alloc([]f32, cfg.layers),
-        .v = try allocator.alloc([]f32, cfg.layers),
+        .k = try allocator.alloc([]f16, cfg.layers),
+        .v = try allocator.alloc([]f16, cfg.layers),
     };
     defer {
         for (st.k) |c| allocator.free(c);
@@ -428,8 +430,8 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
         allocator.free(st.v);
     }
     for (0..cfg.layers) |i| {
-        st.k[i] = try allocator.alloc(f32, 64 * cfg.kvDim());
-        st.v[i] = try allocator.alloc(f32, 64 * cfg.kvDim());
+        st.k[i] = try allocator.alloc(f16, 64 * cfg.kvDim());
+        st.v[i] = try allocator.alloc(f16, 64 * cfg.kvDim());
         @memset(st.k[i], 0);
         @memset(st.v[i], 0);
     }
@@ -800,7 +802,7 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     defer allocator.free(ids);
 
     const L: usize = cfg.layers;
-    var st = RefState{ .k = try allocator.alloc([]f32, L), .v = try allocator.alloc([]f32, L) };
+    var st = RefState{ .k = try allocator.alloc([]f16, L), .v = try allocator.alloc([]f16, L) };
     defer {
         for (st.k) |c| allocator.free(c);
         for (st.v) |c| allocator.free(c);
@@ -808,8 +810,8 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         allocator.free(st.v);
     }
     for (0..L) |i| {
-        st.k[i] = try allocator.alloc(f32, 1024 * cfg.kvDim());
-        st.v[i] = try allocator.alloc(f32, 1024 * cfg.kvDim());
+        st.k[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
+        st.v[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
         @memset(st.k[i], 0);
         @memset(st.v[i], 0);
     }
@@ -1123,9 +1125,9 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
     const iters: u32 = argValue(argv, "--iters", 200);
     const kv_dim: usize = @as(usize, kv_heads) * hd;
 
-    const k = try allocator.alloc(f32, ctx * kv_dim);
+    const k = try allocator.alloc(f16, ctx * kv_dim);
     defer allocator.free(k);
-    const v = try allocator.alloc(f32, ctx * kv_dim);
+    const v = try allocator.alloc(f16, ctx * kv_dim);
     defer allocator.free(v);
     const q = try allocator.alloc(f32, @as(usize, heads) * hd);
     defer allocator.free(q);
@@ -1136,11 +1138,11 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
     var seed: u32 = 7;
     for (k) |*x| {
         seed = seed *% 1664525 +% 1013904223;
-        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
     }
     for (v) |*x| {
         seed = seed *% 1664525 +% 1013904223;
-        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
     }
     for (q) |*x| {
         seed = seed *% 1664525 +% 1013904223;
@@ -1163,7 +1165,7 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
             const q_h = q[h * hd ..][0..hd];
             for (0..ctx) |t| {
                 const k_t = k[t * kv_dim + kvh * hd ..][0..hd];
-                scores[t] = cpu.dotF32(q_h, k_t) * scale;
+                scores[t] = cpu.dotF32F16(q_h, k_t) * scale;
             }
         }
     }

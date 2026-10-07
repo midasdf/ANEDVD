@@ -79,6 +79,7 @@ pub fn addInPlace(dst: []f32, src: []const f32) void {
 /// serialises on the add dependency chain.
 const LANES = 8;
 const F32x = @Vector(LANES, f32);
+const F16x = @Vector(LANES, f16);
 
 /// dot(a, b) over equally sized slices, 8 lanes at a time.
 pub fn dotF32(a: []const f32, b: []const f32) f32 {
@@ -95,17 +96,32 @@ pub fn dotF32(a: []const f32, b: []const f32) f32 {
     return sum;
 }
 
-/// out += weight * v, 8 lanes at a time.
-fn axpyF32(out: []f32, v: []const f32, weight: f32) void {
+/// dot(a_f32, b_f16): the KV cache is fp16, the query stays fp32.
+pub fn dotF32F16(a: []const f32, b: []const f16) f32 {
+    std.debug.assert(a.len == b.len);
+    var acc: F32x = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= a.len) : (i += LANES) {
+        const va: F32x = a[i..][0..LANES].*;
+        const vb: F16x = b[i..][0..LANES].*;
+        acc += va * @as(F32x, @floatCast(vb));
+    }
+    var sum: f32 = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) sum += a[i] * @as(f32, @floatCast(b[i]));
+    return sum;
+}
+
+/// out += weight * v (fp16 source), 8 lanes at a time.
+fn axpyF16(out: []f32, v: []const f16, weight: f32) void {
     const w: F32x = @splat(weight);
     var i: usize = 0;
     while (i + LANES <= out.len) : (i += LANES) {
         var o: F32x = out[i..][0..LANES].*;
-        const vv: F32x = v[i..][0..LANES].*;
-        o += w * vv;
+        const vv: F16x = v[i..][0..LANES].*;
+        o += w * @as(F32x, @floatCast(vv));
         out[i..][0..LANES].* = o;
     }
-    while (i < out.len) : (i += 1) out[i] += weight * v[i];
+    while (i < out.len) : (i += 1) out[i] += weight * @as(f32, @floatCast(v[i]));
 }
 
 /// Softmax over `scores[0..n]` in place.
@@ -133,8 +149,8 @@ pub fn softmax(scores: []f32) void {
 pub fn attentionDecode(
     out: []f32,
     q: []const f32,
-    k_cache: []const f32,
-    v_cache: []const f32,
+    k_cache: []const f16,
+    v_cache: []const f16,
     n_past: usize,
     n_heads: u32,
     n_kv_heads: u32,
@@ -154,7 +170,7 @@ pub fn attentionDecode(
         const scores = scores_scratch[0..n_past];
         for (0..n_past) |t| {
             const k_t = k_cache[t * kv_dim + kvh * hd ..][0..hd];
-            scores[t] = dotF32(q_h, k_t) * scale;
+            scores[t] = dotF32F16(q_h, k_t) * scale;
         }
         softmax(scores);
         const o_h = out[h * hd ..][0..hd];
@@ -173,14 +189,14 @@ pub fn attentionDecode(
             for (0..n_past) |t| {
                 const v_t = v_cache[t * kv_dim + kvh * hd ..][0..hd];
                 const w: F32x = @splat(scores[t]);
-                a0 += w * @as(F32x, v_t[0..8].*);
-                a1 += w * @as(F32x, v_t[8..16].*);
-                a2 += w * @as(F32x, v_t[16..24].*);
-                a3 += w * @as(F32x, v_t[24..32].*);
-                a4 += w * @as(F32x, v_t[32..40].*);
-                a5 += w * @as(F32x, v_t[40..48].*);
-                a6 += w * @as(F32x, v_t[48..56].*);
-                a7 += w * @as(F32x, v_t[56..64].*);
+                a0 += w * @as(F32x, @floatCast(@as(F16x, v_t[0..8].*)));
+                a1 += w * @as(F32x, @floatCast(@as(F16x, v_t[8..16].*)));
+                a2 += w * @as(F32x, @floatCast(@as(F16x, v_t[16..24].*)));
+                a3 += w * @as(F32x, @floatCast(@as(F16x, v_t[24..32].*)));
+                a4 += w * @as(F32x, @floatCast(@as(F16x, v_t[32..40].*)));
+                a5 += w * @as(F32x, @floatCast(@as(F16x, v_t[40..48].*)));
+                a6 += w * @as(F32x, @floatCast(@as(F16x, v_t[48..56].*)));
+                a7 += w * @as(F32x, @floatCast(@as(F16x, v_t[56..64].*)));
             }
             o_h[0..8].* = a0;
             o_h[8..16].* = a1;
@@ -194,7 +210,7 @@ pub fn attentionDecode(
             @memset(o_h, 0);
             for (0..n_past) |t| {
                 const v_t = v_cache[t * kv_dim + kvh * hd ..][0..hd];
-                axpyF32(o_h, v_t, scores[t]);
+                axpyF16(o_h, v_t, scores[t]);
             }
         }
     }
@@ -395,8 +411,8 @@ test "dotF32 matches a scalar dot product" {
 test "attentionDecode single past position returns v" {
     var out: [4]f32 = undefined;
     const q = [_]f32{ 1, 0, 1, 0 };
-    const k = [_]f32{ 1, 0, 1, 0 };
-    const v = [_]f32{ 0.5, 0.25, 0.125, 0.0625 };
+    const k = [_]f16{ 1, 0, 1, 0 };
+    const v = [_]f16{ 0.5, 0.25, 0.125, 0.0625 };
     var scratch: [1]f32 = undefined;
     attentionDecode(&out, &q, &k, &v, 1, 2, 2, 2, &scratch);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-5);

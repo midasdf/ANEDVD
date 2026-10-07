@@ -78,8 +78,11 @@ pub const Engine = struct {
     kernels: []LayerKernels,
     head_kernel: ane.Kernel,
 
-    k_cache: [][]f32,
-    v_cache: [][]f32,
+    /// fp16 KV cache: halves both the resident memory and the attention
+    /// traffic, at the cost of ~5e-4 relative error per stored value (the same
+    /// trade llama.cpp makes with -ctk f16 -ctv f16, its default).
+    k_cache: [][]f16,
+    v_cache: [][]f16,
     max_seq: u32,
 
     /// All activation buffers are `[channel * chunk + column]`.
@@ -199,11 +202,11 @@ pub const Engine = struct {
         self.head_kernel = try makeConvKernel(allocator, cfg.hidden, cfg.vocab, hw.data, "lm_head", 1);
 
         const kv_dim: usize = cfg.kvDim();
-        self.k_cache = try allocator.alloc([]f32, L);
-        self.v_cache = try allocator.alloc([]f32, L);
+        self.k_cache = try allocator.alloc([]f16, L);
+        self.v_cache = try allocator.alloc([]f16, L);
         for (0..L) |i| {
-            self.k_cache[i] = try allocator.alloc(f32, @as(usize, opts.max_seq) * kv_dim);
-            self.v_cache[i] = try allocator.alloc(f32, @as(usize, opts.max_seq) * kv_dim);
+            self.k_cache[i] = try allocator.alloc(f16, @as(usize, opts.max_seq) * kv_dim);
+            self.v_cache[i] = try allocator.alloc(f16, @as(usize, opts.max_seq) * kv_dim);
             @memset(self.k_cache[i], 0);
             @memset(self.v_cache[i], 0);
         }
@@ -360,8 +363,12 @@ pub const Engine = struct {
             cpu.rope(self.sq, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
             cpu.rope(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
         }
-        @memcpy(self.k_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim], self.sk[0..kv_dim]);
-        @memcpy(self.v_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim], self.sv[0..kv_dim]);
+        const krow = self.k_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim];
+        const vrow = self.v_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim];
+        for (0..kv_dim) |i| {
+            krow[i] = @floatCast(self.sk[i]);
+            vrow[i] = @floatCast(self.sv[i]);
+        }
     }
 
     /// Process up to `chunk` prompt tokens in one pass and return the logits for
