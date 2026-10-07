@@ -164,8 +164,23 @@ pub const Server = struct {
         defer sink.deinit();
         sink.setStops(stops);
         const stats = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
+        self.logStats(stats);
         if (!conn.alive) return;
         return sink.finishOpenAi(stats);
+    }
+
+    /// One line per request so multi-turn prefix reuse is observable in the
+    /// server log.
+    fn logStats(self: *Server, stats: generate.Stats) void {
+        _ = self;
+        sys.eprint("[req] prompt {d} ({d} reused), +{d} tokens, prefill {d:.2} s, decode {d:.1} tok/s, {s}\n", .{
+            stats.prompt_tokens,
+            stats.prefill_reused,
+            stats.completion_tokens,
+            @as(f64, @floatFromInt(stats.prefill_ns)) / 1e9,
+            stats.decodeToksPerSec(),
+            stats.stop_reason.toString(),
+        });
     }
 
     // ------------------------------------------------------------ OpenAI legacy

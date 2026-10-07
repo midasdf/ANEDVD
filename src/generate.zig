@@ -63,6 +63,9 @@ pub const Stats = struct {
     decode_ns: u64 = 0,
     /// Time spent inside ANE evaluations during the decode phase.
     decode_ane_ns: u64 = 0,
+    /// Prompt tokens that were already in the KV cache and did not need to be
+    /// recomputed (multi-turn).
+    prefill_reused: u32 = 0,
     stop_reason: StopReason = .stop,
 
     pub fn decodeToksPerSec(self: Stats) f64 {
@@ -98,6 +101,10 @@ pub const Session = struct {
     /// Scratch for the sampler (one candidate per vocabulary entry). Set by
     /// `init`; without it the sampler falls back to greedy decoding.
     candidates: []cpu.Candidate,
+    /// Token ids currently held in the engine's KV cache. Multi-turn chat only
+    /// has to prefill the part that changed, since the transcript grows by
+    /// appending.
+    cached: std.ArrayList(u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, engine: *engine_mod.Engine, tok: *const tokenizer_mod.Tokenizer) Session {
         const candidates = allocator.alloc(cpu.Candidate, tok.vocabSize()) catch &empty_candidates;
@@ -112,6 +119,13 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         if (self.candidates.len > 0) self.allocator.free(self.candidates);
+        self.cached.deinit(self.allocator);
+    }
+
+    /// Drop the cached prefix (start a fresh conversation).
+    pub fn reset(self: *Session) void {
+        self.cached.clearRetainingCapacity();
+        self.engine.reset();
     }
 
     fn isStop(self: *const Session, id: u32) bool {
@@ -192,12 +206,18 @@ pub const Session = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    fn commonPrefix(a: []const u32, b: []const u32) usize {
+        const n = @min(a.len, b.len);
+        var i: usize = 0;
+        while (i < n and a[i] == b[i]) : (i += 1) {}
+        return i;
+    }
+
     /// Prefill `prompt_ids`, then sample up to `params.max_tokens` tokens.
     /// `emitter` receives each decoded piece as it is produced.
     pub fn generate(self: *Session, prompt_ids: []const u32, params: Params, emitter: Emitter) !Stats {
         var stats = Stats{};
         const eng = self.engine;
-        eng.reset();
         self.rng = params.seed;
 
         // Keep the prompt inside the KV cache, leaving room to generate.
@@ -210,11 +230,19 @@ pub const Session = struct {
         }
         stats.prompt_tokens = @intCast(ids.len);
 
-        // One batched pass over the whole prompt: the ANE is weight-bandwidth
+        // Reuse the KV prefix: a growing transcript only needs the new suffix,
+        // which is what makes multi-turn chat cheap.
+        const reuse = commonPrefix(self.cached.items, ids);
+        stats.prefill_reused = @intCast(@min(reuse, ids.len));
+        if (reuse == 0) eng.reset();
+        self.cached.shrinkRetainingCapacity(reuse);
+
+        // One batched pass over the new tokens: the ANE is weight-bandwidth
         // bound, so a chunk of tokens costs about the same as a single one.
         const p0 = nowNs();
-        var logits: []f32 = try eng.prefill(ids, 0);
+        var logits: []f32 = try eng.prefill(ids[reuse..], @intCast(reuse));
         stats.prefill_ns = nowNs() - p0;
+        try self.cached.appendSlice(self.allocator, ids[reuse..]);
 
         // Recent tokens for the repetition / presence / frequency penalties.
         var recent: std.ArrayList(u32) = .empty;
@@ -248,6 +276,7 @@ pub const Session = struct {
             }
             if (recent.items.len >= window) _ = recent.orderedRemove(0);
             try recent.append(self.allocator, next);
+            try self.cached.append(self.allocator, next);
             logits = try eng.forward(next, pos);
             pos += 1;
             if (produced + 1 == params.max_tokens) stats.stop_reason = .length;

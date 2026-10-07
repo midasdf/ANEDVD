@@ -48,11 +48,22 @@ const LayerKernels = struct {
     down: ?ane.Kernel = null,
 };
 
+/// Which ANE node a measurement belongs to.
+pub const Node = enum(usize) { qkv = 0, o = 1, ffn = 2, head = 3 };
+
 pub const Stats = struct {
     ane_eval_ns: u64 = 0,
     ane_evals: u64 = 0,
+    /// ANE time split by node type, so the next optimisation is measured
+    /// rather than guessed.
+    node_ns: [4]u64 = .{ 0, 0, 0, 0 },
+    node_evals: [4]u64 = .{ 0, 0, 0, 0 },
     total_ns: u64 = 0,
     tokens: u64 = 0,
+
+    pub fn nodeMs(self: Stats, n: Node) f64 {
+        return @as(f64, @floatFromInt(self.node_ns[@backingInt(n)])) / 1e6;
+    }
 
     pub fn aneMs(self: Stats) f64 {
         return @as(f64, @floatFromInt(self.ane_eval_ns)) / 1e6;
@@ -280,8 +291,11 @@ pub const Engine = struct {
             try k.qkv.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
             var t0 = sys.nowNs();
             try k.qkv.eval();
-            self.stats.ane_eval_ns += sys.nowNs() - t0;
+            const dt_qkv = sys.nowNs() - t0;
+            self.stats.ane_eval_ns += dt_qkv;
             self.stats.ane_evals += 1;
+            self.stats.node_ns[@backingInt(Node.qkv)] += dt_qkv;
+            self.stats.node_evals[@backingInt(Node.qkv)] += 1;
             try k.qkv.readOutputColumnF16(0, 0, self.dec_out[0..cfg.qkvDim()]);
             for (0..cfg.qkvDim()) |c| self.qkv[c * ch] = @floatCast(self.dec_out[c]);
             if (norm.qkv_bias) |b| {
@@ -300,8 +314,11 @@ pub const Engine = struct {
             try k.o.writeInputColumnF16(0, 0, self.dec_in[0..q_dim]);
             t0 = sys.nowNs();
             try k.o.eval();
-            self.stats.ane_eval_ns += sys.nowNs() - t0;
+            const dt_o = sys.nowNs() - t0;
+            self.stats.ane_eval_ns += dt_o;
             self.stats.ane_evals += 1;
+            self.stats.node_ns[@backingInt(Node.o)] += dt_o;
+            self.stats.node_evals[@backingInt(Node.o)] += 1;
             try k.o.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
             for (0..hidden) |c| {
                 var v = @as(f32, @floatCast(self.dec_out[c]));
@@ -314,8 +331,11 @@ pub const Engine = struct {
             try k.ffn.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
             t0 = sys.nowNs();
             try k.ffn.eval();
-            self.stats.ane_eval_ns += sys.nowNs() - t0;
+            const dt_ffn = sys.nowNs() - t0;
+            self.stats.ane_eval_ns += dt_ffn;
             self.stats.ane_evals += 1;
+            self.stats.node_ns[@backingInt(Node.ffn)] += dt_ffn;
+            self.stats.node_evals[@backingInt(Node.ffn)] += 1;
 
             if (k.ffn_split) {
                 try k.ffn.readOutputColumnF16(0, 0, self.dec_out[0 .. 2 * inter]);
@@ -345,8 +365,11 @@ pub const Engine = struct {
         try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
         const t4 = sys.nowNs();
         try self.head_kernel.eval();
-        self.stats.ane_eval_ns += sys.nowNs() - t4;
+        const dt_head = sys.nowNs() - t4;
+        self.stats.ane_eval_ns += dt_head;
         self.stats.ane_evals += 1;
+        self.stats.node_ns[@backingInt(Node.head)] += dt_head;
+        self.stats.node_evals[@backingInt(Node.head)] += 1;
         try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
         for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
 

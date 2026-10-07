@@ -44,6 +44,19 @@ static void set_err(NSString *msg) {
 }
 
 const char *ane_shim_last_error(void) { return g_err; }
+
+/// QoS class passed to compile/load/evaluate. 21 is QOS_CLASS_USER_INTERACTIVE.
+/// The ANE's per-evaluation overhead (~100 us for small kernels) may depend on
+/// it, so it is tunable for measurement.
+static unsigned int eval_qos(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("ANEDVD_QOS");
+        cached = v ? atoi(v) : 21;
+        if (cached <= 0) cached = 21;
+    }
+    return (unsigned int)cached;
+}
 int ane_shim_compile_count(void) { return g_compile_count; }
 int ane_shim_ready(void) { return g_ready ? 1 : 0; }
 
@@ -254,7 +267,7 @@ ANEKernel *ane_shim_kernel_create(const char *mil, size_t mil_len,
         // Compile (weights are baked in here) then load.
         uint64_t tc0 = mach_absolute_time();
         BOOL compiled = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-            mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e);
+            mdl, @selector(compileWithQoS:options:error:), eval_qos(), @{}, &e);
         g_compile_ns += ns_since(tc0);
         if (!compiled) {
             set_err([NSString stringWithFormat:@"ANECCompile failed: %@", e ? [e description] : @"unknown"]);
@@ -275,7 +288,7 @@ ANEKernel *ane_shim_kernel_create(const char *mil, size_t mil_len,
             if (attempt > 0) usleep(backoff_us[attempt - 1]);
             e = nil;
             loaded = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+                mdl, @selector(loadWithQoS:options:error:), eval_qos(), @{}, &e);
             if (!loaded) last_err = e;
         }
         g_load_ns += ns_since(tl0);
@@ -389,7 +402,7 @@ int ane_shim_kernel_eval(ANEKernel *k) {
         NSError *e = nil;
         uint64_t t0 = mach_absolute_time();
         BOOL ok = ((BOOL(*)(id, SEL, unsigned int, id, id, NSError **))objc_msgSend)(
-            ki.model, @selector(evaluateWithQoS:options:request:error:), 21, @{}, ki.request, &e);
+            ki.model, @selector(evaluateWithQoS:options:request:error:), eval_qos(), @{}, ki.request, &e);
         uint64_t t1 = mach_absolute_time();
         ki.lastEvalNs = t1 - t0;
         if (!ok) {

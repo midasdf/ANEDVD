@@ -752,6 +752,16 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     sys.print("ANE share of wall time: {d:.0}%\n", .{
         if (total_wall > 0) 100.0 * @as(f64, @floatFromInt(eng.stats.ane_eval_ns)) / @as(f64, @floatFromInt(total_wall)) else 0,
     });
+    const tot = eng.stats.tokens;
+    if (tot > 0) {
+        const t: f64 = @floatFromInt(tot);
+        sys.print("ANE per-token split: qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{
+            eng.stats.nodeMs(.qkv) / t,
+            eng.stats.nodeMs(.o) / t,
+            eng.stats.nodeMs(.ffn) / t,
+            eng.stats.nodeMs(.head) / t,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,8 +1105,12 @@ fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         sys.print("\n", .{});
         const stats = try session.generate(ids, params, .{ .ctx = @constCast(&collector), .func = chatEmit });
         try history.add(.assistant, reply.items);
-        sys.print("\n[{d} tokens, {d:.1} tok/s, {s}]\n", .{
-            stats.completion_tokens, stats.decodeToksPerSec(), stats.stop_reason.toString(),
+        sys.print("\n[{d} tokens, {d:.1} tok/s, {s}, prompt {d} ({d} reused from cache)]\n", .{
+            stats.completion_tokens,
+            stats.decodeToksPerSec(),
+            stats.stop_reason.toString(),
+            stats.prompt_tokens,
+            stats.prefill_reused,
         });
     }
     sys.print("bye\n", .{});
