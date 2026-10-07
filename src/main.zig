@@ -27,6 +27,8 @@ const USAGE =
     \\                                  generate text on the ANE
     \\  anedvd cpu --model <m.gguf> --prompt "..." [--rope-hf] [--chat]
     \\                                  pure-CPU reference (no ANE): sanity-check a model
+    \\  anedvd chat --model <m.gguf|hf-dir> [--system "..."]
+    \\                                  interactive multi-turn chat in the terminal
     \\  anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080] [--name ID]
     \\                                  HTTP server: OpenAI + Anthropic compatible API
     \\                                  and a built-in WebUI at /
@@ -70,6 +72,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdCpu(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "serve")) {
         return cmdServe(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "chat")) {
+        return cmdChat(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         sys.print("{s}", .{USAGE});
         return;
@@ -995,4 +999,164 @@ fn cmdWidthSweep(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void
         const gflops = 2.0 * @as(f64, @floatFromInt(size)) * @as(f64, @floatFromInt(size)) * @as(f64, @floatFromInt(w)) / 1e9 / (r.eval_us / 1e6);
         sys.print("{d:>7} {d:>12.2} {d:>11.2}x {d:>12.1}\n", .{ w, r.eval_us, if (base_us > 0) r.eval_us / base_us else 1, gflops });
     }
+}
+
+// ---------------------------------------------------------------------------
+// chat: interactive multi-turn REPL.
+// ---------------------------------------------------------------------------
+
+const History = struct {
+    allocator: std.mem.Allocator,
+    turns: std.ArrayList(generate_mod.Message) = .empty,
+
+    fn deinit(self: *History) void {
+        for (self.turns.items) |t| self.allocator.free(t.content);
+        self.turns.deinit(self.allocator);
+    }
+    fn add(self: *History, role: generate_mod.Role, text: []const u8) !void {
+        try self.turns.append(self.allocator, .{ .role = role, .content = try self.allocator.dupe(u8, text) });
+    }
+    fn clear(self: *History) void {
+        for (self.turns.items) |t| self.allocator.free(t.content);
+        self.turns.clearRetainingCapacity();
+    }
+};
+
+/// Read one line from stdin. Returns null at EOF.
+fn readLine(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
+    sys.writeAll(1, prompt);
+    var out: std.ArrayList(u8) = .empty;
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = std.c.read(0, &byte, 1);
+        if (n <= 0) {
+            if (out.items.len == 0) {
+                out.deinit(allocator);
+                return null;
+            }
+            break;
+        }
+        if (byte[0] == '\n') break;
+        try out.append(allocator, byte[0]);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    const model_path = argStr(argv, "--model") orelse {
+        sys.eprint("usage: anedvd chat --model <model.gguf|hf-dir> [--system \"...\"] [--temp T] [--top-p P] [--repeat-penalty R]\n", .{});
+        std.process.exit(2);
+    };
+    const system = argStr(argv, "--system");
+    const max_tokens: u32 = argValue(argv, "--max-tokens", 256);
+    const chunk: u32 = argValue(argv, "--chunk", 64);
+    var temperature = argF32(argv, "--temp", 0.7);
+    var top_p = argF32(argv, "--top-p", 0.9);
+    var rep_penalty = argF32(argv, "--repeat-penalty", 1.15);
+    var rope_hf = false;
+    var rope_adj = false;
+    for (argv) |a| {
+        if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
+        if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
+    }
+
+    sys.print("loading {s}\n", .{model_path});
+    var loaded = try model_open.open(allocator, model_path, .{ .progress = true, .rope_hf = rope_hf, .rope_adjacent = rope_adj });
+    defer loaded.deinit();
+    const tok = &loaded.tokenizer;
+    const cfg = loaded.config;
+    sys.print("  {s} ({s}): {d} layers, hidden {d}, vocab {d}\n", .{
+        cfg.arch, if (loaded.format == .gguf) "GGUF" else "safetensors", cfg.layers, cfg.hidden, cfg.vocab,
+    });
+
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
+        .max_seq = @intCast(argValue(argv, "--max-seq", 2048)),
+        .verbose = true,
+        .chunk = chunk,
+    });
+    defer eng.deinit();
+    sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
+
+    var session = generate_mod.Session.init(allocator, &eng, tok);
+    defer session.deinit();
+    if (tok.eosId()) |eos| {
+        const stops = try allocator.alloc(u32, 1);
+        stops[0] = eos;
+        session.stop_ids = stops;
+    }
+
+    var history = History{ .allocator = allocator };
+    defer history.deinit();
+
+    sys.print("\nready. /help for commands, /exit to quit.\n", .{});
+    while (true) {
+        const line = (try readLine(allocator, "\nyou> ")) orelse break;
+        defer allocator.free(line);
+        const text = std.mem.trim(u8, line, " \t");
+        if (text.len == 0) continue;
+
+        if (text[0] == '/') {
+            if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) break;
+            if (std.mem.eql(u8, text, "/reset")) {
+                history.clear();
+                sys.print("history cleared\n", .{});
+                continue;
+            }
+            if (std.mem.eql(u8, text, "/help")) {
+                sys.print("/reset  clear the conversation\n/temp X set temperature (0 = greedy)\n/topp X set top-p\n/rep X  set repetition penalty\n/exit   quit\n", .{});
+                continue;
+            }
+            if (std.mem.startsWith(u8, text, "/temp ")) {
+                temperature = std.fmt.parseFloat(f32, text[6..]) catch temperature;
+                sys.print("temperature = {d:.2}\n", .{temperature});
+                continue;
+            }
+            if (std.mem.startsWith(u8, text, "/topp ")) {
+                top_p = std.fmt.parseFloat(f32, text[6..]) catch top_p;
+                sys.print("top_p = {d:.2}\n", .{top_p});
+                continue;
+            }
+            if (std.mem.startsWith(u8, text, "/rep ")) {
+                rep_penalty = std.fmt.parseFloat(f32, text[5..]) catch rep_penalty;
+                sys.print("repetition_penalty = {d:.2}\n", .{rep_penalty});
+                continue;
+            }
+            sys.print("unknown command; /help\n", .{});
+            continue;
+        }
+
+        try history.add(.user, text);
+        const prompt = try session.formatChat(allocator, history.turns.items, system);
+        defer allocator.free(prompt);
+        const ids = try tok.encode(allocator, prompt, true);
+        defer allocator.free(ids);
+
+        var reply: std.ArrayList(u8) = .empty;
+        defer reply.deinit(allocator);
+        const collector = ChatSink{ .out = &reply, .allocator = allocator };
+        const params = generate_mod.Params{
+            .max_tokens = max_tokens,
+            .sampler = .{ .temperature = temperature, .top_p = top_p, .repetition_penalty = rep_penalty },
+        };
+        sys.print("\n", .{});
+        const stats = try session.generate(ids, params, .{ .ctx = @constCast(&collector), .func = chatEmit });
+        try history.add(.assistant, reply.items);
+        sys.print("\n[{d} tokens, {d:.1} tok/s, {s}]\n", .{
+            stats.completion_tokens, stats.decodeToksPerSec(), stats.stop_reason.toString(),
+        });
+    }
+    sys.print("bye\n", .{});
+}
+
+const ChatSink = struct {
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+};
+
+fn chatEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
+    _ = token_id;
+    const sink: *ChatSink = @ptrCast(@alignCast(ctx.?));
+    sys.writeAll(1, piece);
+    sink.out.appendSlice(sink.allocator, piece) catch return false;
+    return true;
 }

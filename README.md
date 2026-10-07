@@ -100,6 +100,7 @@ crashes on ARC Objective-C), Zig 0.17.
 | `anedvd selftest` | tiny transformer: ANE engine vs CPU reference |
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
 | `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--top-p P] [--repeat-penalty R] [--chunk N] [--ab]` | generate text on the ANE |
+| `anedvd chat --model <m.gguf\|hf-dir> [--system "…"]` | interactive multi-turn chat in the terminal (`/help`, `/reset`, `/temp`, `/topp`, `/rep`) |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |
 | `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
 
@@ -142,8 +143,9 @@ batched path is bit-identical to the per-token one.
 ```
 
 Open <http://127.0.0.1:8080/> for the built-in chat UI (single self-contained
-HTML file, no CDN, no build step, streaming replies, stop button, temperature /
-max-tokens / system-prompt settings).
+HTML file, no CDN, no build step, streaming replies, stop button, and settings
+for temperature, top-p, repetition penalty, max tokens and a system prompt —
+all persisted in `localStorage`).
 
 Both API dialects are served from the same endpoint set, so existing clients
 work by pointing their base URL at `http://127.0.0.1:8080/v1`:
@@ -212,6 +214,24 @@ is 151 936 tokens.
 `--temp 0` is greedy. For small models a repetition penalty is the single
 biggest quality lever — the same prompt with `--temp 0.7 --top-p 0.9
 --repeat-penalty 1.3` produces structured prose where greedy decoding loops.
+
+`anedvd chat` is a small REPL over the same session:
+
+```console
+$ ./zig-out/bin/anedvd chat --model models/qwen2.5-0.5b-q8_0.gguf
+ready. /help for commands, /exit to quit.
+
+you> What is the capital of France?
+
+The capital of France is Paris.
+[7 tokens, 23.4 tok/s, stop]
+
+you> And what is it famous for? Answer in one sentence.
+
+Paris, the capital city of France, holds significant cultural and historical
+importance due to its iconic landmarks such as Notre-Dame Cathedral and Louvre
+Museum among others...
+```
 
 ## How it works
 

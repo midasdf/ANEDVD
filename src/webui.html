@@ -127,6 +127,14 @@
       <span class="label">max tokens</span>
       <input type="number" id="max-tokens" min="1" max="32768" step="1" value="256">
     </label>
+    <label class="field">
+      <span class="label">top-p <output id="topp-out">0.90</output></span>
+      <input type="range" id="top-p" min="0.05" max="1" step="0.05" value="0.9">
+    </label>
+    <label class="field">
+      <span class="label">repeat penalty</span>
+      <input type="number" id="repeat-penalty" min="1" max="2" step="0.05" value="1.15">
+    </label>
     <label class="field grow">
       <span class="label">system prompt</span>
       <input type="text" id="system-prompt" autocomplete="off"
@@ -166,7 +174,7 @@ const API_CHAT = '/v1/chat/completions';
 const SETTINGS_KEY = 'anedvd.chat.settings.v1';
 const HEALTH_INTERVAL_MS = 20000;
 const MAX_TOKENS_CEILING = 32768;
-const DEFAULTS = { temperature: 0.7, maxTokens: 256, systemPrompt: '' };
+const DEFAULTS = { temperature: 0.7, maxTokens: 256, systemPrompt: '', topP: 0.9, repeatPenalty: 1.15 };
 const el = (id) => document.getElementById(id);
 const ui = {
   log: el('log'), list: el('list'), empty: el('empty'),
@@ -174,6 +182,7 @@ const ui = {
   composer: el('composer'), input: el('input'), send: el('send'), stop: el('stop'),
   temperature: el('temperature'), tempOut: el('temp-out'),
   maxTokens: el('max-tokens'), systemPrompt: el('system-prompt'),
+  topP: el('top-p'), topPOut: el('topp-out'), repeatPenalty: el('repeat-penalty'),
 };
 // `messages` is the transcript replayed to the server; the DOM is only a view.
 const state = { model: '', messages: [], generating: false, controller: null, pinned: true, cleared: false };
@@ -188,6 +197,14 @@ function clampTokens(value) {
   const n = parseInt(value, 10);
   return Number.isFinite(n) && n >= 1 ? Math.min(MAX_TOKENS_CEILING, n) : DEFAULTS.maxTokens;
 }
+function clampTopP(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(1, Math.max(0.05, n)) : DEFAULTS.topP;
+}
+function clampRepeatPenalty(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(2, Math.max(1, n)) : DEFAULTS.repeatPenalty;
+}
 function loadSettings() {
   let raw = null;
   try { raw = localStorage.getItem(SETTINGS_KEY); } catch (err) { raw = null; }
@@ -199,6 +216,8 @@ function loadSettings() {
   }
   settings.temperature = clampTemperature(settings.temperature);
   settings.maxTokens = clampTokens(settings.maxTokens);
+  settings.topP = clampTopP(settings.topP);
+  settings.repeatPenalty = clampRepeatPenalty(settings.repeatPenalty);
   if (typeof settings.systemPrompt !== 'string') settings.systemPrompt = '';
 }
 function saveSettings() {
@@ -208,6 +227,9 @@ function settingsToForm() {
   ui.temperature.value = String(settings.temperature);
   ui.tempOut.textContent = settings.temperature.toFixed(2);
   ui.maxTokens.value = String(settings.maxTokens);
+  ui.topP.value = String(settings.topP);
+  ui.topPOut.textContent = settings.topP.toFixed(2);
+  ui.repeatPenalty.value = String(settings.repeatPenalty);
   ui.systemPrompt.value = settings.systemPrompt;
 }
 function wireSettings() {
@@ -225,6 +247,20 @@ function wireSettings() {
   ui.maxTokens.addEventListener('change', () => {
     settings.maxTokens = clampTokens(ui.maxTokens.value);
     ui.maxTokens.value = String(settings.maxTokens);
+    saveSettings();
+  });
+  ui.topP.addEventListener('input', () => {
+    settings.topP = clampTopP(ui.topP.value);
+    ui.topPOut.textContent = settings.topP.toFixed(2);
+    saveSettings();
+  });
+  ui.repeatPenalty.addEventListener('input', () => {
+    settings.repeatPenalty = clampRepeatPenalty(ui.repeatPenalty.value);
+    saveSettings();
+  });
+  ui.repeatPenalty.addEventListener('change', () => {
+    settings.repeatPenalty = clampRepeatPenalty(ui.repeatPenalty.value);
+    ui.repeatPenalty.value = String(settings.repeatPenalty);
     saveSettings();
   });
   ui.systemPrompt.addEventListener('input', () => {
@@ -447,6 +483,8 @@ async function send() {
         messages: buildRequestMessages(),
         temperature: settings.temperature,
         max_tokens: settings.maxTokens,
+        top_p: settings.topP,
+        repetition_penalty: settings.repeatPenalty,
         stream: true,
       }),
     });

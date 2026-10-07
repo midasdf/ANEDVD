@@ -9,7 +9,7 @@ measurements live in `docs/RESULTS.md`.
 
 | File | Role |
 |---|---|
-| `src/main.zig` | CLI: `info`, `probe`, `bench`, `selftest`, `check`, `run`, `cpu`, `serve` |
+| `src/main.zig` | CLI: `info`, `probe`, `bench`, `width`, `selftest`, `check`, `run`, `chat`, `cpu`, `serve` |
 | `src/ane/shim.m` / `shim.h` | the only Objective-C + private-API code (`_ANEInMemoryModel`, IOSurfaces) |
 | `src/ane/runtime.zig` | Zig kernel wrapper, planar fp16 scatter/gather |
 | `src/ane/mil.zig` | MIL program generator (`conv`, `add`, `sigmoid`, `mul`) |
