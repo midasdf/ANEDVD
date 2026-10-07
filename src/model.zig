@@ -109,6 +109,8 @@ pub const Runtime = struct {
         for (self.norms) |n| {
             if (n.attn.len > 0) self.allocator.free(n.attn);
             if (n.ffn.len > 0) self.allocator.free(n.ffn);
+            if (n.qkv_bias) |b| self.allocator.free(b);
+            if (n.o_bias) |b| self.allocator.free(b);
         }
         if (self.norms.len > 0) self.allocator.free(self.norms);
         self.* = undefined;
