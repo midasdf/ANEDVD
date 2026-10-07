@@ -151,52 +151,121 @@ pub fn argmax(values: []const f32) u32 {
     return @intCast(best);
 }
 
-/// Simple temperature + top-k sampler. `rng_state` is a caller-owned LCG seed.
-pub fn sampleTopK(values: []const f32, temperature: f32, top_k: usize, rng_state: *u32) u32 {
-    if (temperature <= 0 or top_k == 1) return argmax(values);
+/// One candidate token during sampling.
+pub const Candidate = struct {
+    logit: f32,
+    index: u32,
+};
 
-    const n = values.len;
-    var best_val: f32 = -std.math.inf(f32);
-    for (values) |v| best_val = @max(best_val, v);
+pub const SamplerParams = struct {
+    temperature: f32 = 1.0,
+    /// 0 disables top-k.
+    top_k: usize = 0,
+    /// 1.0 disables nucleus sampling.
+    top_p: f32 = 1.0,
+    /// >1.0 discourages tokens already in `recent` (llama.cpp semantics).
+    repetition_penalty: f32 = 1.0,
+    /// Flat subtraction for tokens already present (OpenAI semantics).
+    presence_penalty: f32 = 0.0,
+    /// Subtracted once per occurrence (OpenAI semantics).
+    frequency_penalty: f32 = 0.0,
+    /// Logits below `max_logit - min_keep_delta * temperature` are ignored
+    /// entirely: their softmax weight is < e^-20 and cannot be sampled.
+    min_keep_delta: f32 = 20.0,
+};
 
-    // exp((v - max)/T) into a reusable accumulator via a two-pass top-k scan
-    // (small vocab-sized scratch is avoided by scanning k times).
-    const k = @min(top_k, n);
-    var sum: f32 = 0;
-    // Compute the normaliser over the top-k only: find the k-th largest value.
-    var threshold: f32 = -std.math.inf(f32);
-    if (k < n) {
-        var cut: f32 = -std.math.inf(f32);
-        for (0..k) |_| {
-            var local: f32 = -std.math.inf(f32);
-            for (values) |v| {
-                if (v > cut and v < local) local = v;
-                if (v > local) local = v;
-            }
-            // simple selection: track the largest value strictly below `cut`
-            var next: f32 = -std.math.inf(f32);
-            for (values) |v| {
-                if (v < cut and v > next) next = v;
-            }
-            if (next == -std.math.inf(f32)) break;
-            cut = next;
+fn compareCandidates(_: void, a: Candidate, b: Candidate) bool {
+    return a.logit > b.logit;
+}
+
+/// Apply repetition / presence / frequency penalties to `logits` in place.
+pub fn applyPenalties(logits: []f32, params: SamplerParams, recent: []const u32) void {
+    if (params.repetition_penalty == 1.0 and params.presence_penalty == 0.0 and params.frequency_penalty == 0.0) return;
+    for (recent) |id| {
+        if (id >= logits.len) continue;
+        var v = logits[id];
+        if (params.repetition_penalty != 1.0) {
+            v = if (v > 0) v / params.repetition_penalty else v * params.repetition_penalty;
         }
-        threshold = cut;
+        v -= params.presence_penalty;
+        v -= params.frequency_penalty;
+        logits[id] = v;
     }
-    for (values) |v| {
-        if (v >= threshold) sum += @exp((v - best_val) / temperature);
-    }
-    if (sum <= 0) return argmax(values);
+}
 
-    rng_state.* = rng_state.* *% 1664525 +% 1013904223;
-    const r = @as(f32, @floatFromInt(rng_state.* >> 8)) / 16777216.0;
-    var target = r * sum;
-    for (values, 0..) |v, i| {
-        if (v < threshold) continue;
-        target -= @exp((v - best_val) / temperature);
-        if (target <= 0) return @intCast(i);
+/// Temperature / top-k / top-p sampler with penalties.
+///
+/// `scratch` must hold at least `logits.len` candidates and is reused across
+/// calls. Returns the chosen token id.
+pub fn sample(
+    logits: []f32,
+    params: SamplerParams,
+    recent: []const u32,
+    rng: *u32,
+    scratch: []Candidate,
+) u32 {
+    std.debug.assert(scratch.len >= logits.len);
+    applyPenalties(logits, params, recent);
+
+    if (params.temperature <= 0) return argmax(logits);
+
+    // Pass 1: max (used as the softmax reference and the cut-off).
+    var max_v: f32 = -std.math.inf(f32);
+    for (logits) |v| max_v = @max(max_v, v);
+
+    const cut = max_v - params.min_keep_delta * params.temperature;
+
+    // Pass 2: collect the candidates worth considering.
+    var n: usize = 0;
+    for (logits, 0..) |v, i| {
+        if (v >= cut) {
+            scratch[n] = .{ .logit = v, .index = @intCast(i) };
+            n += 1;
+        }
     }
-    return argmax(values);
+    if (n == 0) return argmax(logits);
+
+    // Top-k: keep only the k best (sorting n candidates, n is small).
+    var keep = n;
+    if (params.top_k > 0 and params.top_k < n) {
+        std.mem.sort(Candidate, scratch[0..n], {}, compareCandidates);
+        keep = params.top_k;
+    }
+
+    // Probabilities over the kept set.
+    var sum: f32 = 0;
+    for (scratch[0..keep]) |*c| {
+        c.logit = @exp((c.logit - max_v) / params.temperature);
+        sum += c.logit;
+    }
+    if (sum <= 0) return argmax(logits);
+
+    // Top-p: sort and truncate at the nucleus (only needed if enabled).
+    if (params.top_p < 1.0) {
+        std.mem.sort(Candidate, scratch[0..keep], {}, compareCandidates);
+        var acc: f32 = 0;
+        var cut_n: usize = keep;
+        for (scratch[0..keep], 0..) |c, i| {
+            acc += c.logit / sum;
+            if (acc >= params.top_p) {
+                cut_n = i + 1;
+                break;
+            }
+        }
+        keep = cut_n;
+        sum = 0;
+        for (scratch[0..keep]) |c| sum += c.logit;
+        if (sum <= 0) return argmax(logits);
+    }
+
+    rng.* = rng.* *% 1664525 +% 1013904223;
+    const r = @as(f32, @floatFromInt(rng.* >> 8)) / 16777216.0;
+    var target = r * sum;
+    for (scratch[0..keep]) |c| {
+        target -= c.logit;
+        if (target <= 0) return c.index;
+    }
+    return scratch[0].index;
 }
 
 test "rmsnorm normalises to unit rms" {
@@ -258,8 +327,48 @@ test "attentionDecode single past position returns v" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.125), out[2], 1e-5);
 }
 
-test "sampleTopK with top_k 1 is argmax" {
+test "sampling: temperature 0 is greedy" {
     var seed: u32 = 1;
-    const logits = [_]f32{ 0.1, 5.0, 0.2 };
-    try std.testing.expectEqual(@as(u32, 1), sampleTopK(&logits, 1.0, 1, &seed));
+    var logits = [_]f32{ 0.1, 5.0, 0.2 };
+    var cand: [3]Candidate = undefined;
+    try std.testing.expectEqual(@as(u32, 1), sample(&logits, .{ .temperature = 0 }, &.{}, &seed, &cand));
+}
+
+test "sampling: top_k 1 picks the maximum" {
+    var seed: u32 = 1;
+    var logits = [_]f32{ 0.1, 5.0, 4.9 };
+    var cand: [3]Candidate = undefined;
+    for (0..16) |_| {
+        try std.testing.expectEqual(@as(u32, 1), sample(&logits, .{ .temperature = 1.0, .top_k = 1 }, &.{}, &seed, &cand));
+    }
+}
+
+test "sampling: top_p 0.1 keeps only the dominant token" {
+    var seed: u32 = 7;
+    var logits = [_]f32{ 20.0, 0.0, 0.0 };
+    var cand: [3]Candidate = undefined;
+    for (0..16) |_| {
+        try std.testing.expectEqual(@as(u32, 0), sample(&logits, .{ .temperature = 1.0, .top_p = 0.1 }, &.{}, &seed, &cand));
+    }
+}
+
+test "sampling: every drawn token has non-zero probability" {
+    var seed: u32 = 12345;
+    var logits = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    var cand: [4]Candidate = undefined;
+    var counts: [4]u32 = @splat(0);
+    for (0..4000) |_| {
+        const t = sample(&logits, .{ .temperature = 1.0, .top_p = 0.9 }, &.{}, &seed, &cand);
+        counts[t] += 1;
+    }
+    for (counts) |c| try std.testing.expect(c > 500); // roughly uniform
+}
+
+test "penalties push repeated tokens down" {
+    var logits = [_]f32{ 5.0, 4.0 };
+    applyPenalties(&logits, .{ .repetition_penalty = 2.0 }, &.{0});
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), logits[0], 1e-6);
+    var logits2 = [_]f32{ 5.0, 4.0 };
+    applyPenalties(&logits2, .{ .presence_penalty = 1.0, .frequency_penalty = 0.5 }, &.{ 0, 0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), logits2[0], 1e-6);
 }

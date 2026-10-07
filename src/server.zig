@@ -26,6 +26,8 @@ pub const Options = struct {
     model_name: []const u8 = "anedvd",
     default_system: ?[]const u8 = null,
     default_max_tokens: u32 = 512,
+    default_top_p: f32 = 1.0,
+    default_repetition_penalty: f32 = 1.0,
 };
 
 pub const Server = struct {
@@ -127,7 +129,17 @@ pub const Server = struct {
         const ids = try self.session.tokenizer.encode(a, prompt, true);
         if (ids.len == 0) return sendError(conn, 400, "prompt encoded to zero tokens");
 
-        const params = generate.Params{ .max_tokens = max_tokens, .temperature = temperature, .top_k = top_k };
+        const params = generate.Params{
+            .max_tokens = max_tokens,
+            .sampler = .{
+                .temperature = temperature,
+                .top_k = top_k,
+                .top_p = getFloat(root, "top_p", self.opts.default_top_p),
+                .repetition_penalty = getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty),
+                .presence_penalty = getFloat(root, "presence_penalty", 0.0),
+                .frequency_penalty = getFloat(root, "frequency_penalty", 0.0),
+            },
+        };
         const created = sys.unixTime();
 
         if (!stream) {
@@ -173,7 +185,14 @@ pub const Server = struct {
 
         const ids = try self.session.tokenizer.encode(a, prompt, true);
         if (ids.len == 0) return sendError(conn, 400, "prompt encoded to zero tokens");
-        const params = generate.Params{ .max_tokens = max_tokens, .temperature = temperature };
+        const params = generate.Params{
+            .max_tokens = max_tokens,
+            .sampler = .{
+                .temperature = temperature,
+                .top_p = getFloat(root, "top_p", self.opts.default_top_p),
+                .repetition_penalty = getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty),
+            },
+        };
         const created = sys.unixTime();
 
         if (!stream) {
@@ -225,7 +244,14 @@ pub const Server = struct {
         const ids = try self.session.tokenizer.encode(a, prompt, true);
         if (ids.len == 0) return sendError(conn, 400, "prompt encoded to zero tokens");
 
-        const params = generate.Params{ .max_tokens = max_tokens, .temperature = temperature };
+        const params = generate.Params{
+            .max_tokens = max_tokens,
+            .sampler = .{
+                .temperature = temperature,
+                .top_p = getFloat(root, "top_p", self.opts.default_top_p),
+                .repetition_penalty = getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty),
+            },
+        };
         const created = sys.unixTime();
         const msg_id = try std.fmt.allocPrint(a, "msg_{d}", .{created});
 

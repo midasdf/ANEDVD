@@ -35,9 +35,11 @@ pub const Message = struct {
 
 pub const Params = struct {
     max_tokens: u32 = 256,
-    temperature: f32 = 0.7,
-    top_k: usize = 40,
+    /// Sampling knobs; `temperature <= 0` means greedy.
+    sampler: cpu.SamplerParams = .{ .temperature = 0.7, .top_k = 40 },
     seed: u32 = 0x12345678,
+    /// How many recent tokens the penalties consider.
+    penalty_window: usize = 256,
 };
 
 pub const StopReason = enum {
@@ -78,6 +80,10 @@ pub const Emitter = struct {
     }
 };
 
+/// Used when the sampler scratch cannot be allocated: sampling then falls back
+/// to greedy decoding instead of failing the whole session.
+var empty_candidates: [0]cpu.Candidate = .{};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
@@ -85,9 +91,23 @@ pub const Session = struct {
     rng: u32 = 0x12345678,
     /// Ids that terminate generation (EOS plus any explicit stop tokens).
     stop_ids: []const u32 = &.{},
+    /// Scratch for the sampler (one candidate per vocabulary entry). Set by
+    /// `init`; without it the sampler falls back to greedy decoding.
+    candidates: []cpu.Candidate,
 
     pub fn init(allocator: std.mem.Allocator, engine: *engine_mod.Engine, tok: *const tokenizer_mod.Tokenizer) Session {
-        return .{ .allocator = allocator, .engine = engine, .tokenizer = tok, .rng = 0x12345678 };
+        const candidates = allocator.alloc(cpu.Candidate, tok.vocabSize()) catch &empty_candidates;
+        return .{
+            .allocator = allocator,
+            .engine = engine,
+            .tokenizer = tok,
+            .rng = 0x12345678,
+            .candidates = candidates,
+        };
+    }
+
+    pub fn deinit(self: *Session) void {
+        if (self.candidates.len > 0) self.allocator.free(self.candidates);
     }
 
     fn isStop(self: *const Session, id: u32) bool {
@@ -183,14 +203,23 @@ pub const Session = struct {
         var logits: []f32 = try eng.prefill(ids, 0);
         stats.prefill_ns = nowNs() - p0;
 
+        // Recent tokens for the repetition / presence / frequency penalties.
+        var recent: std.ArrayList(u32) = .empty;
+        defer recent.deinit(self.allocator);
+        const window = params.penalty_window;
+        for (ids) |id| {
+            if (recent.items.len >= window) _ = recent.orderedRemove(0);
+            try recent.append(self.allocator, id);
+        }
+
         var pos: u32 = @intCast(ids.len);
         const d0 = nowNs();
         var produced: u32 = 0;
         while (produced < params.max_tokens and pos < max_seq) : (produced += 1) {
-            const next = if (params.temperature <= 0)
-                cpu.argmax(logits)
+            const next = if (self.candidates.len >= logits.len)
+                cpu.sample(logits, params.sampler, recent.items, &self.rng, self.candidates)
             else
-                cpu.sampleTopK(logits, params.temperature, params.top_k, &self.rng);
+                cpu.argmax(logits);
 
             if (self.isStop(next)) {
                 stats.stop_reason = .stop;
@@ -203,6 +232,8 @@ pub const Session = struct {
                 produced += 1;
                 break;
             }
+            if (recent.items.len >= window) _ = recent.orderedRemove(0);
+            try recent.append(self.allocator, next);
             logits = try eng.forward(next, pos);
             pos += 1;
             if (produced + 1 == params.max_tokens) stats.stop_reason = .length;

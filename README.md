@@ -99,7 +99,7 @@ crashes on ARC Objective-C), Zig 0.17.
 | `anedvd bench` | matmul throughput sweep (128 … 4096) |
 | `anedvd selftest` | tiny transformer: ANE engine vs CPU reference |
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
-| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--chunk N] [--ab]` | generate text on the ANE |
+| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--top-p P] [--repeat-penalty R] [--chunk N] [--ab]` | generate text on the ANE |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |
 | `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
 
@@ -183,6 +183,9 @@ What is implemented:
   emitted partially.
 * `usage` / `stop_reason` reporting (`length` ↔ `max_tokens`, `stop` ↔ `end_turn`).
 * Message content as a plain string or as an array of `{type:"text"}` blocks.
+* Sampling controls: `temperature`, `top_p`, `top_k`, `repetition_penalty`
+  (llama.cpp semantics), `presence_penalty` and `frequency_penalty`
+  (OpenAI semantics). The Anthropic route accepts the first four.
 * CORS headers, so browser-based tools can call it directly.
 
 Known limitations:
@@ -195,6 +198,20 @@ Known limitations:
 * The chat template is ChatML when the vocabulary has `<|im_start|>` and a
   plain `User:/Assistant:` transcript otherwise; a model's own Jinja template
   from GGUF metadata is not evaluated.
+
+## Sampling
+
+The sampler is shared by the CLI, the HTTP API and the WebUI. It applies the
+penalties first, then keeps the candidates within
+`max_logit - 20 * temperature` (anything below contributes less than e^-20 and
+cannot be drawn), sorts that much smaller set, and truncates it by `top_k` and
+then `top_p` before drawing. A single pass over the vocabulary plus a small sort
+replaces the naive O(vocabulary × k) scan, which mattered: Qwen2.5's vocabulary
+is 151 936 tokens.
+
+`--temp 0` is greedy. For small models a repetition penalty is the single
+biggest quality lever — the same prompt with `--temp 0.7 --top-p 0.9
+--repeat-penalty 1.3` produces structured prose where greedy decoding loops.
 
 ## How it works
 

@@ -669,6 +669,8 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const temperature = argF32(argv, "--temp", 0.0);
     const top_k: usize = argValue(argv, "--top-k", 40);
     const chunk: u32 = argValue(argv, "--chunk", 64);
+    const top_p = argF32(argv, "--top-p", 1.0);
+    const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
     var fuse = false;
     var rope_hf = false;
     var rope_adj = false;
@@ -726,15 +728,6 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     defer allocator.free(ids);
     sys.print("\nprompt ({d} tokens): {s}\n---\n", .{ ids.len, formatted.items });
 
-    // Prefill.
-    const t0 = sys.nowNs();
-    const ane_before = eng.stats.ane_eval_ns;
-    var logits: []f32 = try eng.prefill(ids, 0);
-    const ane_after = eng.stats.ane_eval_ns;
-    const t_prefill = sys.nowNs();
-    _ = ane_before;
-    _ = ane_after;
-
     // A/B: the same prompt through the per-token path must give the same logits.
     var ab = false;
     for (argv) |a| if (std.mem.eql(u8, a, "--ab")) {
@@ -743,56 +736,47 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     if (ab) {
         var seq_logits: []f32 = undefined;
         for (ids, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
+        const batch_logits = try eng.prefill(ids, 0);
         var max_d: f32 = 0;
         var argmax_seq: u32 = 0;
         var argmax_batch: u32 = 0;
-        for (seq_logits, logits, 0..) |a, b, i| {
+        for (seq_logits, batch_logits, 0..) |a, b, i| {
             max_d = @max(max_d, @abs(a - b));
             if (a > seq_logits[argmax_seq]) argmax_seq = @intCast(i);
-            if (b > logits[argmax_batch]) argmax_batch = @intCast(i);
+            if (b > batch_logits[argmax_batch]) argmax_batch = @intCast(i);
         }
         sys.print("A/B sequential vs batched: max|diff| = {e:.6}, argmax {d} vs {d}\n", .{ max_d, argmax_seq, argmax_batch });
-        logits = try eng.prefill(ids, 0);
     }
 
-    // Decode.
-    var rng: u32 = 0x12345678;
-    const eos = tok.eosId();
-    var pos: u32 = @intCast(ids.len);
-    var produced: u32 = 0;
-    var printed_any = false;
-    var debug_gen = false;
-    for (argv) |a| if (std.mem.eql(u8, a, "--debug-gen")) {
-        debug_gen = true;
+    // Generation goes through the shared session so the CLI, the HTTP API and
+    // the WebUI all sample identically.
+    var session = generate_mod.Session.init(allocator, &eng, tok);
+    defer session.deinit();
+    if (tok.eosId()) |eos| {
+        const stops = try allocator.alloc(u32, 1);
+        stops[0] = eos;
+        session.stop_ids = stops;
+    }
+    const params = generate_mod.Params{
+        .max_tokens = max_tokens,
+        .sampler = .{ .temperature = temperature, .top_k = top_k, .top_p = top_p, .repetition_penalty = rep_penalty },
     };
-    while (produced < max_tokens and pos < 1000) : (produced += 1) {
-        const next = if (temperature <= 0) cpu.argmax(logits) else cpu.sampleTopK(logits, temperature, top_k, &rng);
-        if (debug_gen) sys.print("[gen] pos={d} next={d} eos={?d} top_logit={d:.2} produced={d}\n", .{ pos, next, eos, logits[next], produced });
-        if (eos != null and next == eos.?) break;
-        const bytes = try tok.tokenBytes(allocator, next);
-        defer allocator.free(bytes);
-        sys.writeAll(1, bytes);
-        printed_any = true;
-        logits = try eng.forward(next, pos);
-        pos += 1;
-    }
+    const t_gen0 = sys.nowNs();
+    const stats = try session.generate(ids, params, .{ .func = stdoutEmit });
     const t_end = sys.nowNs();
-    if (!printed_any) sys.print("(no output)", .{});
 
-    const decode_ns = t_end - t_prefill;
-    const decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1e6;
-    sys.print("\n---\n", .{});
+    const total_wall = t_end - t_gen0;
+    sys.print("stop: {s}\n", .{stats.stop_reason.toString()});
     sys.print("prefill: {d} tokens in {d:.2} s ({d:.1} tok/s)\n", .{
-        ids.len,
-        @as(f64, @floatFromInt(t_prefill - t0)) / 1e9,
-        @as(f64, @floatFromInt(ids.len)) / (@as(f64, @floatFromInt(t_prefill - t0)) / 1e9),
+        stats.prompt_tokens,
+        @as(f64, @floatFromInt(stats.prefill_ns)) / 1e9,
+        if (stats.prefill_ns > 0) @as(f64, @floatFromInt(stats.prompt_tokens)) / (@as(f64, @floatFromInt(stats.prefill_ns)) / 1e9) else 0,
     });
     sys.print("decode: {d} tokens in {d:.2} s ({d:.1} tok/s)\n", .{
-        produced,
-        decode_ms / 1000.0,
-        if (decode_ms > 0) @as(f64, @floatFromInt(produced)) / (decode_ms / 1000.0) else 0,
+        stats.completion_tokens,
+        @as(f64, @floatFromInt(stats.decode_ns)) / 1e9,
+        stats.decodeToksPerSec(),
     });
-    const total_wall = t_end - t0;
     sys.print("ANE: {d} evals for {d} tokens ({d:.1} kernels/token), {d:.1} ms total, {d:.2} ms/token\n", .{
         eng.stats.ane_evals,
         eng.stats.tokens,
@@ -910,6 +894,13 @@ const server_mod = @import("server.zig");
 const model_open = @import("model_open.zig");
 const generate_mod = @import("generate.zig");
 
+fn stdoutEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
+    _ = ctx;
+    _ = token_id;
+    sys.writeAll(1, piece);
+    return true;
+}
+
 fn fileStem(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     const ext = std.fs.path.extension(base);
@@ -928,6 +919,8 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const max_seq: u32 = argValue(argv, "--max-seq", 2048);
     const default_max_tokens: u32 = argValue(argv, "--max-tokens", 512);
     const chunk: u32 = argValue(argv, "--chunk", 64);
+    const top_p = argF32(argv, "--top-p", 1.0);
+    const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
     var fuse = false;
     var rope_hf = false;
     var rope_adj = false;
@@ -976,6 +969,8 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
             .model_name = model_name,
             .default_system = system,
             .default_max_tokens = default_max_tokens,
+            .default_top_p = top_p,
+            .default_repetition_penalty = rep_penalty,
         },
     };
     try srv.run();

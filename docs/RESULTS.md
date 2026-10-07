@@ -195,6 +195,20 @@ unsupported"). Reproduce with `probe/ane_int8_probe.m`.
 Consequence: weight traffic stays fp16, and the measured ~12–15 GB/s of weight
 bandwidth remains the decode ceiling.
 
+## Sampling
+
+The sampler keeps candidates within `max_logit - 20*T`, sorts that reduced set,
+and truncates by `top_k` then `top_p`. That is one pass over the vocabulary plus
+a small sort, replacing the previous O(vocabulary x k) selection — with a 151 936
+token vocabulary and k=40 that scan alone was several milliseconds per token.
+
+Effect on Qwen2.5-0.5B, same prompt ("Tell me about the ocean."):
+
+| settings | output |
+|---|---|
+| greedy | "The ocean is a vast and complex system of water bodies that cover approximately 71% of the Earth's surface. It is the largest body of water on Earth, covering about 367,000 square miles (950" |
+| `--temp 0.7 --top-p 0.9 --repeat-penalty 1.3` | "The Earth's oceans are a complex network of salty water that covers approximately 71% of its surface area, forming an immense and dynamic system...\n\nKey features include:\n\n1. **Size**: The largest single..." |
+
 ## Bugs found and fixed during development
 
 These are worth recording because each one produced *plausible-looking* output

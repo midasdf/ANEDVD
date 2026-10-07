@@ -50,6 +50,9 @@ zig fmt src build.zig
   64): decode fills column 0, prefill fills a whole chunk. The ANE costs the
   same either way (weights are read once), so do not "fix" this by building
   width-1 kernels — that just makes prefill 10x slower.
+* **One sampler for everything** (`cpu.sample`, driven by `generate.Session`):
+  CLI, HTTP API and WebUI all go through it, so a sampling change lands
+  everywhere at once.
 * **Use `run --ab`** after touching the prefill path: it asserts the batched and
   per-token logits are bit-identical.
 * **The ANE fails silently.** A wrong weight-blob offset, a transposed weight or
