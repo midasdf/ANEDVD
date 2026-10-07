@@ -89,8 +89,10 @@ pub const Session = struct {
     engine: *engine_mod.Engine,
     tokenizer: *const tokenizer_mod.Tokenizer,
     rng: u32 = 0x12345678,
-    /// Ids that terminate generation (EOS plus any explicit stop tokens).
+    /// Ids that terminate generation (any explicit stop tokens).
     stop_ids: []const u32 = &.{},
+    /// The tokenizer's EOS token, if it has one.
+    eos_stop: ?u32 = null,
     /// Scratch for the sampler (one candidate per vocabulary entry). Set by
     /// `init`; without it the sampler falls back to greedy decoding.
     candidates: []cpu.Candidate,
@@ -111,8 +113,17 @@ pub const Session = struct {
     }
 
     fn isStop(self: *const Session, id: u32) bool {
+        if (self.eos_stop) |eos| {
+            if (id == eos) return true;
+        }
         for (self.stop_ids) |s| if (s == id) return true;
         return false;
+    }
+
+    /// Stop when the model emits EOS. Owned by the session, so callers never
+    /// have to allocate a stop list.
+    pub fn stopOnEos(self: *Session) void {
+        self.eos_stop = self.tokenizer.eosId();
     }
 
     /// Build a prompt string from chat messages.

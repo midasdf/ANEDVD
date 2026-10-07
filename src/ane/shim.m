@@ -169,6 +169,11 @@ static BOOL write_weight_file(NSString *path, const ANEWeightFile *wf) {
     header[0] = 0x01;
     header[4] = 0x02;
     BOOL ok = write_all_fd(fd, header, sizeof(header));
+    // Each chunk header records the ABSOLUTE offset of its own payload, not a
+    // constant: the published ffn_blob_ref.bin has 128 for the first chunk and
+    // 240 for the second. Writing a constant here compiles fine and then
+    // silently feeds the wrong weights to every chunk after the first.
+    size_t pos = sizeof(header);
     for (int i = 0; ok && i < wf->n_chunks; i++) {
         uint8_t chunk[64];
         memset(chunk, 0, sizeof(chunk));
@@ -176,10 +181,11 @@ static BOOL write_weight_file(NSString *path, const ANEWeightFile *wf) {
         chunk[4] = 0x01;
         uint32_t size = (uint32_t)wf->chunk_sizes[i];
         memcpy(chunk + 8, &size, 4);
-        uint32_t data_off = 128;
+        uint32_t data_off = (uint32_t)(pos + sizeof(chunk));
         memcpy(chunk + 16, &data_off, 4);
         ok = write_all_fd(fd, chunk, sizeof(chunk)) &&
              write_all_fd(fd, wf->chunk_data[i], wf->chunk_sizes[i]);
+        pos += sizeof(chunk) + wf->chunk_sizes[i];
     }
     close(fd);
     return ok;

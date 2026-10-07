@@ -85,7 +85,8 @@ pub fn pack(allocator: std.mem.Allocator, tensors: []const Tensor) !Packed {
         bytes[h + 3] = 0xDE;
         bytes[h + 4] = 0x01;
         sys.writeU32LE(bytes[h + 8 ..][0..4], @intCast(payload_size));
-        sys.writeU32LE(bytes[h + 16 ..][0..4], 128);
+        // Absolute payload offset for THIS chunk (128, 240, 352, ...).
+        sys.writeU32LE(bytes[h + 16 ..][0..4], @intCast(h + CHUNK_HEADER));
 
         const payload_off = h + CHUNK_HEADER;
         const dst = bytes[payload_off..][0..payload_size];
@@ -131,12 +132,38 @@ test "weight blob layout matches the published fixture" {
     try std.testing.expectEqual(@as(u8, 0xEF), blob.bytes[64]);
     try std.testing.expectEqual(@as(u8, 0xDE), blob.bytes[67]);
     try std.testing.expectEqual(@as(u32, 48), sys.readU32LE(blob.bytes[72..76]));
-    try std.testing.expectEqual(@as(u32, 128), sys.readU32LE(blob.bytes[80..84]));
     try std.testing.expectEqual(@as(u32, 48), sys.readU32LE(blob.bytes[176..180]));
+
+    // `data_off` is the ABSOLUTE offset of each chunk's own payload (128 then
+    // 240), not a constant. Assuming a constant compiles fine and silently
+    // feeds the wrong weights to every chunk after the first; this is checked
+    // against the published ffn_blob_ref.bin byte-for-byte.
+    try std.testing.expectEqual(@as(u32, 128), sys.readU32LE(blob.bytes[80..84]));
+    try std.testing.expectEqual(@as(u32, 240), sys.readU32LE(blob.bytes[192..196]));
 
     // Payload round-trip.
     const got: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, blob.bytes[128..176]));
     for (a, 0..) |v, i| try std.testing.expectEqual(v, got[i]);
+}
+
+test "chunkOffsets agrees with pack()" {
+    const allocator = std.testing.allocator;
+    const sizes = [_]usize{ 48, 96, 24 };
+    var a: [48]f16 = undefined;
+    var b: [96]f16 = undefined;
+    var c: [24]f16 = undefined;
+    for (&a) |*v| v.* = 1;
+    for (&b) |*v| v.* = 2;
+    for (&c) |*v| v.* = 3;
+    var blob = try pack(allocator, &.{
+        .{ .name = "a", .data = &a },
+        .{ .name = "b", .data = &b },
+        .{ .name = "c", .data = &c },
+    });
+    defer blob.deinit();
+    var computed: [3]u64 = undefined;
+    chunkOffsets(&sizes, &computed);
+    for (computed, blob.offsets) |x, y| try std.testing.expectEqual(y, x);
 }
 
 test "f32ToF16 round-trips exactly-representable values" {

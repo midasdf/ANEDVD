@@ -21,7 +21,7 @@ const USAGE =
     \\  anedvd bench [--size N] [--iters K]
     \\                                  measure ANE matmul throughput
     \\  anedvd width [--size N]         cost of extra activation columns (prefill batching)
-    \\  anedvd selftest [--fuse]        ANE engine vs CPU reference on a tiny model
+    \\  anedvd selftest [--split]       ANE engine vs CPU reference on a tiny model
     \\  anedvd check <model.gguf>       load a real GGUF, compile all ANE kernels, run a step
     \\  anedvd run --model <m.gguf> --prompt "..." [--max-tokens N] [--temp T] [--top-k K]
     \\                                  generate text on the ANE
@@ -35,7 +35,7 @@ const USAGE =
     \\
     \\model flags: --rope-hf | --rope-adjacent   force the RoPE convention
     \\             --chunk N                      activation width (default 64; prompt batching)
-    \\             --fuse                         experimental fused FFN (known wrong)
+    \\             --split                        use two kernels for the FFN instead of one
     \\
 ;
 
@@ -59,9 +59,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "width")) {
         return cmdWidthSweep(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "selftest")) {
-        var fuse = false;
-        for (argv) |a| if (std.mem.eql(u8, a, "--fuse")) {
-            fuse = true;
+        var fuse = true;
+        for (argv) |a| if (std.mem.eql(u8, a, "--split")) {
+            fuse = false;
         };
         return cmdSelftestOpt(allocator, fuse);
     } else if (std.mem.eql(u8, cmd, "check")) {
@@ -336,7 +336,7 @@ fn refForward(
 }
 
 fn cmdSelftest(allocator: std.mem.Allocator) !void {
-    return cmdSelftestOpt(allocator, false);
+    return cmdSelftestOpt(allocator, true);
 }
 
 fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
@@ -465,7 +465,7 @@ const load_gguf = @import("load_gguf.zig");
 
 fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     if (argv.len < 3) {
-        sys.eprint("usage: anedvd check <model.gguf|hf-dir> [--fuse]\n", .{});
+        sys.eprint("usage: anedvd check <model.gguf|hf-dir> [--split]\n", .{});
         std.process.exit(2);
     }
     const path = argv[2];
@@ -633,11 +633,11 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const chunk: u32 = argValue(argv, "--chunk", 64);
     const top_p = argF32(argv, "--top-p", 1.0);
     const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
-    var fuse = false;
+    var fuse = true;
     var rope_hf = false;
     var rope_adj = false;
     for (argv) |a| {
-        if (std.mem.eql(u8, a, "--fuse")) fuse = true;
+        if (std.mem.eql(u8, a, "--split")) fuse = false;
         if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
         if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
     }
@@ -714,11 +714,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     // the WebUI all sample identically.
     var session = generate_mod.Session.init(allocator, &eng, tok);
     defer session.deinit();
-    if (tok.eosId()) |eos| {
-        const stops = try allocator.alloc(u32, 1);
-        stops[0] = eos;
-        session.stop_ids = stops;
-    }
+    session.stopOnEos();
     const params = generate_mod.Params{
         .max_tokens = max_tokens,
         .sampler = .{ .temperature = temperature, .top_k = top_k, .top_p = top_p, .repetition_penalty = rep_penalty },
@@ -883,11 +879,11 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const chunk: u32 = argValue(argv, "--chunk", 64);
     const top_p = argF32(argv, "--top-p", 1.0);
     const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
-    var fuse = false;
+    var fuse = true;
     var rope_hf = false;
     var rope_adj = false;
     for (argv) |a| {
-        if (std.mem.eql(u8, a, "--fuse")) fuse = true;
+        if (std.mem.eql(u8, a, "--split")) fuse = false;
         if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
         if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
     }
@@ -916,11 +912,8 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
 
     var session = generate_mod.Session.init(allocator, &eng, tok);
-    if (tok.eosId()) |eos| {
-        const stops = try allocator.alloc(u32, 1);
-        stops[0] = eos;
-        session.stop_ids = stops;
-    }
+    defer session.deinit();
+    session.stopOnEos();
 
     var srv = server_mod.Server{
         .allocator = allocator,
@@ -1037,11 +1030,7 @@ fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     var session = generate_mod.Session.init(allocator, &eng, tok);
     defer session.deinit();
-    if (tok.eosId()) |eos| {
-        const stops = try allocator.alloc(u32, 1);
-        stops[0] = eos;
-        session.stop_ids = stops;
-    }
+    session.stopOnEos();
 
     var history = History{ .allocator = allocator };
     defer history.deinit();

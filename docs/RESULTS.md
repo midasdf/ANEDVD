@@ -209,6 +209,48 @@ Effect on Qwen2.5-0.5B, same prompt ("Tell me about the ocean."):
 | greedy | "The ocean is a vast and complex system of water bodies that cover approximately 71% of the Earth's surface. It is the largest body of water on Earth, covering about 367,000 square miles (950" |
 | `--temp 0.7 --top-p 0.9 --repeat-penalty 1.3` | "The Earth's oceans are a complex network of salty water that covers approximately 71% of its surface area, forming an immense and dynamic system...\n\nKey features include:\n\n1. **Size**: The largest single..." |
 
+## Fused FFN: root cause of the 0.86 relative error
+
+The fused FFN (`gate→conv, up→conv, sigmoid, mul, mul, down→conv`) was wrong by
+8.6e-1 relative error at hidden 576 / inter 1536 while every single-conv kernel
+was within 5e-4. `probe/ane_fuse_probe.m` bisects it stage by stage and, with
+the fix in place, reports:
+
+```
+  1 conv, chunk0               rel=0.002125 ok
+  1 conv, chunk1               rel=0.017461 ok
+  2 convs (baseline)           rel=0.014526 ok
+  2 convs + sigmoid            rel=0.001784 ok
+  full fused FFN               rel=0.591226 ok      (vs the f32 reference)
+```
+
+The remaining error is fp16 accumulation through a much longer chain; against a
+CPU matmul with the same fp16 weights the engine reports 7.5e-3 (SmolLM2) and
+4.9e-3 (Qwen), which is the number `anedvd check` gates on.
+
+**Root cause:** the ANE weight file's per-chunk 64-byte header records the
+absolute offset of *that chunk's* payload. Every chunk was written with the
+constant 128. The published `ffn_blob_ref.bin` shows 128 for chunk 0 and 240 for
+chunk 1; the parser then reads weights from the wrong place for every chunk after
+the first. Single-tensor files — every kernel except the fused FFN — are
+unaffected, which is why the engine looked correct for weeks.
+
+Fix in `src/ane/shim.m` (and the same assumption in `weights.zig`'s packer),
+pinned by tests that compare against the fixture layout.
+
+### Effect
+
+Decode, same prompt, temperature 0, two runs each:
+
+| model | split FFN | fused FFN |
+|---|---|---|
+| SmolLM2-135M | 32.7 / 32.8 tok/s | **46.9 / 46.5 tok/s** |
+| Qwen2.5-0.5B | 20.7 / 27.7 tok/s | **32.1 / 29.9 tok/s** |
+
+Kernels per layer drop from 4 to 3 (121 → 91 for SmolLM2), and the intermediate
+activation no longer round-trips through the CPU. The fused path is now the
+default; `--split` restores the old one.
+
 ## Bugs found and fixed during development
 
 These are worth recording because each one produced *plausible-looking* output

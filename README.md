@@ -39,17 +39,17 @@ The capital of France is Paris. Paris is a city located in the northern part of
 the country, and it is known for its historical landmarks, cultural institutions,
 and cultural attractions. Paris is famous for
 ---
-prefill: 16 tokens in 0.62 s (25.6 tok/s)
+prefill: 16 tokens in 0.04 s (400 tok/s)
 decode: 40 tokens in 1.57 s (25.4 tok/s)
 ANE: 6776 evals, 1293.2 ms total, 23.09 ms/token (82% of wall time)
 ```
 
 * **Prompt batching works**: a whole chunk of prompt tokens goes through the ANE
   in one pass, because the ANE reads the weights once per evaluation regardless
-  of width (measured below). SmolLM2-135M prefill went from ~25 to **258 tok/s**,
-  Qwen2.5-0.5B from ~17 to **277 tok/s**.
-* **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at ~31 tok/s decode, HF
-  safetensors F16 at ~31 tok/s (no dequantisation), same output.
+  of width (measured below). SmolLM2-135M prefill is ~400 tok/s and Qwen2.5-0.5B
+  is ~260 tok/s, against ~25 and ~17 before batching.
+* **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at ~47 tok/s decode, HF
+  safetensors F16 at ~47 tok/s (no dequantisation), same output.
 * **SmolLM2-135M-Instruct (Q8_0)**: 30 layers, 121 ANE kernels, **25.4 tok/s** decode.
 * **Qwen2.5-0.5B-Instruct (Q8_0)**: 24 layers, 97 ANE kernels, **10.1 tok/s** decode,
   GQA + QKV biases + RoPE θ=10⁶ — answers "The capital of France is Paris."
@@ -303,8 +303,11 @@ so RMSNorm/attention cannot be expressed portably. The projections are >95% of
 the FLOPs, so the ANE still does the heavy lifting (82% of wall-clock in the run
 above).
 
-Per layer: `qkv` (fused Wq|Wk|Wv), `o`, `gate_up`, `down` — 4 kernels; plus one
-`lm_head` kernel. Kernel launch overhead is ~90–110 µs, which is why the
+Per layer: `qkv` (fused Wq|Wk|Wv), `o`, and one fused FFN kernel
+(`gate→conv, up→conv, sigmoid, mul, mul, down→conv`), plus one `lm_head` kernel
+— 3 kernels per layer, which measured ~45% faster decode than keeping the SiLU
+on the CPU and running `gate_up`/`down` as two kernels. `--split` restores the
+two-kernel path. Kernel launch overhead is ~90–110 µs, which is why the
 projections are fused as much as the data dependencies allow, and why prompt
 tokens are batched into one pass instead of one pass per token.
 
@@ -447,13 +450,7 @@ quantisation rather than unified memory:
 
 ## Known issues
 
-* **The fused FFN kernel (`--fuse`) is numerically wrong.** The program is
-  `gate→conv, up→conv, sigmoid, mul, mul, down→conv`, which would save 2 kernel
-  launches per layer. Measured relative error vs the CPU reference: 2.3×10⁻² on
-  the tiny selftest shapes and 8.6×10⁻¹ at hidden 576 / inter 1536, while every
-  conv-only kernel stays within 5×10⁻⁴. It is off by default and the split path
-  (`gate_up` conv + CPU SiLU + `down` conv) is exact. Bisecting which of
-  `sigmoid`/`mul`/multi-conv programs the ANE mis-handles is the main open item.
+
 * K-quants are implemented but only lightly exercised; Q8_0/Q4_0/F16 are the
   best-tested paths.
 * `check` and `cpu` are still GGUF-only (`run`, `serve` and `selftest` handle
