@@ -474,12 +474,12 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         std.process.exit(2);
     }
     const path = argv[2];
-    var fuse = false;
+    var fuse = true;
     var rope_hf = false;
     var rope_adj = false;
     var chunk: u32 = 64;
     for (argv, 0..) |a, i| {
-        if (std.mem.eql(u8, a, "--fuse")) fuse = true;
+        if (std.mem.eql(u8, a, "--split")) fuse = false;
         if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
         if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
         if (std.mem.eql(u8, a, "--chunk") and i + 1 < argv.len) chunk = std.fmt.parseInt(u32, argv[i + 1], 10) catch chunk;

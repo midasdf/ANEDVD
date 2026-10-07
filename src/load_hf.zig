@@ -121,6 +121,10 @@ pub fn loadRuntime(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.C
         const li: u32 = @intCast(i);
         n.attn = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.input_layernorm.weight", .{li}) catch unreachable, cfg.hidden);
         n.ffn = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.post_attention_layernorm.weight", .{li}) catch unreachable, cfg.hidden);
+        if (sh.find(std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}) catch unreachable) != null) {
+            n.q_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+            n.k_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+        }
         if (sh.find(std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.bias", .{li}) catch unreachable) != null) {
             const bq = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.bias", .{li}) catch unreachable);
             defer allocator.free(bq);

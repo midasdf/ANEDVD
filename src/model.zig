@@ -87,6 +87,10 @@ pub const Norm = struct {
     /// projection, so they must outlive the matrices.
     qkv_bias: ?[]f32 = null,
     o_bias: ?[]f32 = null,
+    /// Per-head Q/K normalisation weights (Qwen3): [head_dim] each, applied
+    /// before RoPE.
+    q_norm: ?[]f32 = null,
+    k_norm: ?[]f32 = null,
 };
 
 /// Everything the engine needs at run time: the token embedding, the final
@@ -111,6 +115,8 @@ pub const Runtime = struct {
             if (n.ffn.len > 0) self.allocator.free(n.ffn);
             if (n.qkv_bias) |b| self.allocator.free(b);
             if (n.o_bias) |b| self.allocator.free(b);
+            if (n.q_norm) |b| self.allocator.free(b);
+            if (n.k_norm) |b| self.allocator.free(b);
         }
         if (self.norms.len > 0) self.allocator.free(self.norms);
         self.* = undefined;

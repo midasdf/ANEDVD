@@ -228,6 +228,11 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_output.bias", .{li}) catch unreachable) != null) {
             n.o_bias = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.bias", .{li}) catch unreachable);
         }
+        // Qwen3 normalises each head's q/k before RoPE.
+        if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
+            n.q_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+            n.k_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+        }
     }
     return rt;
 }

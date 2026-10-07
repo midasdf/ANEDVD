@@ -378,7 +378,19 @@ pub const Engine = struct {
         return self.logits;
     }
 
+    /// RMSNorm applied per attention head (Qwen3's q_norm/k_norm), before RoPE.
+    fn applyHeadNorm(vec: []f32, heads: u32, head_dim: u32, weight: []const f32, eps: f32) void {
+        const hd: usize = head_dim;
+        for (0..heads) |h| {
+            const v = vec[h * hd ..][0..hd];
+            cpu.rmsnorm(v, v, weight, eps);
+        }
+    }
+
     fn ropeAndCache(self: *Engine, li: usize, pos: u32, cfg: model.Config, kv_dim: usize) void {
+        const norm = &self.norms[li];
+        if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, cfg.head_dim, w, cfg.eps);
+        if (norm.k_norm) |w| applyHeadNorm(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, w, cfg.eps);
         if (cfg.rope_adjacent) {
             cpu.ropeAdjacent(self.sq, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
             cpu.ropeAdjacent(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);

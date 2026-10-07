@@ -29,9 +29,14 @@ const SOCK_STREAM: c_uint = 1;
 const SOL_SOCKET: c_int = 0xffff;
 const SO_REUSEADDR: c_int = 0x0004;
 const SO_NOSIGPIPE: c_int = 0x1022;
+const SO_RCVTIMEO: c_int = 0x1006;
+const SO_SNDTIMEO: c_int = 0x1005;
 const SHUT_WR: c_int = 1;
 const SIGPIPE: c_int = 13;
 const SIG_IGN: usize = 1;
+/// A stalled client must not wedge the single-threaded server.
+const RECV_TIMEOUT_S: c_long = 30;
+const SEND_TIMEOUT_S: c_long = 60;
 
 pub const Error = error{
     SocketFailed,
