@@ -64,10 +64,8 @@ extern fn ane_shim_compile_count() c_int;
 extern fn ane_shim_kernel_create(
     mil: [*]const u8,
     mil_len: usize,
-    w_names: [*]const [*:0]const u8,
-    w_data: [*]const [*]const u8,
-    w_lens: [*]const usize,
-    n_weights: c_int,
+    files: [*]const CWeightFile,
+    n_files: c_int,
 ) ?*anyopaque;
 extern fn ane_shim_kernel_free(k: *anyopaque) void;
 extern fn ane_shim_kernel_eval(k: *anyopaque) c_int;
@@ -84,12 +82,34 @@ extern fn ane_shim_output_unlock(k: *const anyopaque, idx: c_int) c_int;
 extern fn ane_shim_input_capacity(k: *const anyopaque, idx: c_int) usize;
 extern fn ane_shim_output_capacity(k: *const anyopaque, idx: c_int) usize;
 extern fn ane_shim_last_eval_ns(k: *const anyopaque) u64;
+extern fn ane_shim_write_ns() u64;
+extern fn ane_shim_compile_ns() u64;
+extern fn ane_shim_load_ns() u64;
 
-/// One weight file handed to a kernel. `name` must be a MIL weight symbol such
-/// as "@model_path/weights/w0.bin".
+/// Cumulative milliseconds spent inside the ANE daemon's compile/load and in
+/// writing weight files, for startup profiling.
+pub fn phaseMs() struct { write: f64, compile: f64, load: f64 } {
+    return .{
+        .write = @as(f64, @floatFromInt(ane_shim_write_ns())) / 1e6,
+        .compile = @as(f64, @floatFromInt(ane_shim_compile_ns())) / 1e6,
+        .load = @as(f64, @floatFromInt(ane_shim_load_ns())) / 1e6,
+    };
+}
+
+/// One weight file handed to a kernel: a MIL symbol plus the fp16 payloads of
+/// the tensors it contains, written straight to disk by the shim (no blob is
+/// ever materialised in Zig).
 pub const WeightFile = struct {
     name: [:0]const u8,
-    data: []const u8,
+    chunks: []const []const u8,
+};
+
+/// C ABI mirror of ANEWeightFile.
+pub const CWeightFile = extern struct {
+    name: [*:0]const u8,
+    n_chunks: c_int,
+    chunk_data: [*]const [*]const u8,
+    chunk_sizes: [*]const usize,
 };
 
 pub const Error = error{
@@ -115,20 +135,11 @@ pub fn compileCount() i32 {
     return ane_shim_compile_count();
 }
 
-fn dupeZ(allocator: std.mem.Allocator, s: []const u8) ![:0]u8 {
-    const buf = try allocator.alloc(u8, s.len + 1);
-    @memcpy(buf[0..s.len], s);
-    buf[s.len] = 0;
-    return buf[0..s.len :0];
-}
-
 pub const Kernel = struct {
     allocator: std.mem.Allocator,
     handle: *anyopaque,
     in_info: []TensorInfo,
     out_info: []TensorInfo,
-    /// Names of the MIL weight symbols, kept alive for the kernel's lifetime.
-    weight_names: [][:0]u8,
     /// Bytes written to the input surfaces at creation (they start zeroed and
     /// padding is never touched afterwards).
     input_scratch: []u8,
@@ -136,40 +147,42 @@ pub const Kernel = struct {
     pub fn create(
         allocator: std.mem.Allocator,
         mil: []const u8,
-        weights: []const WeightFile,
+        files: []const WeightFile,
     ) !Kernel {
         if (!available()) return Error.AneUnavailable;
 
-        const names = try allocator.alloc([*:0]const u8, weights.len);
-        defer allocator.free(names);
-        const datas = try allocator.alloc([*]const u8, weights.len);
+        var total_chunks: usize = 0;
+        for (files) |f| total_chunks += f.chunks.len;
+        const datas = try allocator.alloc([*]const u8, total_chunks);
         defer allocator.free(datas);
-        const lens = try allocator.alloc(usize, weights.len);
-        defer allocator.free(lens);
-        var owned_names = try allocator.alloc([:0]u8, weights.len);
-        errdefer {
-            for (owned_names) |n| allocator.free(n);
-            allocator.free(owned_names);
-        }
-        for (weights, 0..) |w, i| {
-            owned_names[i] = try dupeZ(allocator, w.name);
-            names[i] = owned_names[i].ptr;
-            datas[i] = w.data.ptr;
-            lens[i] = w.data.len;
+        const sizes = try allocator.alloc(usize, total_chunks);
+        defer allocator.free(sizes);
+        const c_files = try allocator.alloc(CWeightFile, files.len);
+        defer allocator.free(c_files);
+
+        var idx: usize = 0;
+        for (files, 0..) |f, i| {
+            const start = idx;
+            for (f.chunks) |chunk| {
+                datas[idx] = chunk.ptr;
+                sizes[idx] = chunk.len;
+                idx += 1;
+            }
+            c_files[i] = .{
+                .name = f.name.ptr,
+                .n_chunks = @intCast(f.chunks.len),
+                .chunk_data = datas.ptr + start,
+                .chunk_sizes = sizes.ptr + start,
+            };
         }
 
-        const h = ane_shim_kernel_create(mil.ptr, mil.len, names.ptr, datas.ptr, lens.ptr, @intCast(weights.len)) orelse {
-            for (owned_names) |n| allocator.free(n);
-            allocator.free(owned_names);
+        const h = ane_shim_kernel_create(mil.ptr, mil.len, c_files.ptr, @intCast(files.len)) orelse
             return Error.AneCompileFailed;
-        };
 
         const ni: usize = @intCast(ane_shim_input_count(h));
         const no: usize = @intCast(ane_shim_output_count(h));
         if (ni == 0 or no == 0 or ni > 16 or no > 16) {
             ane_shim_kernel_free(h);
-            for (owned_names) |n| allocator.free(n);
-            allocator.free(owned_names);
             return Error.TooManyTensors;
         }
 
@@ -192,15 +205,12 @@ pub const Kernel = struct {
             .handle = h,
             .in_info = in_info,
             .out_info = out_info,
-            .weight_names = owned_names,
             .input_scratch = try allocator.alloc(u8, max_in),
         };
     }
 
     pub fn deinit(self: *Kernel) void {
         ane_shim_kernel_free(self.handle);
-        for (self.weight_names) |n| self.allocator.free(n);
-        self.allocator.free(self.weight_names);
         self.allocator.free(self.in_info);
         self.allocator.free(self.out_info);
         self.allocator.free(self.input_scratch);

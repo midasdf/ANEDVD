@@ -88,6 +88,18 @@ fn loadLinear(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u
     return Error.DimensionMismatch;
 }
 
+/// Zero-copy view of an fp16 tensor's payload inside the mapped file.
+fn viewF16(g: *const gguf.Gguf, name: []const u8, in_dim: u32, out_dim: u32) ?[]f16 {
+    const t = g.tensor(name) orelse return null;
+    if (t.ttype != .f16) return null;
+    if (t.elemCount() != @as(u64, in_dim) * out_dim) return null;
+    if (t.dims.len < 2 or t.dims[0] != in_dim or t.dims[1] != out_dim) return null;
+    const bytes = g.tensorBytes(t) catch return null;
+    if (bytes.len % 2 != 0) return null;
+    const aligned: []align(2) const u8 = @alignCast(bytes);
+    return @constCast(std.mem.bytesAsSlice(f16, aligned));
+}
+
 fn loadNorm(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u8, n: u32) ![]f32 {
     const v = try g.readF32(allocator, name);
     if (v.len != n) {
@@ -175,3 +187,104 @@ test "config keys are built per architecture" {
     try std.testing.expectEqualStrings("qwen2.embedding_length", key(&buf, "qwen2", "embedding_length"));
     try std.testing.expectEqualStrings("llama.block_count", key(&buf, "llama", "block_count"));
 }
+
+// ---------------------------------------------------------------- streaming
+
+/// Everything needed at run time, without the per-layer matrices.
+pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, progress: bool) !model.Runtime {
+    var rt = model.Runtime{ .allocator = allocator, .config = cfg };
+    errdefer rt.deinit();
+    if (progress) sys.print("  runtime weights: embedding + norms\n", .{});
+    if (viewF16(g, "token_embd.weight", cfg.hidden, cfg.vocab)) |view| {
+        rt.embed = view;
+        rt.embed_owned = false; // aliases the mmap; nothing to free
+        if (progress) sys.print("    embedding: zero-copy from the mapped file\n", .{});
+    } else {
+        rt.embed = try loadLinear(allocator, g, "token_embd.weight", cfg.hidden, cfg.vocab);
+        rt.embed_owned = true;
+    }
+    rt.final_norm = try loadNorm(allocator, g, "output_norm.weight", cfg.hidden);
+    rt.norms = try allocator.alloc(model.Norm, cfg.layers);
+    @memset(rt.norms, .{});
+    var buf: [128]u8 = undefined;
+    for (rt.norms, 0..) |*n, i| {
+        const li: u32 = @intCast(i);
+        n.attn = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden);
+        n.ffn = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden);
+        if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable) != null) {
+            const bq = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable);
+            defer allocator.free(bq);
+            const bk = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.bias", .{li}) catch unreachable);
+            defer allocator.free(bk);
+            const bv = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.bias", .{li}) catch unreachable);
+            defer allocator.free(bv);
+            if (bq.len + bk.len + bv.len != cfg.qkvDim()) return Error.DimensionMismatch;
+            const all = try allocator.alloc(f32, cfg.qkvDim());
+            @memcpy(all[0..bq.len], bq);
+            @memcpy(all[bq.len..][0..bk.len], bk);
+            @memcpy(all[bq.len + bk.len ..][0..bv.len], bv);
+            n.qkv_bias = all;
+        }
+        if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_output.bias", .{li}) catch unreachable) != null) {
+            n.o_bias = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.bias", .{li}) catch unreachable);
+        }
+    }
+    return rt;
+}
+
+/// One layer's compile-time-only matrices.
+pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, index: u32) !model.Matrices {
+    var m = model.Matrices{};
+    errdefer m.deinit(allocator);
+    var buf: [128]u8 = undefined;
+    const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{index}) catch unreachable, cfg.hidden, cfg.qDim());
+    defer allocator.free(q);
+    const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
+    defer allocator.free(k);
+    const v = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
+    defer allocator.free(v);
+    m.qkv = try allocator.alloc(f16, q.len + k.len + v.len);
+    @memcpy(m.qkv[0..q.len], q);
+    @memcpy(m.qkv[q.len..][0..k.len], k);
+    @memcpy(m.qkv[q.len + k.len ..][0..v.len], v);
+    m.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{index}) catch unreachable, cfg.qDim(), cfg.hidden);
+    m.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
+    m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
+    m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{index}) catch unreachable, cfg.inter, cfg.hidden);
+    return m;
+}
+
+/// lm-head weights; ties to the embedding when the file has no `output.weight`.
+pub fn loadHead(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, embed: []const f16) !model.HeadWeights {
+    if (g.tensor("output.weight") == null) return .{ .data = embed, .owned = false };
+    return .{ .data = try loadLinear(allocator, g, "output.weight", cfg.hidden, cfg.vocab), .owned = true };
+}
+
+/// LayerSource backed by a GGUF file.
+pub const GgufLayers = struct {
+    g: *const gguf.Gguf,
+    cfg: model.Config,
+
+    pub fn source(self: *GgufLayers) model.LayerSource {
+        return .{ .ctx = self, .loadFn = loadFn };
+    }
+    fn loadFn(ctx: *anyopaque, allocator: std.mem.Allocator, index: u32) anyerror!model.Matrices {
+        const self: *GgufLayers = @ptrCast(@alignCast(ctx));
+        return loadLayer(allocator, self.g, self.cfg, index);
+    }
+};
+
+/// HeadSource backed by a GGUF file (falls back to the tied embedding).
+pub const GgufHead = struct {
+    g: *const gguf.Gguf,
+    cfg: model.Config,
+    embed: []const f16,
+
+    pub fn source(self: *GgufHead) model.HeadSource {
+        return .{ .ctx = self, .loadFn = loadFn };
+    }
+    fn loadFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!model.HeadWeights {
+        const self: *GgufHead = @ptrCast(@alignCast(ctx));
+        return loadHead(allocator, self.g, self.cfg, self.embed);
+    }
+};

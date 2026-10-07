@@ -131,11 +131,8 @@ fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32)
     const x16 = try weights.f32ToF16(allocator, x32);
     defer allocator.free(x16);
 
-    var wblob = try weights.pack(allocator, &.{.{ .name = "W", .data = w16 }});
-    defer wblob.deinit();
-
     var sym_buf: [64]u8 = undefined;
-    const sym = try weights.symbolFor(&sym_buf, 0);
+    const sym = try weights.symbol(&sym_buf);
 
     const program = try mil.build(allocator, .{
         .inputs = &.{.{ .name = "i0", .channels = cin }},
@@ -145,14 +142,17 @@ fn runMatmulProbe(allocator: std.mem.Allocator, cin: u32, cout: u32, iters: u32)
             .y = "o0",
             .cin = cin,
             .cout = cout,
-            .blob_offset = wblob.offsets[0],
+            .blob_offset = 64,
             .file = sym,
         } }},
         .outputs = &.{"o0"},
     });
     defer allocator.free(program);
 
-    var kernel = try ane.Kernel.create(allocator, program, &.{.{ .name = sym, .data = wblob.bytes }});
+    var kernel = try ane.Kernel.create(allocator, program, &.{.{
+        .name = sym,
+        .chunks = &.{std.mem.sliceAsBytes(w16)},
+    }});
     defer kernel.deinit();
     kernel.zeroInputs();
 
@@ -388,7 +388,15 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
         for (tmp[0..cfg.hidden], 0..) |v, i| lw.ffn_norm[i] = 0.8 + v * 0.4;
     }
 
-    var engine = try engine_mod.Engine.init(allocator, &mw, .{ .max_seq = 64, .verbose = true, .fuse_ffn = fuse });
+    // The CPU reference keeps its own copy; the engine takes ownership of `mw`.
+    var ref_mw = try mw.clone(allocator);
+    defer ref_mw.deinit();
+    const rt = try mw.toRuntime(allocator);
+    var engine = try engine_mod.Engine.init(allocator, rt, mw.layerSource(), mw.headSource(rt.embed), .{
+        .max_seq = 64,
+        .verbose = true,
+        .fuse_ffn = fuse,
+    });
     defer engine.deinit();
 
     var st = RefState{
@@ -413,7 +421,7 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
     var max_ref: f32 = 0;
     for (tokens, 0..) |tok, pos| {
         const got = try engine.forward(tok, @intCast(pos));
-        const ref = try refForward(allocator, &mw, &st, tok, @intCast(pos));
+        const ref = try refForward(allocator, &ref_mw, &st, tok, @intCast(pos));
         defer allocator.free(ref);
         var step_max: f32 = 0;
         for (got, ref) |a, b| {
@@ -468,24 +476,26 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         }
     }
 
-    const t_w0 = sys.nowNs();
-    var mw = try load_gguf.loadWeights(allocator, &g, true);
-    defer mw.deinit();
-    const t_w1 = sys.nowNs();
-    const bytes = (@as(u64, cfg.vocab) * cfg.hidden + @as(u64, cfg.layers) * (@as(u64, cfg.qkvDim()) * cfg.hidden +
-        @as(u64, cfg.hidden) * cfg.qDim() + 2 * @as(u64, cfg.inter) * cfg.hidden + @as(u64, cfg.hidden) * cfg.inter)) * 2;
-    sys.print("  weights loaded in {d:.2} s (~{d:.1} MB fp16)\n", .{ @as(f64, @floatFromInt(t_w1 - t_w0)) / 1e9, @as(f64, @floatFromInt(bytes)) / 1e6 });
+    const rt = try load_gguf.loadRuntime(allocator, &g, cfg, true);
     sys.print("  ANE compiles so far: {d}\n", .{ane.compileCount()});
 
     const t_c0 = sys.nowNs();
-    var fuse = true;
-    for (argv) |a| if (std.mem.eql(u8, a, "--split")) {
-        fuse = false;
+    var fuse = false;
+    for (argv) |a| if (std.mem.eql(u8, a, "--fuse")) {
+        fuse = true;
     };
-    var eng = try engine_mod.Engine.init(allocator, &mw, .{ .max_seq = 512, .verbose = true, .fuse_ffn = fuse });
+    var layers_src = load_gguf.GgufLayers{ .g = &g, .cfg = rt.config };
+    var head_src = load_gguf.GgufHead{ .g = &g, .cfg = rt.config, .embed = rt.embed };
+    var eng = try engine_mod.Engine.init(allocator, rt, layers_src.source(), head_src.source(), .{
+        .max_seq = 512,
+        .verbose = true,
+        .fuse_ffn = fuse,
+    });
     defer eng.deinit();
     const t_c1 = sys.nowNs();
     sys.print("  all kernels compiled in {d:.2} s (ANE compiles: {d})\n", .{ @as(f64, @floatFromInt(t_c1 - t_c0)) / 1e9, ane.compileCount() });
+    const ph = ane.phaseMs();
+    sys.print("  phase split: write {d:.2} s, ANECCompile {d:.2} s, load {d:.2} s\n", .{ ph.write / 1000.0, ph.compile / 1000.0, ph.load / 1000.0 });
 
     const logits = try eng.forward(1, 0);
     var max: f32 = -std.math.inf(f32);
@@ -503,12 +513,11 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         std.process.exit(1);
     }
     sys.print("  per-kernel check (layer 0, token 1):\n", .{});
-    try eng.diagnose(1);
+    var m0 = try load_gguf.loadLayer(allocator, &g, cfg, 0);
+    defer m0.deinit(allocator);
+    try eng.diagnose(1, &m0);
     try predictNextTokens(allocator, &g, &eng, "The capital of France is", null);
     try predictNextTokens(allocator, &g, &eng, "2 + 2 =", null);
-    sys.print("  --- same weights through the pure-CPU reference ---\n", .{});
-    try predictNextTokens(allocator, &g, &eng, "The capital of France is", &mw);
-    try predictNextTokens(allocator, &g, &eng, "2 + 2 =", &mw);
     sys.print("  RESULT: OK\n", .{});
 }
 
@@ -653,15 +662,28 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const cfg = try load_gguf.loadConfig(&g);
     sys.print("  {s}: {d} layers, hidden {d}, vocab {d}\n", .{ cfg.arch, cfg.layers, cfg.hidden, cfg.vocab });
 
-    var mw = try load_gguf.loadWeights(allocator, &g, false);
-    defer mw.deinit();
-    if (rope_hf) mw.config.rope_adjacent = false;
-    if (rope_adj) mw.config.rope_adjacent = true;
-    sys.print("  rope: {s}\n", .{if (mw.config.rope_adjacent) "adjacent pairs (llama.cpp NORM)" else "half-split (llama.cpp NEOX)"});
-    if (mw.layers.len > 0 and mw.layers[0].qkv_bias != null) sys.print("  attention biases: present\n", .{});
-    var eng = try engine_mod.Engine.init(allocator, &mw, .{ .max_seq = 1024, .verbose = true, .fuse_ffn = fuse });
+    const t_rt0 = sys.nowNs();
+    var rt = try load_gguf.loadRuntime(allocator, &g, cfg, false);
+    const t_rt1 = sys.nowNs();
+    if (rope_hf) rt.config.rope_adjacent = false;
+    if (rope_adj) rt.config.rope_adjacent = true;
+    sys.print("  rope: {s}\n", .{if (rt.config.rope_adjacent) "adjacent pairs (llama.cpp NORM)" else "half-split (llama.cpp NEOX)"});
+    if (rt.norms.len > 0 and rt.norms[0].qkv_bias != null) sys.print("  attention biases: present\n", .{});
+    var layers_src = load_gguf.GgufLayers{ .g = &g, .cfg = rt.config };
+    var head_src = load_gguf.GgufHead{ .g = &g, .cfg = rt.config, .embed = rt.embed };
+    const t_c0 = sys.nowNs();
+    var eng = try engine_mod.Engine.init(allocator, rt, layers_src.source(), head_src.source(), .{
+        .max_seq = 1024,
+        .verbose = true,
+        .fuse_ffn = fuse,
+    });
     defer eng.deinit();
+    const t_c1 = sys.nowNs();
     sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
+    sys.print("  startup: runtime {d:.2} s + kernels {d:.2} s\n", .{
+        @as(f64, @floatFromInt(t_rt1 - t_rt0)) / 1e9,
+        @as(f64, @floatFromInt(t_c1 - t_c0)) / 1e9,
+    });
 
     // Prompt formatting: ChatML for instruct models that have the tokens.
     var formatted = std.ArrayList(u8).empty;
@@ -871,12 +893,17 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         if (cfg.rope_adjacent) "adjacent" else "half-split",
     });
 
-    var mw = try load_gguf.loadWeights(allocator, &g, false);
-    defer mw.deinit();
-    if (rope_hf) mw.config.rope_adjacent = false;
-    if (rope_adj) mw.config.rope_adjacent = true;
+    var rt = try load_gguf.loadRuntime(allocator, &g, cfg, false);
+    if (rope_hf) rt.config.rope_adjacent = false;
+    if (rope_adj) rt.config.rope_adjacent = true;
 
-    var eng = try engine_mod.Engine.init(allocator, &mw, .{ .max_seq = max_seq, .verbose = true, .fuse_ffn = fuse });
+    var layers_src = load_gguf.GgufLayers{ .g = &g, .cfg = rt.config };
+    var head_src = load_gguf.GgufHead{ .g = &g, .cfg = rt.config, .embed = rt.embed };
+    var eng = try engine_mod.Engine.init(allocator, rt, layers_src.source(), head_src.source(), .{
+        .max_seq = max_seq,
+        .verbose = true,
+        .fuse_ffn = fuse,
+    });
     defer eng.deinit();
     sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
 

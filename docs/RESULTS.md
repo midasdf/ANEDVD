@@ -107,6 +107,41 @@ The same check on Qwen2.5-0.5B is identical in character, and the CPU reference
 in `anedvd cpu` reproduces the ANE's text token-for-token — the ANE path is not
 merely "close", it is the same computation.
 
+## Memory and startup
+
+Qwen2.5-0.5B-Instruct Q8_0 (494 M params), measured with `/usr/bin/time -l`:
+
+| build | peak RSS | note |
+|---|---|---|
+| eager load | 1.39 GB | whole model as fp16 in RAM + all weight blobs |
+| streaming layers + chunked weight files | 965 MB | |
+| **+ weight files deleted after load (current)** | **~0.72 GB** | |
+
+SmolLM2-135M: 299 MB (Q8_0) / 361 MB (F16). The F16 case is larger only because
+its mmap is larger; its embedding is a zero-copy view into that mapping.
+
+Startup for Qwen2.5-0.5B, split by phase (`anedvd check` prints this):
+
+```
+phase split: write 0.31 s, ANECCompile 9.33 s, load 0.38 s
+all kernels compiled in 20.39 s     (the rest is Q8_0 -> fp16 conversion in Zig)
+```
+
+`ANECCompile` is ~10 s for 97 kernels (~100 ms each) and dominates startup.
+The ANE daemon does not appear to reuse compiled programs across processes on
+this machine, so every launch pays it.
+
+Two operational findings from this work:
+
+* **The weight dictionary passed to `modelWithMILText:weights:optionsPlist:` is
+  not read by the compiler** — it only feeds the cache hash. Empty data compiles
+  to bit-identical results. It must still carry a content digest, or two models
+  with the same MIL shapes would share a cache entry and silently reuse the
+  wrong weights.
+* **The ANE program pool is machine-wide.** A second process loading a full
+  model fails with `no ANE resources (transient; retry)` (status 0x5) while
+  another holds its kernels. The shim now retries with exponential backoff.
+
 ## Bugs found and fixed during development
 
 These are worth recording because each one produced *plausible-looking* output

@@ -55,6 +55,11 @@ zig fmt src build.zig
 * The HTTP server handles **one request at a time** on purpose: one ANE engine,
   one KV cache. Do not add a thread pool without giving each thread its own
   engine.
+* **The ANE program pool is machine-wide**, so only one process can hold a full
+  model's kernels. Killing a stale `anedvd serve` is usually what fixes a
+  sudden "no ANE resources" failure.
+* Weights are streamed per layer and the ANE weight files are deleted after
+  load; `ANEDVD_KEEP_ANE_FILES=1` keeps them for debugging.
 * Models are not committed (`models/` is gitignored); re-download a small GGUF
   (SmolLM2-135M-Q8_0, Qwen2.5-0.5B-Q8_0) to run end to end.
 

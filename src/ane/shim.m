@@ -13,6 +13,7 @@
 #import <dlfcn.h>
 #import <IOSurface/IOSurface.h>
 #import <mach/mach_time.h>
+#include <CommonCrypto/CommonDigest.h>
 #include "shim.h"
 
 // ---------------------------------------------------------------- globals
@@ -24,6 +25,16 @@ static Class g_IO = nil;     // _ANEIOSurfaceObject
 static char kInInfoKey;      // associated-object keys (stable addresses)
 static char kOutInfoKey;
 static bool g_ready = false;
+static mach_timebase_info_data_t g_tb;
+static uint64_t g_write_ns = 0, g_compile_ns = 0, g_load_ns = 0;
+
+static uint64_t ns_since(uint64_t t0) {
+    uint64_t dt = mach_absolute_time() - t0;
+    return (uint64_t)((double)dt * g_tb.numer / g_tb.denom);
+}
+uint64_t ane_shim_write_ns(void) { return g_write_ns; }
+uint64_t ane_shim_compile_ns(void) { return g_compile_ns; }
+uint64_t ane_shim_load_ns(void) { return g_load_ns; }
 static int g_compile_count = 0;
 static char g_err[4096];
 
@@ -51,6 +62,7 @@ int ane_shim_init(void) {
         set_err(@"failed to resolve _ANEInMemoryModelDescriptor/_ANEInMemoryModel/_ANERequest/_ANEIOSurfaceObject");
         return -1;
     }
+    mach_timebase_info(&g_tb);
     g_ready = true;
     g_err[0] = '\0';
     return 0;
@@ -136,21 +148,67 @@ static int extract_live(NSDictionary *attrs, NSString *key, ANETensorInfo *out, 
     return n;
 }
 
+static BOOL write_all_fd(int fd, const uint8_t *bytes, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, bytes + off, len - off);
+        if (n <= 0) return NO;
+        off += (size_t)n;
+    }
+    return YES;
+}
+
+/// Writes one ANE weight file: 64-byte file header, then per chunk a 64-byte
+/// chunk header followed by the fp16 payload. Streamed straight from the
+/// caller's buffers so no full-file copy is needed.
+static BOOL write_weight_file(NSString *path, const ANEWeightFile *wf) {
+    int fd = open([path fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return NO;
+    uint8_t header[64];
+    memset(header, 0, sizeof(header));
+    header[0] = 0x01;
+    header[4] = 0x02;
+    BOOL ok = write_all_fd(fd, header, sizeof(header));
+    for (int i = 0; ok && i < wf->n_chunks; i++) {
+        uint8_t chunk[64];
+        memset(chunk, 0, sizeof(chunk));
+        chunk[0] = 0xEF; chunk[1] = 0xBE; chunk[2] = 0xAD; chunk[3] = 0xDE;
+        chunk[4] = 0x01;
+        uint32_t size = (uint32_t)wf->chunk_sizes[i];
+        memcpy(chunk + 8, &size, 4);
+        uint32_t data_off = 128;
+        memcpy(chunk + 16, &data_off, 4);
+        ok = write_all_fd(fd, chunk, sizeof(chunk)) &&
+             write_all_fd(fd, wf->chunk_data[i], wf->chunk_sizes[i]);
+    }
+    close(fd);
+    return ok;
+}
+
 ANEKernel *ane_shim_kernel_create(const char *mil, size_t mil_len,
-                                  const char *const *w_names,
-                                  const uint8_t *const *w_data,
-                                  const size_t *w_lens, int n_weights) {
+                                  const ANEWeightFile *files, int n_files) {
     @autoreleasepool {
         if (ane_shim_init() != 0) return NULL;
         NSError *e = nil;
 
         NSData *milData = [NSData dataWithBytes:mil length:mil_len];
 
+        // The compiler reads the weights from $TMPDIR, not from this dictionary
+        // (verified: empty data compiles to identical results). The dictionary
+        // *does* feed the model hash, though, so it must carry a content digest:
+        // passing empty data would make two different models with the same MIL
+        // shapes share a cache entry and silently reuse the wrong weights.
         NSMutableDictionary *wdict = [NSMutableDictionary dictionary];
-        for (int i = 0; i < n_weights; i++) {
-            NSString *name = [NSString stringWithUTF8String:w_names[i]];
-            NSData *d = [NSData dataWithBytes:w_data[i] length:w_lens[i]];
-            wdict[name] = @{@"offset": @0, @"data": d};
+        for (int i = 0; i < n_files; i++) {
+            NSString *name = [NSString stringWithUTF8String:files[i].name];
+            CC_SHA256_CTX ctx;
+            CC_SHA256_Init(&ctx);
+            for (int c = 0; c < files[i].n_chunks; c++) {
+                CC_SHA256_Update(&ctx, files[i].chunk_data[c], (CC_LONG)files[i].chunk_sizes[c]);
+            }
+            unsigned char md[CC_SHA256_DIGEST_LENGTH];
+            CC_SHA256_Final(md, &ctx);
+            wdict[name] = @{@"offset": @0, @"data": [NSData dataWithBytes:md length:sizeof(md)]};
         }
 
         id desc = ((id(*)(Class, SEL, id, id, id))objc_msgSend)(
@@ -171,41 +229,63 @@ ANEKernel *ane_shim_kernel_create(const char *mil, size_t mil_len,
             set_err(@"could not write model.mil to the ANE temp directory");
             return NULL;
         }
-        for (int i = 0; i < n_weights; i++) {
-            NSString *name = [NSString stringWithUTF8String:w_names[i]];
+        for (int i = 0; i < n_files; i++) {
+            NSString *name = [NSString stringWithUTF8String:files[i].name];
             NSString *rel = name;
             if ([name hasPrefix:@"@model_path/"]) rel = [name substringFromIndex:12];
             NSString *full = [td stringByAppendingPathComponent:rel];
             [fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
           withIntermediateDirectories:YES attributes:nil error:nil];
-            NSData *d = [NSData dataWithBytes:w_data[i] length:w_lens[i]];
-            if (![d writeToFile:full atomically:YES]) {
+            uint64_t tw0 = mach_absolute_time();
+            BOOL wrote = write_weight_file(full, &files[i]);
+            g_write_ns += ns_since(tw0);
+            if (!wrote) {
                 set_err([NSString stringWithFormat:@"could not write weight file %@", rel]);
                 return NULL;
             }
         }
 
         // Compile (weights are baked in here) then load.
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
+        uint64_t tc0 = mach_absolute_time();
+        BOOL compiled = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+            mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e);
+        g_compile_ns += ns_since(tc0);
+        if (!compiled) {
             set_err([NSString stringWithFormat:@"ANECCompile failed: %@", e ? [e description] : @"unknown"]);
             [fm removeItemAtPath:td error:nil];
             return NULL;
         }
         g_compile_count++;
 
-        BOOL loaded = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-            mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
-        if (!loaded) {
-            usleep(100000);   // ANE slot reclamation: one retry after 100 ms
+        // Loading can fail with "no ANE resources (transient; retry)" when the
+        // program pool is busy — notably when another process is already
+        // serving a model, because the pool is shared machine-wide. Back off
+        // and retry before giving up.
+        uint64_t tl0 = mach_absolute_time();
+        BOOL loaded = NO;
+        NSError *last_err = nil;
+        const useconds_t backoff_us[6] = { 100000, 200000, 400000, 800000, 1600000, 3200000 };
+        for (int attempt = 0; attempt < 7 && !loaded; attempt++) {
+            if (attempt > 0) usleep(backoff_us[attempt - 1]);
             e = nil;
             loaded = ((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
                 mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+            if (!loaded) last_err = e;
         }
+        g_load_ns += ns_since(tl0);
         if (!loaded) {
-            set_err([NSString stringWithFormat:@"ANE load failed: %@", e ? [e description] : @"unknown"]);
+            set_err([NSString stringWithFormat:@"ANE load failed after retries: %@", last_err ? [last_err description] : @"unknown"]);
             [fm removeItemAtPath:td error:nil];
             return NULL;
+        }
+
+        // The compiled program lives in the ANE daemon's own cache; the MIL text
+        // and weight blobs in $TMPDIR are only inputs to ANECCompile(). They can
+        // be several hundred MB per model, so drop them as soon as the model is
+        // loaded. ANEDVD_KEEP_ANE_FILES=1 keeps them for debugging.
+        const char *keep_files = getenv("ANEDVD_KEEP_ANE_FILES");
+        if (!keep_files || keep_files[0] == '0' || keep_files[0] == '\0') {
+            [fm removeItemAtPath:td error:nil];
         }
 
         // ---- declared layout ----

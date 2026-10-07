@@ -246,6 +246,53 @@ a 48-byte first payload) and in
 GGUF stores a linear layer as `ne = [in, out]` with the payload already in
 `[out][in]` C order — exactly this layout, so no transpose is needed.
 
+## Unified memory: what is shared, what is copied
+
+CPU, GPU and ANE share one physical DRAM pool on Apple Silicon, and this project
+uses that where the ANE lets it:
+
+* **Activations are true zero-copy.** Kernels exchange tensors through
+  `IOSurface`s, which *are* unified memory: the CPU writes a vector into the
+  surface the ANE reads, with no copy in between (`src/ane/runtime.zig`).
+* **The token embedding can be zero-copy.** For an fp16 GGUF the embedding is
+  used straight out of the memory-mapped file — no dequantisation, no second
+  copy (`embed_owned = false` in `src/model.zig`). A Q8_0 file has to be
+  converted, so that one is allocated.
+* **Weights are streamed, not staged.** Each layer's matrices are loaded,
+  written into the ANE weight file, baked into the compiled program, and then
+  freed before the next layer starts. The full model is never resident as fp16.
+* **The weight files are written straight from the caller's buffers** in 64-byte
+  headers plus payloads (`write_weight_file` in `src/ane/shim.m`), so no blob is
+  materialised in Zig, and the compiler's weight dictionary carries only a
+  SHA-256 digest rather than another copy of every tensor.
+* **Those files are deleted as soon as the model is loaded.** They are inputs to
+  `ANECCompile()`; the compiled program lives in the ANE daemon's own cache.
+  Keeping them cost ~600 MB of disk per model.
+
+Measured peak RSS, same machine, Qwen2.5-0.5B-Instruct Q8_0:
+
+| | peak RSS |
+|---|---|
+| eager load (whole model as fp16, all blobs in RAM) | 1.39 GB |
+| + blob/NSData copies removed | 1.78 GB → 965 MB |
+| **streaming + zero-copy + digest (current)** | **~0.72 GB** |
+
+SmolLM2-135M for scale: 299 MB (Q8_0), 361 MB (F16, where the larger mmap
+accounts for the difference — its embedding is not allocated at all).
+
+Two things are *not* shared, and they are the reason a bigger model still needs
+quantisation rather than unified memory:
+
+1. **The ANE bakes weights into the compiled program.** A 0.5B model at fp16 is
+   ~1 GB inside the ANE's own memory, on top of whatever the CPU side holds.
+   int8 would halve that and halve the per-token bandwidth (currently the
+   limiting factor at ~12–15 GB/s).
+2. **The ANE program pool is shared machine-wide, not per-process.** A running
+   `anedvd serve` holds its kernels loaded; a second process that tries to load
+   a full model gets `no ANE resources (transient; retry)` (status 0x5). The
+   shim retries with exponential backoff (100 ms … 3.2 s), but the real answer
+   is one engine per machine at a time.
+
 ## Findings worth knowing (all reproduced locally)
 
 1. **No entitlement, no SIP changes, no signing.** The ANE is reached over XPC
@@ -274,12 +321,15 @@ GGUF stores a linear layer as `ne = [in, out]` with the payload already in
 6. **Qwen2 adds biases to Q/K/V** (`attn_q.bias` …); Llama does not. Missing them
    yields multilingual garbage rather than an error. They are applied after the
    ANE projection (a vector add is not worth a kernel).
-7. **Throughput is weight-bandwidth-bound**: a 4096×4096 fp16 matmul runs in
+7. **The ANE program pool is global.** Two processes cannot each hold a full
+   model's kernels; the second gets a transient "no ANE resources" error. See
+   the unified-memory section above.
+8. **Throughput is weight-bandwidth-bound**: a 4096×4096 fp16 matmul runs in
    1.41 ms ≈ 24 GFLOP/s (≈12 GB/s of weights), while a 128×128 matmul takes
    81 µs — almost all of it launch overhead. Qwen2.5-0.5B's 66.8 ms/token is
    ≈15 GB/s of fp16 weights: the ANE's DRAM share, not the MAC array, is the
    ceiling. Quantised weights are the only large win left.
-8. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
+9. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
    the ANE's generated text token-for-token on both models.
 
 ## Known issues

@@ -40,11 +40,24 @@ pub const Packed = struct {
     }
 };
 
-/// MIL weight symbol for tensor `index` (all tensors live in one file per kernel).
-pub fn symbolFor(buf: []u8, index: usize) ![:0]const u8 {
-    const s = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "@model_path/weights/w{d}.bin", .{index});
+/// MIL weight symbol for a kernel's single weight file.
+pub fn symbol(buf: []u8) ![:0]const u8 {
+    const s = "@model_path/weights/w.bin";
+    if (buf.len < s.len + 1) return error.NoSpaceLeft;
+    @memcpy(buf[0..s.len], s);
     buf[s.len] = 0;
     return buf[0..s.len :0];
+}
+
+/// BLOBFILE offset for chunk `k` of a file laid out as
+/// [64-byte file header][64-byte chunk header + payload]*, where the MIL offset
+/// is the payload's absolute offset minus 64.
+pub fn chunkOffsets(sizes: []const usize, out: []u64) void {
+    var cursor: u64 = 64; // file header
+    for (sizes, 0..) |size, k| {
+        out[k] = cursor; // payload starts after this chunk's 64-byte header
+        cursor += 64 + size;
+    }
 }
 
 pub fn pack(allocator: std.mem.Allocator, tensors: []const Tensor) !Packed {

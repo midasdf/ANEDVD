@@ -60,18 +60,29 @@ const char *ane_shim_last_error(void);
  * stops compiling after roughly 120 per process, so callers should cache. */
 int ane_shim_compile_count(void);
 
+/* One weight file: a 64-byte file header followed by one 64-byte chunk header
+ * plus fp16 payload per chunk. The file is written incrementally, so the caller
+ * never has to materialise the whole blob in memory.
+ *
+ *   name        : MIL weight symbol, e.g. "@model_path/weights/w.bin"
+ *   n_chunks    : number of tensors in the file (max 16 BLOBFILE refs/program)
+ *   chunk_data  : pointer to each tensor's fp16 payload (caller-owned)
+ *   chunk_sizes : byte length of each payload
+ */
+typedef struct {
+    const char *name;
+    int n_chunks;
+    const uint8_t *const *chunk_data;
+    const size_t *chunk_sizes;
+} ANEWeightFile;
+
 /* Compile + load an ANE kernel.
- *   mil        : MIL program text (UTF-8)
- *   w_names    : weight file symbols, e.g. "@model_path/weights/w0.bin"
- *   w_data     : weight blob bytes (caller-owned, copied)
- *   n_weights  : number of weight files (max 16 BLOBFILE refs per program)
- *   n_inputs/n_outputs and the declared byte sizes are used only as a hint;
- *   the authoritative sizes come back from ane_shim_*_info() after loading.
+ * The MIL text is the caller's; BLOBFILE offsets must match the file layout
+ * above (payload_k at 128 + sum(previous payload sizes), i.e. offset = that
+ * minus 64).
  * Returns NULL on failure. */
 ANEKernel *ane_shim_kernel_create(const char *mil, size_t mil_len,
-                                  const char *const *w_names,
-                                  const uint8_t *const *w_data,
-                                  const size_t *w_lens, int n_weights);
+                                  const ANEWeightFile *files, int n_files);
 
 void ane_shim_kernel_free(ANEKernel *k);
 
@@ -95,6 +106,11 @@ int ane_shim_output_unlock(const ANEKernel *k, int idx);
 /* Allocated IOSurface capacity in bytes (>= declared nbytes). */
 size_t ane_shim_input_capacity(const ANEKernel *k, int idx);
 size_t ane_shim_output_capacity(const ANEKernel *k, int idx);
+
+/* Accumulated time spent writing weight files / compiling / loading. */
+uint64_t ane_shim_write_ns(void);
+uint64_t ane_shim_compile_ns(void);
+uint64_t ane_shim_load_ns(void);
 
 /* Wall-clock time of the last eval in nanoseconds (0 if unknown). */
 uint64_t ane_shim_last_eval_ns(const ANEKernel *k);

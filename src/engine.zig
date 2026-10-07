@@ -62,10 +62,12 @@ pub const Engine = struct {
     config: model.Config,
     opts: Options,
 
+    /// Owned: embedding, final norm, per-layer norms and biases.
+    rt: model.Runtime,
     embed: []const f16,
     final_norm: []const f32,
     head: []const f16,
-    layers_weights: []const model.LayerWeights,
+    norms: []const model.Norm,
 
     kernels: []LayerKernels,
     head_kernel: ane.Kernel,
@@ -97,6 +99,7 @@ pub const Engine = struct {
         }
         self.head_kernel.deinit();
         self.allocator.free(self.kernels);
+        self.rt.deinit();
         for (self.k_cache) |c| self.allocator.free(c);
         for (self.v_cache) |c| self.allocator.free(c);
         self.allocator.free(self.k_cache);
@@ -115,19 +118,30 @@ pub const Engine = struct {
         self.* = undefined;
     }
 
-    /// Build every ANE kernel. Weights stay owned by `mw`.
-    pub fn init(allocator: std.mem.Allocator, mw: *const model.ModelWeights, opts: Options) !Engine {
-        const cfg = mw.config;
+    /// Build every ANE kernel.
+    ///
+    /// `rt` is taken by value and owned by the engine. Layer matrices are pulled
+    /// from `layers` one at a time and freed as soon as that layer's kernels
+    /// exist, so peak memory stays near one layer instead of the whole model.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        rt: model.Runtime,
+        layers: model.LayerSource,
+        head: model.HeadSource,
+        opts: Options,
+    ) !Engine {
+        const cfg = rt.config;
         try cfg.validate();
 
         var self: Engine = undefined;
         self.allocator = allocator;
         self.config = cfg;
         self.opts = opts;
-        self.embed = mw.embed;
-        self.final_norm = mw.final_norm;
-        self.head = mw.headWeights();
-        self.layers_weights = mw.layers;
+        self.rt = rt;
+        self.embed = rt.embed;
+        self.final_norm = rt.final_norm;
+        self.head = &.{};
+        self.norms = rt.norms;
         self.max_seq = opts.max_seq;
         self.stats = .{};
 
@@ -143,13 +157,18 @@ pub const Engine = struct {
             }
             allocator.free(self.kernels);
         }
-        for (mw.layers, 0..) |*lw, i| {
-            if (opts.verbose) sys.print("  layer {d}/{d}: compiling ANE kernels\n", .{ i + 1, L });
-            self.kernels[i] = try buildLayerKernels(allocator, cfg, lw, opts);
+        for (0..L) |i| {
+            if (opts.verbose) sys.print("  layer {d}/{d}: loading weights + compiling ANE kernels\n", .{ i + 1, L });
+            var m = try layers.load(allocator, @intCast(i));
+            defer m.deinit(allocator); // matrices are baked into the kernels now
+            self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, opts);
             built += 1;
         }
-        if (opts.verbose) sys.print("  lm head: compiling ANE kernel ({d} -> {d})\n", .{ cfg.hidden, cfg.vocab });
-        self.head_kernel = try makeConvKernel(allocator, cfg.hidden, cfg.vocab, self.head, "lm_head");
+        if (opts.verbose) sys.print("  lm head: loading weights + compiling ANE kernel ({d} -> {d})\n", .{ cfg.hidden, cfg.vocab });
+        const hw = try head.load(allocator);
+        defer if (hw.owned) allocator.free(hw.data);
+        self.head = hw.data;
+        self.head_kernel = try makeConvKernel(allocator, cfg.hidden, cfg.vocab, hw.data, "lm_head");
 
         const kv_dim: usize = cfg.kvDim();
         self.k_cache = try allocator.alloc([]f32, L);
@@ -196,10 +215,10 @@ pub const Engine = struct {
         f16ToF32Into(self.x, self.embed[@as(usize, token) * hidden ..][0..hidden]);
 
         for (self.kernels, 0..) |*k, li| {
-            const lw = &self.layers_weights[li];
+            const norm = &self.norms[li];
 
             // ---- attention: qkv projection on ANE ----
-            cpu.rmsnorm(self.h, self.x, lw.attn_norm, cfg.eps);
+            cpu.rmsnorm(self.h, self.x, norm.attn, cfg.eps);
             f32ToF16Into(self.in16[0..hidden], self.h);
             try k.qkv.writeInputF16(0, self.in16[0..hidden]);
             var t0 = sys.nowNs();
@@ -208,7 +227,7 @@ pub const Engine = struct {
             self.stats.ane_evals += 1;
             try k.qkv.readOutputF16(0, self.out16[0..cfg.qkvDim()]);
             f16ToF32Into(self.qkv, self.out16[0..cfg.qkvDim()]);
-            if (lw.qkv_bias) |b| cpu.addInPlace(self.qkv, b);
+            if (norm.qkv_bias) |b| cpu.addInPlace(self.qkv, b);
 
             const q = self.qkv[0..q_dim];
             const kk = self.qkv[q_dim..][0..kv_dim];
@@ -235,11 +254,11 @@ pub const Engine = struct {
             self.stats.ane_evals += 1;
             try k.o.readOutputF16(0, self.out16[0..hidden]);
             f16ToF32Into(self.proj, self.out16[0..hidden]);
-            if (lw.o_bias) |b| cpu.addInPlace(self.proj, b);
+            if (norm.o_bias) |b| cpu.addInPlace(self.proj, b);
             cpu.addInPlace(self.x, self.proj);
 
             // ---- feed-forward on ANE ----
-            cpu.rmsnorm(self.h, self.x, lw.ffn_norm, cfg.eps);
+            cpu.rmsnorm(self.h, self.x, norm.ffn, cfg.eps);
             f32ToF16Into(self.in16[0..hidden], self.h);
             try k.ffn.writeInputF16(0, self.in16[0..hidden]);
             t0 = sys.nowNs();
@@ -284,15 +303,14 @@ pub const Engine = struct {
 
     /// Compare each ANE kernel against a CPU matmul with the same weights, to
     /// localise a broken kernel when end-to-end output looks wrong.
-    pub fn diagnose(self: *Engine, token: u32) !void {
+    pub fn diagnose(self: *Engine, token: u32, lw: *const model.Matrices) !void {
         const cfg = self.config;
         const hidden: usize = cfg.hidden;
         const q_dim: usize = cfg.qDim();
         const inter: usize = cfg.inter;
-        const lw = &self.layers_weights[0];
 
         f16ToF32Into(self.x, self.embed[@as(usize, token) * hidden ..][0..hidden]);
-        cpu.rmsnorm(self.h, self.x, lw.attn_norm, cfg.eps);
+        cpu.rmsnorm(self.h, self.x, self.norms[0].attn, cfg.eps);
 
         const ref = try self.allocator.alloc(f32, cfg.vocab);
         defer self.allocator.free(ref);
@@ -379,11 +397,10 @@ fn reportKernel(name: []const u8, got: []const f32, ref: []const f32) void {
 
 /// Create a single-conv kernel: cin -> cout, weights already in ANE layout.
 fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const f16, label: []const u8) !ane.Kernel {
+    _ = label;
     std.debug.assert(w.len == @as(usize, cin) * cout);
-    var blob = try weights.pack(allocator, &.{.{ .name = label, .data = w }});
-    defer blob.deinit();
     var sym_buf: [64]u8 = undefined;
-    const sym = try weights.symbolFor(&sym_buf, 0);
+    const sym = try weights.symbol(&sym_buf);
     const program = try mil.build(allocator, .{
         .inputs = &.{.{ .name = "i0", .channels = cin }},
         .ops = &.{.{ .conv = .{
@@ -392,17 +409,20 @@ fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const 
             .y = "o0",
             .cin = cin,
             .cout = cout,
-            .blob_offset = blob.offsets[0],
+            .blob_offset = 64,
             .file = sym,
         } }},
         .outputs = &.{"o0"},
     });
     defer allocator.free(program);
-    return ane.Kernel.create(allocator, program, &.{.{ .name = sym, .data = blob.bytes }});
+    return ane.Kernel.create(allocator, program, &.{.{
+        .name = sym,
+        .chunks = &.{std.mem.sliceAsBytes(w)},
+    }});
 }
 
 /// Fused FFN: i0 -> gate conv, up conv, sigmoid, mul, mul, down conv -> o0.
-/// Three BLOBFILEs and no inline scalars, so it stays inside the 16-slot budget.
+/// Three BLOBFILEs in one weight file, no inline scalars.
 fn makeFusedFfnKernel(
     allocator: std.mem.Allocator,
     hidden: u32,
@@ -411,40 +431,36 @@ fn makeFusedFfnKernel(
     up: []const f16,
     down: []const f16,
 ) !ane.Kernel {
-    var blob = try weights.pack(allocator, &.{
-        .{ .name = "gate", .data = gate },
-        .{ .name = "up", .data = up },
-        .{ .name = "down", .data = down },
-    });
-    defer blob.deinit();
-    var s0: [64]u8 = undefined;
-    var s1: [64]u8 = undefined;
-    var s2: [64]u8 = undefined;
-    const n0 = try weights.symbolFor(&s0, 0);
-    const n1 = try weights.symbolFor(&s1, 1);
-    const n2 = try weights.symbolFor(&s2, 2);
+    const sizes = [_]usize{ gate.len * 2, up.len * 2, down.len * 2 };
+    var offsets: [3]u64 = undefined;
+    weights.chunkOffsets(&sizes, &offsets);
+
+    var sym_buf: [64]u8 = undefined;
+    const sym = try weights.symbol(&sym_buf);
     const program = try mil.build(allocator, .{
         .inputs = &.{.{ .name = "i0", .channels = hidden }},
         .ops = &.{
-            .{ .conv = .{ .x = "i0", .w = "w0", .y = "t0", .cin = hidden, .cout = inter, .blob_offset = blob.offsets[0], .file = n0 } },
-            .{ .conv = .{ .x = "i0", .w = "w1", .y = "t1", .cin = hidden, .cout = inter, .blob_offset = blob.offsets[1], .file = n1 } },
+            .{ .conv = .{ .x = "i0", .w = "w0", .y = "t0", .cin = hidden, .cout = inter, .blob_offset = offsets[0], .file = sym } },
+            .{ .conv = .{ .x = "i0", .w = "w1", .y = "t1", .cin = hidden, .cout = inter, .blob_offset = offsets[1], .file = sym } },
             .{ .sigmoid = .{ .x = "t0", .y = "t2", .channels = inter } },
             .{ .mul = .{ .a = "t0", .b = "t2", .y = "t3", .channels = inter } },
             .{ .mul = .{ .a = "t3", .b = "t1", .y = "t4", .channels = inter } },
-            .{ .conv = .{ .x = "t4", .w = "w2", .y = "o0", .cin = inter, .cout = hidden, .blob_offset = blob.offsets[2], .file = n2 } },
+            .{ .conv = .{ .x = "t4", .w = "w2", .y = "o0", .cin = inter, .cout = hidden, .blob_offset = offsets[2], .file = sym } },
         },
         .outputs = &.{"o0"},
     });
     defer allocator.free(program);
-    // All three symbols point at the same file; the shim writes it once per name.
-    return ane.Kernel.create(allocator, program, &.{
-        .{ .name = n0, .data = blob.bytes },
-        .{ .name = n1, .data = blob.bytes },
-        .{ .name = n2, .data = blob.bytes },
-    });
+    return ane.Kernel.create(allocator, program, &.{.{
+        .name = sym,
+        .chunks = &.{
+            std.mem.sliceAsBytes(gate),
+            std.mem.sliceAsBytes(up),
+            std.mem.sliceAsBytes(down),
+        },
+    }});
 }
 
-fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.LayerWeights, opts: Options) !LayerKernels {
+fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.Matrices, opts: Options) !LayerKernels {
     var qkv = try makeConvKernel(allocator, cfg.hidden, cfg.qkvDim(), lw.qkv, "qkv");
     errdefer qkv.deinit();
     var o = try makeConvKernel(allocator, cfg.qDim(), cfg.hidden, lw.o, "o");
