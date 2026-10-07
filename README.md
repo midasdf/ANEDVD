@@ -287,6 +287,11 @@ Quoted material in `research/` keeps its original attribution; the Orion paper i
 CC BY 4.0. Apple's private frameworks are undocumented and unsupported: this
 project is for research and cannot be shipped on the App Store.
 
+## License
+
+MIT — see [LICENSE](LICENSE). Third-party material quoted in
+[`research/`](research) keeps its original terms (the Orion paper is CC BY 4.0).
+
 ## Disclaimer
 
 This project uses AI-generated code (LLM). I do my best to review and test it, but I can't guarantee it's perfect. Please use it at your own risk.
