@@ -465,50 +465,55 @@ const load_gguf = @import("load_gguf.zig");
 
 fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     if (argv.len < 3) {
-        sys.eprint("usage: anedvd check <model.gguf>\n", .{});
+        sys.eprint("usage: anedvd check <model.gguf|hf-dir> [--fuse]\n", .{});
         std.process.exit(2);
     }
     const path = argv[2];
-    sys.print("loading {s}\n", .{path});
-    var g = try gguf.Gguf.load(allocator, path);
-    defer g.deinit();
-    const cfg = try load_gguf.loadConfig(&g);
-    sys.print("  arch={s} hidden={d} layers={d} heads={d}/{d} head_dim={d} inter={d} vocab={d} eps={e} rope_theta={d}\n", .{
-        cfg.arch, cfg.hidden, cfg.layers, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.inter, cfg.vocab, cfg.eps, cfg.rope_theta,
-    });
-    sys.print("  tensors in file: {d}\n", .{g.tensorCount()});
-    const probe_names = [_][]const u8{ "token_embd.weight", "output_norm.weight", "output.weight", "blk.0.attn_norm.weight", "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.0.attn_output.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight" };
-    for (probe_names) |pn| {
-        if (g.tensor(pn)) |t| {
-            sys.print("    {s}: dims=", .{pn});
-            for (t.dims, 0..) |d, di| {
-                if (di > 0) sys.print("x", .{});
-                sys.print("{d}", .{d});
-            }
-            sys.print("  type={s}\n", .{t.ttype.name()});
-        } else {
-            sys.print("    {s}: MISSING\n", .{pn});
-        }
+    var fuse = false;
+    var rope_hf = false;
+    var rope_adj = false;
+    var chunk: u32 = 64;
+    for (argv, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--fuse")) fuse = true;
+        if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
+        if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
+        if (std.mem.eql(u8, a, "--chunk") and i + 1 < argv.len) chunk = std.fmt.parseInt(u32, argv[i + 1], 10) catch chunk;
     }
 
-    const rt = try load_gguf.loadRuntime(allocator, &g, cfg, true);
-    sys.print("  ANE compiles so far: {d}\n", .{ane.compileCount()});
+    sys.print("loading {s}\n", .{path});
+    var loaded = try model_open.open(allocator, path, .{
+        .progress = true,
+        .rope_hf = rope_hf,
+        .rope_adjacent = rope_adj,
+    });
+    defer loaded.deinit();
+    const cfg = loaded.config;
+    sys.print("  {s} ({s}): hidden={d} layers={d} heads={d}/{d} head_dim={d} inter={d} vocab={d} eps={e} rope_theta={d}\n", .{
+        cfg.arch,
+        if (loaded.format == .gguf) "GGUF" else "safetensors",
+        cfg.hidden,
+        cfg.layers,
+        cfg.heads,
+        cfg.kv_heads,
+        cfg.head_dim,
+        cfg.inter,
+        cfg.vocab,
+        cfg.eps,
+        cfg.rope_theta,
+    });
+    sys.print("  rope: {s}, attention biases: {s}\n", .{
+        if (cfg.rope_adjacent) "adjacent pairs" else "half-split",
+        if (loaded.rt.norms.len > 0 and loaded.rt.norms[0].qkv_bias != null) "present" else "none",
+    });
 
-    const t_c0 = sys.nowNs();
-    var fuse = false;
-    for (argv) |a| if (std.mem.eql(u8, a, "--fuse")) {
-        fuse = true;
-    };
-    var layers_src = load_gguf.GgufLayers{ .g = &g, .cfg = rt.config };
-    var head_src = load_gguf.GgufHead{ .g = &g, .cfg = rt.config, .embed = rt.embed };
-    var eng = try engine_mod.Engine.init(allocator, rt, layers_src.source(), head_src.source(), .{
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
         .max_seq = 512,
         .verbose = true,
         .fuse_ffn = fuse,
+        .chunk = chunk,
     });
     defer eng.deinit();
-    const t_c1 = sys.nowNs();
-    sys.print("  all kernels compiled in {d:.2} s (ANE compiles: {d})\n", .{ @as(f64, @floatFromInt(t_c1 - t_c0)) / 1e9, ane.compileCount() });
+    sys.print("  ANE kernels: {d}\n", .{ane.compileCount()});
     const ph = ane.phaseMs();
     sys.print("  phase split: write {d:.2} s, ANECCompile {d:.2} s, load {d:.2} s\n", .{ ph.write / 1000.0, ph.compile / 1000.0, ph.load / 1000.0 });
 
@@ -522,30 +527,30 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         if (v < min) min = v;
     }
     sys.print("  one decode step: logits[{d}] min={e:.4} max={e:.4} nan={d}\n", .{ logits.len, min, max, nan });
-    sys.print("  ANE evals={d} ANE time={d:.2} ms\n", .{ eng.stats.ane_evals, eng.stats.aneMs() });
     if (nan > 0) {
         sys.print("  RESULT: FAIL (NaN in logits)\n", .{});
         std.process.exit(1);
     }
+
     sys.print("  per-kernel check (layer 0, token 1):\n", .{});
-    var m0 = try load_gguf.loadLayer(allocator, &g, cfg, 0);
+    var m0 = try loaded.layers.load(allocator, 0);
     defer m0.deinit(allocator);
     try eng.diagnose(1, &m0);
-    try predictNextTokens(allocator, &g, &eng, "The capital of France is", null);
-    try predictNextTokens(allocator, &g, &eng, "2 + 2 =", null);
+
+    try predictNextTokens(allocator, &loaded.tokenizer, &eng, "The capital of France is");
+    try predictNextTokens(allocator, &loaded.tokenizer, &eng, "2 + 2 =");
     sys.print("  RESULT: OK\n", .{});
 }
 
-/// Map a plain-text prompt onto vocabulary tokens by exact string match (good
-/// enough for a sanity check without a BPE tokenizer) and print the model's
-/// top-5 next-token predictions.
-fn predictNextTokens(allocator: std.mem.Allocator, g: *const gguf.Gguf, eng: *engine_mod.Engine, prompt: []const u8, mw: ?*const model_mod.ModelWeights) !void {
-    const toks = g.getStringArray("tokenizer.ggml.tokens") orelse {
-        sys.print("  (no tokenizer.ggml.tokens metadata; skipping prediction)\n", .{});
-        return;
-    };
-    eng.reset();
-    var ids = std.ArrayList(u32).empty;
+/// Prompt the model with plain text and print the top-5 next tokens. Used by
+/// `check` as a smoke test; works for either model format via the tokenizer.
+fn predictNextTokens(
+    allocator: std.mem.Allocator,
+    tok: *const tokenizer_mod.Tokenizer,
+    eng: *engine_mod.Engine,
+    prompt: []const u8,
+) !void {
+    var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(allocator);
 
     var it = std.mem.tokenizeAny(u8, prompt, " ");
@@ -555,81 +560,34 @@ fn predictNextTokens(allocator: std.mem.Allocator, g: *const gguf.Gguf, eng: *en
         // GGUF vocabularies spell a leading space as 'Ġ' (GPT-2 style) or
         // '▁' (SentencePiece); some files keep the plain ASCII space.
         var buf: [128]u8 = undefined;
-        var variants: [4][]const u8 = undefined;
+        var variants: [3][]const u8 = undefined;
         var nvar: usize = 0;
         if (!first) {
             variants[nvar] = std.fmt.bufPrint(&buf, "\u{0120}{s}", .{word}) catch word;
             nvar += 1;
         }
-        {
-            var buf2: [128]u8 = undefined;
-            variants[nvar] = std.fmt.bufPrint(&buf2, "\u{2581}{s}", .{word}) catch word;
-            nvar += 1;
-            // note: buf2 is a local; copy through a static-safe path below
-            variants[nvar - 1] = std.fmt.bufPrint(&buf, "\u{2581}{s}", .{word}) catch word;
-        }
+        variants[nvar] = std.fmt.bufPrint(&buf, "\u{2581}{s}", .{word}) catch word;
+        nvar += 1;
         variants[nvar] = word;
         nvar += 1;
         for (variants[0..nvar]) |v| {
-            for (toks, 0..) |t, i| {
-                if (std.mem.eql(u8, t, v)) {
-                    found = @intCast(i);
-                    break;
-                }
+            if (tok.tokenId(v)) |id| {
+                found = id;
+                break;
             }
-            if (found != null) break;
         }
-        if (found) |id| {
-            try ids.append(allocator, id);
-            sys.print("    token \"{s}\" -> id {d} (\"{s}\")\n", .{ word, id, if (id < toks.len) toks[id] else "?" });
-        } else sys.print("  (word \"{s}\" not in vocab)\n", .{word});
+        if (found) |id| try ids.append(allocator, id) else sys.print("  (word \"{s}\" not in vocab)\n", .{word});
         first = false;
     }
     if (ids.items.len == 0) return;
 
-    // Run the prompt both ways so a batched-prefill bug cannot hide.
-    {
-        const seq = try allocator.dupe(u32, ids.items);
-        defer allocator.free(seq);
-        var seq_logits: []f32 = undefined;
-        for (seq, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
-        const batch_logits = try eng.prefill(seq, 0);
-        var max_d: f32 = 0;
-        for (seq_logits, batch_logits) |a, b| max_d = @max(max_d, @abs(a - b));
-        sys.print("    sequential vs batched prefill: max|diff| = {e:.5} ({s})\n", .{ max_d, if (max_d < 1e-2) "ok" else "MISMATCH" });
-    }
-
-    var logits: []f32 = undefined;
-    var ref_st: ?RefState = null;
-    defer if (ref_st) |*st| {
-        for (st.k) |c| allocator.free(c);
-        for (st.v) |c| allocator.free(c);
-        allocator.free(st.k);
-        allocator.free(st.v);
-    };
-    if (mw) |m| {
-        const L: usize = m.config.layers;
-        var st = RefState{ .k = try allocator.alloc([]f32, L), .v = try allocator.alloc([]f32, L) };
-        for (0..L) |i| {
-            st.k[i] = try allocator.alloc(f32, 2048 * m.config.kvDim());
-            st.v[i] = try allocator.alloc(f32, 2048 * m.config.kvDim());
-            @memset(st.k[i], 0);
-            @memset(st.v[i], 0);
-        }
-        ref_st = st;
-        for (ids.items, 0..) |id, pos| {
-            if (pos > 0) allocator.free(logits);
-            logits = try refForward(allocator, m, &ref_st.?, id, @intCast(pos));
-        }
-    } else {
-        for (ids.items, 0..) |id, pos| logits = try eng.forward(id, @intCast(pos));
-    }
+    const logits: []f32 = try eng.prefill(ids.items, 0);
 
     sys.print("  prompt \"{s}\" ({d} tokens) -> top-5:\n", .{ prompt, ids.items.len });
-    var shown: usize = 0;
-    var used = try allocator.alloc(bool, logits.len);
+    const used = try allocator.alloc(bool, logits.len);
     defer allocator.free(used);
     @memset(used, false);
+    var shown: usize = 0;
     while (shown < 5) : (shown += 1) {
         var best: usize = 0;
         var best_v: f32 = -std.math.inf(f32);
@@ -640,7 +598,7 @@ fn predictNextTokens(allocator: std.mem.Allocator, g: *const gguf.Gguf, eng: *en
             }
         }
         used[best] = true;
-        const txt = if (best < toks.len) toks[best] else "?";
+        const txt = if (best < tok.vocabSize()) tok.tokenText(@intCast(best)) else "?";
         sys.print("    {d}. id={d} logit={d:.2} {s}\n", .{ shown + 1, best, best_v, txt });
     }
 }

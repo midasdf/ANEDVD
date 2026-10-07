@@ -90,6 +90,30 @@ Requirements: Apple Silicon, macOS 15+, Xcode command line tools (the
 Objective-C shim is compiled with `/usr/bin/clang` because Zig's bundled clang
 crashes on ARC Objective-C), Zig 0.17.
 
+## Getting models
+
+Nothing is bundled; models are large and `models/` is gitignored. These are the
+ones this project was developed against:
+
+```sh
+mkdir -p models && cd models
+
+# GGUF (single file, includes the tokenizer)
+curl -LO https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf
+curl -LO https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+
+# HuggingFace directory (safetensors + config.json + tokenizer.json)
+mkdir -p SmolLM2-135M-Instruct && cd SmolLM2-135M-Instruct
+for f in config.json tokenizer.json model.safetensors; do
+  curl -LO "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/$f"
+done
+```
+
+Rough memory guidance on an 8 GB machine: the fp16 weights are baked into the
+ANE's compiled programs, so a Q8_0 0.5B model peaks around 1 GB of RSS and a
+135M model around 320 MB. A 1B model at Q8_0 works but leaves little headroom;
+larger models need a machine with more unified memory.
+
 ## Commands
 
 | Command | Purpose |
