@@ -9,12 +9,16 @@ measurements live in `docs/RESULTS.md`.
 
 | File | Role |
 |---|---|
-| `src/main.zig` | CLI: `info`, `probe`, `bench`, `selftest`, `check`, `run`, `cpu` |
+| `src/main.zig` | CLI: `info`, `probe`, `bench`, `selftest`, `check`, `run`, `cpu`, `serve` |
 | `src/ane/shim.m` / `shim.h` | the only Objective-C + private-API code (`_ANEInMemoryModel`, IOSurfaces) |
 | `src/ane/runtime.zig` | Zig kernel wrapper, planar fp16 scatter/gather |
 | `src/ane/mil.zig` | MIL program generator (`conv`, `add`, `sigmoid`, `mul`) |
 | `src/ane/weights.zig` | ANE weight-blob packer |
 | `src/engine.zig` | transformer decode loop + kernel construction |
+| `src/generate.zig` | sampling loop + prompt formatting (shared by CLI and server) |
+| `src/http.zig` | minimal HTTP/1.1 server on libc sockets (std.http sits behind the new Io) |
+| `src/server.zig` | OpenAI + Anthropic routes, SSE framing, stop-sequence holdback |
+| `src/webui.html` | built-in chat UI, embedded with `@embedFile` |
 | `src/cpu.zig` | RMSNorm, RoPE (adjacent + half-split), attention, SwiGLU, sampling |
 | `src/model.zig` | format-independent `Config` / `LayerWeights` / `ModelWeights` |
 | `src/load_gguf.zig` | GGUF → `ModelWeights` (config keys, RoPE convention, biases) |
@@ -48,6 +52,9 @@ zig fmt src build.zig
   strides come back from `modelAttributes` — never assume them.
 * **RoPE convention is per-architecture** (llama = adjacent, qwen2 = half-split).
   The wrong one produces fluent repetition, not garbage.
+* The HTTP server handles **one request at a time** on purpose: one ANE engine,
+  one KV cache. Do not add a thread pool without giving each thread its own
+  engine.
 * Models are not committed (`models/` is gitignored); re-download a small GGUF
   (SmolLM2-135M-Q8_0, Qwen2.5-0.5B-Q8_0) to run end to end.
 

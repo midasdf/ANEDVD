@@ -26,6 +26,9 @@ const USAGE =
     \\                                  generate text on the ANE
     \\  anedvd cpu --model <m.gguf> --prompt "..." [--rope-hf] [--chat]
     \\                                  pure-CPU reference (no ANE): sanity-check a model
+    \\  anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080] [--name ID]
+    \\                                  HTTP server: OpenAI + Anthropic compatible API
+    \\                                  and a built-in WebUI at /
     \\
     \\model flags: --rope-hf | --rope-adjacent   force the RoPE convention
     \\             --fuse                         experimental fused FFN (known wrong)
@@ -61,6 +64,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdRun(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "cpu")) {
         return cmdCpu(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "serve")) {
+        return cmdServe(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         sys.print("{s}", .{USAGE});
         return;
@@ -820,4 +825,78 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         @as(f64, @floatFromInt(t2 - t1)) / 1e9,
         @as(f64, @floatFromInt(produced)) / (@as(f64, @floatFromInt(t2 - t1)) / 1e9),
     });
+}
+
+// ---------------------------------------------------------------------------
+// serve: OpenAI- and Anthropic-compatible HTTP API plus the built-in WebUI.
+// ---------------------------------------------------------------------------
+
+const server_mod = @import("server.zig");
+const generate_mod = @import("generate.zig");
+
+fn fileStem(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    const ext = std.fs.path.extension(base);
+    return base[0 .. base.len - ext.len];
+}
+
+fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    const model_path = argStr(argv, "--model") orelse {
+        sys.eprint("usage: anedvd serve --model <model.gguf> [--host 127.0.0.1] [--port 8080] [--name ID] [--system \"...\"]\n", .{});
+        std.process.exit(2);
+    };
+    const host = argStr(argv, "--host") orelse "127.0.0.1";
+    const port: u16 = @intCast(argValue(argv, "--port", 8080));
+    const model_name = argStr(argv, "--name") orelse fileStem(model_path);
+    const system = argStr(argv, "--system");
+    const max_seq: u32 = argValue(argv, "--max-seq", 2048);
+    const default_max_tokens: u32 = argValue(argv, "--max-tokens", 512);
+    var fuse = false;
+    var rope_hf = false;
+    var rope_adj = false;
+    for (argv) |a| {
+        if (std.mem.eql(u8, a, "--fuse")) fuse = true;
+        if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
+        if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
+    }
+
+    sys.print("loading {s}\n", .{model_path});
+    var g = try gguf.Gguf.load(allocator, model_path);
+    defer g.deinit();
+    var tok = try tokenizer_mod.Tokenizer.fromGguf(allocator, &g);
+    defer tok.deinit();
+    const cfg = try load_gguf.loadConfig(&g);
+    sys.print("  {s}: {d} layers, hidden {d}, vocab {d}, rope {s}\n", .{
+        cfg.arch,                                            cfg.layers, cfg.hidden, cfg.vocab,
+        if (cfg.rope_adjacent) "adjacent" else "half-split",
+    });
+
+    var mw = try load_gguf.loadWeights(allocator, &g, false);
+    defer mw.deinit();
+    if (rope_hf) mw.config.rope_adjacent = false;
+    if (rope_adj) mw.config.rope_adjacent = true;
+
+    var eng = try engine_mod.Engine.init(allocator, &mw, .{ .max_seq = max_seq, .verbose = true, .fuse_ffn = fuse });
+    defer eng.deinit();
+    sys.print("  {d} ANE kernels compiled\n", .{ane.compileCount()});
+
+    var session = generate_mod.Session.init(allocator, &eng, &tok);
+    if (tok.eosId()) |eos| {
+        const stops = try allocator.alloc(u32, 1);
+        stops[0] = eos;
+        session.stop_ids = stops;
+    }
+
+    var srv = server_mod.Server{
+        .allocator = allocator,
+        .session = &session,
+        .opts = .{
+            .host = host,
+            .port = port,
+            .model_name = model_name,
+            .default_system = system,
+            .default_max_tokens = default_max_tokens,
+        },
+    };
+    try srv.run();
 }

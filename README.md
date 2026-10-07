@@ -13,7 +13,8 @@ this program. *Vandal* — it drives the ANE through undocumented private
 frameworks, which Apple does not support and App Store review rejects.
 
 It loads **GGUF** models (Q8_0, Q4_0/1, Q5_0/1, F16, F32, BF16, K-quants where
-implemented) and generates text.
+implemented), generates text from the CLI, and serves an OpenAI- and
+Anthropic-compatible HTTP API with a built-in WebUI.
 
 ## Verified on this machine
 
@@ -92,9 +93,72 @@ crashes on ARC Objective-C), Zig 0.17.
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
 | `anedvd run --model <m.gguf> --prompt "…" [--max-tokens N] [--temp T] [--top-k K]` | generate text on the ANE |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |
+| `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
 
 Overrides for unusual models: `--rope-hf` / `--rope-adjacent` force the RoPE
 convention, `--fuse` enables the experimental fused FFN.
+
+## HTTP API and WebUI
+
+```sh
+./zig-out/bin/anedvd serve --model models/qwen2.5-0.5b-q8_0.gguf --port 8080
+# → ANEDVD server listening on http://127.0.0.1:8080
+```
+
+Open <http://127.0.0.1:8080/> for the built-in chat UI (single self-contained
+HTML file, no CDN, no build step, streaming replies, stop button, temperature /
+max-tokens / system-prompt settings).
+
+Both API dialects are served from the same endpoint set, so existing clients
+work by pointing their base URL at `http://127.0.0.1:8080/v1`:
+
+| Endpoint | Dialect |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI (streaming and non-streaming) |
+| `POST /v1/completions` | OpenAI legacy |
+| `POST /v1/messages` | Anthropic Messages (streaming and non-streaming) |
+| `GET /v1/models` | OpenAI model list |
+| `GET /health` | liveness probe |
+| `GET /` | WebUI |
+
+```console
+$ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":24}'
+{"id":"chatcmpl-1791404097","object":"chat.completion","created":1791404097,
+ "model":"smollm2-135m-q8_0","choices":[{"index":0,"message":{"role":"assistant",
+ "content":"The capital of France is Paris. Paris is a city located in the northern part of the country, and it is known"},
+ "finish_reason":"length"}],"usage":{"prompt_tokens":16,"completion_tokens":24,"total_tokens":40}}
+
+$ curl -sN http://127.0.0.1:8080/v1/messages -H 'Content-Type: application/json' \
+    -d '{"max_tokens":12,"stream":true,"messages":[{"role":"user","content":"Say hi."}]}'
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_1791404130",...}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+```
+
+What is implemented:
+
+* SSE streaming with the exact chunk shapes each SDK expects
+  (`chat.completion.chunk` + `data: [DONE]`, and Anthropic's
+  `message_start` / `content_block_delta` / `message_delta` / `message_stop`).
+* `stop` sequences (string or array) with holdback, so a stop string is never
+  emitted partially.
+* `usage` / `stop_reason` reporting (`length` ↔ `max_tokens`, `stop` ↔ `end_turn`).
+* Message content as a plain string or as an array of `{type:"text"}` blocks.
+* CORS headers, so browser-based tools can call it directly.
+
+Known limitations:
+
+* **One request at a time.** There is a single ANE engine and a single KV cache,
+  so a second client waits for the first to finish rather than corrupting it.
+  A concurrent request does not error, it just queues behind the socket.
+* No tokeniser-level `logprobs`, `n>1`, tool/function calling, embeddings or
+  `/v1/images`. Unsupported fields are ignored rather than rejected.
+* The chat template is ChatML when the vocabulary has `<|im_start|>` and a
+  plain `User:/Assistant:` transcript otherwise; a model's own Jinja template
+  from GGUF metadata is not evaluated.
 
 ## How it works
 

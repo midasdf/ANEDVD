@@ -164,6 +164,13 @@ pub fn mkdirp(path: []const u8) !void {
 
 // ---------------------------------------------------------------- time
 
+/// Unix epoch seconds (for API `created` fields).
+pub fn unixTime() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return 0;
+    return @intCast(ts.sec);
+}
+
 pub fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
