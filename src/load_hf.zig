@@ -219,3 +219,66 @@ test "hf config maps to the engine config with half-split RoPE" {
     try std.testing.expectEqualStrings("qwen2", m.arch);
     try std.testing.expect(!m.rope_adjacent);
 }
+
+/// Load every layer plus the runtime weights into a `ModelWeights`, for the
+/// CPU reference in `anedvd verify` and `anedvd cpu`.
+///
+/// Mirrors load_gguf.loadWeights: the reference needs the whole model resident,
+/// which is the opposite of what the engine does (it streams one layer at a
+/// time), so this is deliberately a separate, simple path.
+pub fn loadWeights(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.Config, progress: bool) !model.ModelWeights {
+    var mw = model.ModelWeights{ .allocator = allocator, .config = cfg };
+    errdefer mw.deinit();
+    if (progress) sys.print("loading HF weights: {d} layers\\n", .{cfg.layers});
+
+    mw.embed = try linear(allocator, sh, "model.embed_tokens.weight", cfg.hidden, cfg.vocab);
+    mw.final_norm = try norm(allocator, sh, "model.norm.weight", cfg.hidden);
+    if (sh.find("lm_head.weight") != null) {
+        mw.lm_head = try linear(allocator, sh, "lm_head.weight", cfg.hidden, cfg.vocab);
+    }
+
+    mw.layers = try allocator.alloc(model.LayerWeights, cfg.layers);
+    @memset(mw.layers, .{});
+    var buf: [192]u8 = undefined;
+    for (mw.layers, 0..) |*lw, i| {
+        const li: u32 = @intCast(i);
+        lw.attn_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.input_layernorm.weight", .{li}) catch unreachable, cfg.hidden);
+        lw.ffn_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.post_attention_layernorm.weight", .{li}) catch unreachable, cfg.hidden);
+
+        const q = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.qDim());
+        defer allocator.free(q);
+        const k = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.kvDim());
+        defer allocator.free(k);
+        const v = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.v_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.kvDim());
+        defer allocator.free(v);
+        lw.qkv = try allocator.alloc(f16, q.len + k.len + v.len);
+        @memcpy(lw.qkv[0..q.len], q);
+        @memcpy(lw.qkv[q.len..][0..k.len], k);
+        @memcpy(lw.qkv[q.len + k.len ..][0..v.len], v);
+
+        lw.o = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
+        lw.gate = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
+        lw.up = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.up_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
+        lw.down = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.down_proj.weight", .{li}) catch unreachable, cfg.inter, cfg.hidden);
+
+        if (sh.find(std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}) catch unreachable) != null) {
+            lw.q_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+            lw.k_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+        }
+        if (sh.find(std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.bias", .{li}) catch unreachable) != null) {
+            const bq = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_proj.bias", .{li}) catch unreachable);
+            defer allocator.free(bq);
+            const bk = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.k_proj.bias", .{li}) catch unreachable);
+            defer allocator.free(bk);
+            const bv = try sh.readF32(allocator, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.v_proj.bias", .{li}) catch unreachable);
+            defer allocator.free(bv);
+            if (bq.len + bk.len + bv.len != cfg.qkvDim()) return Error.DimensionMismatch;
+            const all = try allocator.alloc(f32, cfg.qkvDim());
+            @memcpy(all[0..bq.len], bq);
+            @memcpy(all[bq.len..][0..bk.len], bk);
+            @memcpy(all[bq.len + bk.len ..][0..bv.len], bv);
+            lw.qkv_bias = all;
+        }
+    }
+    return mw;
+}

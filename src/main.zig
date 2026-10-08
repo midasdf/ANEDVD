@@ -490,6 +490,8 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
 
 const gguf = @import("gguf.zig");
 const load_gguf = @import("load_gguf.zig");
+const load_hf = @import("load_hf.zig");
+const hf = @import("hf.zig");
 
 fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     if (argv.len < 3) {
@@ -1404,15 +1406,6 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const prompt = argStr(argv, "--prompt") orelse "The capital of France is";
     const layers_cap: u32 = argValue(argv, "--layers", 0);
 
-    // The reference needs a second copy of the weights, which this command can
-    // only build from GGUF today (load_gguf.loadWeights). Saying so beats
-    // failing with a bare read error.
-    if (!std.mem.endsWith(u8, path, ".gguf")) {
-        sys.eprint("verify needs a GGUF file (the CPU reference loads from GGUF; \"{s}\" is not one).\n", .{path});
-        sys.eprint("For safetensors models use `anedvd run --ab` and `anedvd check`.\n", .{});
-        std.process.exit(2);
-    }
-
     var loaded = try model_open.open(allocator, path, .{ .progress = false });
     defer loaded.deinit();
     const cfg = loaded.config;
@@ -1424,7 +1417,7 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     // The CPU reference needs its own copy of the weights: the engine takes
     // ownership of the ones in `loaded`.
-    var ref_mw = try cloneForReference(allocator, path, cfg, layers);
+    var ref_mw = try cloneForReference(allocator, path, layers);
     defer ref_mw.deinit();
 
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
@@ -1487,19 +1480,26 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
 /// Load `cap` layers plus the runtime weights as an independent ModelWeights for
 /// the CPU reference. Re-opening the file is simplest and keeps the two paths
-/// from sharing any buffer.
-fn cloneForReference(allocator: std.mem.Allocator, path: []const u8, cfg: model_mod.Config, cap: usize) !model_mod.ModelWeights {
-    var g = try gguf.Gguf.load(allocator, path);
-    defer g.deinit();
-    var mw = try load_gguf.loadWeights(allocator, &g, false);
+/// from sharing any buffer. Works for both model formats.
+fn cloneForReference(allocator: std.mem.Allocator, path: []const u8, cap: usize) !model_mod.ModelWeights {
+    var mw = if (std.mem.endsWith(u8, path, ".gguf")) blk: {
+        var g = try gguf.Gguf.load(allocator, path);
+        defer g.deinit();
+        break :blk try load_gguf.loadWeights(allocator, &g, false);
+    } else blk: {
+        var sh = try load_hf.Shards.open(allocator, path);
+        defer sh.deinit();
+        var hcfg = try hf.loadConfig(allocator, path);
+        defer hcfg.deinit(allocator);
+        const cfg = try load_hf.toModelConfig(hcfg);
+        break :blk try load_hf.loadWeights(allocator, &sh, cfg, false);
+    };
     if (cap >= mw.layers.len) return mw;
-    // Drop the layers the reference will not run.
     for (mw.layers[cap..]) |*lw| lw.deinit(allocator);
     const kept = try allocator.alloc(model_mod.LayerWeights, cap);
     @memcpy(kept, mw.layers[0..cap]);
     allocator.free(mw.layers);
     mw.layers = kept;
-    _ = cfg;
     return mw;
 }
 
