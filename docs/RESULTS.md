@@ -365,6 +365,18 @@ a shifting sorted window that overwrote slots the scan had not reached yet, and
 a size-k min-heap. The comparison test described below caught both, and the code
 now uses the library rather than a third attempt.
 
+## Server liveness during a long prefill
+
+The mid-generation hook that keeps `/health` answerable only ran between decode
+tokens, and prefill happens entirely before the first token — so the case the
+hook exists for, a long job that must not make the server look dead, was the one
+case it did not cover.
+
+A 971-token prompt prefills in 6.4 s on Qwen2.5-1.5B. During that window `/health`
+answered 1 of 3 requests, the others timing out; after adding `Engine.prefill_tick`
+(one call per prefill chunk, ~8 chunks for that prompt) it answers 4 of 4, with
+the generation itself unchanged at 6.6 s.
+
 ## Server bugs found by testing two requests instead of one
 
 Every earlier test used a single request, which hid two bugs in the same code

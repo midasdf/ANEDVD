@@ -507,7 +507,8 @@ quantisation rather than unified memory:
 * **The HTTP server serialises requests.** One ANE engine, one KV cache. Cheap
   GETs (`/health`, `/v1/models`) are answered mid-generation, but a second
   completion is refused with **503 Service Unavailable and `Retry-After: 1`**
-  rather than queued, so a client can tell "busy" from "broken".
+  rather than queued, so a client can tell "busy" from "broken". This holds
+  during a long prefill too, not just between decode tokens.
 * No tokeniser-level `logprobs`, `n>1`, tool calling, embeddings or images.
 * The chat template is selected by probing for ChatML markers; a model's own
   Jinja template from GGUF metadata is not evaluated.
