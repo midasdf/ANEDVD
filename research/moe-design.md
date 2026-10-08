@@ -98,6 +98,31 @@ is hundreds of distinct experts x layers compiled and loaded, each compile costi
 milliseconds. Streaming a few MB of fp16 expert weights into a CPU matvec is
 simply faster than compiling a kernel for them.
 
+## Where the CPU time actually goes (measured on the engine)
+
+`anedvd run` now prints the CPU MoE time, which the ANE node split does not show.
+On Qwen1.5-MoE-A2.7B, one token with a 10-token prompt:
+
+  CPU MoE experts: 11386 ms/token (93% of decode+prefill)
+
+Broken down in isolation, per layer for one token (4 experts x 3 tensors):
+
+| step | before | after |
+|---|---|---|
+| matrix multiply | 122 ms | 23 ms |
+| dequantise | 205 ms | 165 ms |
+
+The matmul was scalar — one multiply-accumulate per iteration — and 0.83 GMAC per
+token at ~1 MAC/cycle predicts the ~10 s/token the engine measured. Vectorising it
+to eight lanes cut that step 5.3x, and the MoE reference still matches exactly.
+
+**End-to-end decode barely moved (11.4 -> 9.97 s/token), and the reason matters:**
+the microbenchmark re-reads the same four experts, so their pages are hot, while the
+engine reads whatever the router picked. On this randomly-routed checkpoint that is
+a different, cold set nearly every layer. The dominant remaining cost is therefore
+dequantisation volume, not arithmetic — the same conclusion the streaming
+measurements reached from the other direction (219 MB/s cold and warm alike).
+
 ## Status and verification
 
 Implemented and verified for safetensors Qwen2MoE, against
@@ -172,6 +197,31 @@ What would change it, in the order the numbers suggest:
 3. **Batch prefill.** One expert read then serves every token in a chunk that
    routes to it, so prompt processing amortises the read over 128 positions instead
    of one.
+
+## Where the CPU time actually goes (measured on the engine)
+
+`anedvd run` now prints the CPU MoE time, which the ANE node split does not show.
+On Qwen1.5-MoE-A2.7B, one token with a 10-token prompt:
+
+  CPU MoE experts: 11386 ms/token (93% of decode+prefill)
+
+Broken down in isolation, per layer for one token (4 experts x 3 tensors):
+
+| step | before | after |
+|---|---|---|
+| matrix multiply | 122 ms | 23 ms |
+| dequantise | 205 ms | 165 ms |
+
+The matmul was scalar — one multiply-accumulate per iteration — and 0.83 GMAC per
+token at ~1 MAC/cycle predicts the ~10 s/token the engine measured. Vectorising it
+to eight lanes cut that step 5.3x, and the MoE reference still matches exactly.
+
+**End-to-end decode barely moved (11.4 -> 9.97 s/token), and the reason matters:**
+the microbenchmark re-reads the same four experts, so their pages are hot, while the
+engine reads whatever the router picked. On this randomly-routed checkpoint that is
+a different, cold set nearly every layer. The dominant remaining cost is therefore
+dequantisation volume, not arithmetic — the same conclusion the streaming
+measurements reached from the other direction (219 MB/s cold and warm alike).
 
 ## Status
 
