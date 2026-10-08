@@ -36,6 +36,20 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run anedvd").dependOn(&run_cmd.step);
 
-    const unit_tests = b.addTest(.{ .root_module = mod });
+    // Test build. Zig runs `test` blocks from the test ROOT and the files it
+    // references, so rooting the test build at src/main.zig silently ran zero
+    // tests; src/tests.zig references every module instead.
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.addObjectFile(shim_obj);
+    test_mod.addIncludePath(b.path("src/ane"));
+    test_mod.linkFramework("Foundation", .{});
+    test_mod.linkFramework("IOSurface", .{});
+
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
 }

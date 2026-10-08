@@ -142,68 +142,9 @@ pub const Session = struct {
         self.eos_stop = self.tokenizer.eosId();
     }
 
-    /// Build a prompt string from chat messages.
-    ///
-    /// Uses ChatML when the vocabulary has the markers (Qwen, SmolLM2, …) and
-    /// falls back to a plain "User:/Assistant:" transcript otherwise.
+    /// Build a prompt string from chat messages; same as `formatChatFor`.
     pub fn formatChat(self: *const Session, allocator: std.mem.Allocator, messages: []const Message, default_system: ?[]const u8) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(allocator);
-        const tok = self.tokenizer;
-        const chatml = tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null;
-
-        if (chatml) {
-            var wrote_system = false;
-            for (messages) |m| {
-                if (m.role == .system) {
-                    try out.appendSlice(allocator, "<|im_start|>system\n");
-                    try out.appendSlice(allocator, m.content);
-                    try out.appendSlice(allocator, "<|im_end|>\n");
-                    wrote_system = true;
-                }
-            }
-            if (!wrote_system) {
-                if (default_system) |sys_text| {
-                    try out.appendSlice(allocator, "<|im_start|>system\n");
-                    try out.appendSlice(allocator, sys_text);
-                    try out.appendSlice(allocator, "<|im_end|>\n");
-                }
-            }
-            for (messages) |m| {
-                if (m.role == .system) continue;
-                try out.appendSlice(allocator, "<|im_start|>");
-                try out.appendSlice(allocator, m.role.toString());
-                try out.appendSlice(allocator, "\n");
-                try out.appendSlice(allocator, m.content);
-                try out.appendSlice(allocator, "<|im_end|>\n");
-            }
-            try out.appendSlice(allocator, "<|im_start|>assistant\n");
-        } else {
-            if (default_system) |sys_text| {
-                try out.appendSlice(allocator, sys_text);
-                try out.appendSlice(allocator, "\n\n");
-            }
-            for (messages) |m| {
-                switch (m.role) {
-                    .system => {
-                        try out.appendSlice(allocator, m.content);
-                        try out.appendSlice(allocator, "\n\n");
-                    },
-                    .user => {
-                        try out.appendSlice(allocator, "User: ");
-                        try out.appendSlice(allocator, m.content);
-                        try out.appendSlice(allocator, "\n");
-                    },
-                    .assistant => {
-                        try out.appendSlice(allocator, "Assistant: ");
-                        try out.appendSlice(allocator, m.content);
-                        try out.appendSlice(allocator, "\n");
-                    },
-                }
-            }
-            try out.appendSlice(allocator, "Assistant:");
-        }
-        return out.toOwnedSlice(allocator);
+        return formatChatFor(allocator, self.tokenizer, messages, default_system);
     }
 
     fn commonPrefix(a: []const u32, b: []const u32) usize {
@@ -289,10 +230,140 @@ pub const Session = struct {
     }
 };
 
+/// Build a prompt from chat messages using `tok`'s special tokens.
+///
+/// ChatML when the vocabulary has the markers (Qwen, SmolLM2, …), otherwise a
+/// plain "User:/Assistant:" transcript. The result always ends with the
+/// assistant header, so generation continues from there.
+pub fn formatChatFor(
+    allocator: std.mem.Allocator,
+    tok: *const tokenizer_mod.Tokenizer,
+    messages: []const Message,
+    default_system: ?[]const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const chatml = tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null;
+
+    if (chatml) {
+        var wrote_system = false;
+        for (messages) |m| {
+            if (m.role == .system) {
+                try out.appendSlice(allocator, "<|im_start|>system\n");
+                try out.appendSlice(allocator, m.content);
+                try out.appendSlice(allocator, "<|im_end|>\n");
+                wrote_system = true;
+            }
+        }
+        if (!wrote_system) {
+            if (default_system) |sys_text| {
+                try out.appendSlice(allocator, "<|im_start|>system\n");
+                try out.appendSlice(allocator, sys_text);
+                try out.appendSlice(allocator, "<|im_end|>\n");
+            }
+        }
+        for (messages) |m| {
+            if (m.role == .system) continue;
+            try out.appendSlice(allocator, "<|im_start|>");
+            try out.appendSlice(allocator, m.role.toString());
+            try out.appendSlice(allocator, "\n");
+            try out.appendSlice(allocator, m.content);
+            try out.appendSlice(allocator, "<|im_end|>\n");
+        }
+        try out.appendSlice(allocator, "<|im_start|>assistant\n");
+    } else {
+        if (default_system) |sys_text| {
+            try out.appendSlice(allocator, sys_text);
+            try out.appendSlice(allocator, "\n\n");
+        }
+        for (messages) |m| {
+            switch (m.role) {
+                .system => {
+                    try out.appendSlice(allocator, m.content);
+                    try out.appendSlice(allocator, "\n\n");
+                },
+                .user => {
+                    try out.appendSlice(allocator, "User: ");
+                    try out.appendSlice(allocator, m.content);
+                    try out.appendSlice(allocator, "\n");
+                },
+                .assistant => {
+                    try out.appendSlice(allocator, "Assistant: ");
+                    try out.appendSlice(allocator, m.content);
+                    try out.appendSlice(allocator, "\n");
+                },
+            }
+        }
+        try out.appendSlice(allocator, "Assistant:");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "chatml prompt layout" {
+    const a = std.testing.allocator;
+    var tok = try tokenizer_mod.Tokenizer.fromTokenizerJsonSlice(a, chatmlFixture());
+    defer tok.deinit();
+    const msgs = [_]Message{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "hello" },
+        .{ .role = .user, .content = "bye" },
+    };
+    const prompt = try formatChatFor(a, &tok, &msgs, null);
+    defer a.free(prompt);
+    try std.testing.expectEqualStrings(
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n<|im_start|>user\nbye<|im_end|>\n<|im_start|>assistant\n",
+        prompt,
+    );
+}
+
+test "chatml prompt inserts the default system message once" {
+    const a = std.testing.allocator;
+    var tok = try tokenizer_mod.Tokenizer.fromTokenizerJsonSlice(a, chatmlFixture());
+    defer tok.deinit();
+    const msgs = [_]Message{.{ .role = .user, .content = "hi" }};
+    const prompt = try formatChatFor(a, &tok, &msgs, "be nice");
+    defer a.free(prompt);
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "<|im_start|>system\nbe nice<|im_end|>\n"));
+    // An explicit system message wins over the default.
+    const with_system = [_]Message{
+        .{ .role = .system, .content = "explicit" },
+        .{ .role = .user, .content = "hi" },
+    };
+    const p2 = try formatChatFor(a, &tok, &with_system, "be nice");
+    defer a.free(p2);
+    try std.testing.expect(std.mem.startsWith(u8, p2, "<|im_start|>system\nexplicit<|im_end|>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, p2, "be nice") == null);
+}
+
+test "plain transcript when the vocabulary has no ChatML markers" {
+    const a = std.testing.allocator;
+    var tok = try tokenizer_mod.Tokenizer.fromTokenizerJsonSlice(a, plainFixture());
+    defer tok.deinit();
+    const msgs = [_]Message{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "hello" },
+    };
+    const prompt = try formatChatFor(a, &tok, &msgs, "sys");
+    defer a.free(prompt);
+    try std.testing.expectEqualStrings("sys\n\nUser: hi\nAssistant: hello\nAssistant:", prompt);
+}
+
+fn chatmlFixture() []const u8 {
+    return
+    \\{"model":{"type":"BPE","vocab":{"<|im_start|>":0,"<|im_end|>":1,"a":2},"merges":[]}}
+    ;
+}
+
+fn plainFixture() []const u8 {
+    return
+    \\{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}
+    ;
 }
 
 test "role parsing" {

@@ -261,16 +261,23 @@ fn compareCandidates(_: void, a: Candidate, b: Candidate) bool {
 }
 
 /// Apply repetition / presence / frequency penalties to `logits` in place.
+///
+/// The window is scanned in order, so a token that appears n times takes the
+/// repetition penalty and the frequency penalty n times, but the presence
+/// penalty only once — which is the OpenAI definition and what the unit test
+/// pins.
 pub fn applyPenalties(logits: []f32, params: SamplerParams, recent: []const u32) void {
     if (params.repetition_penalty == 1.0 and params.presence_penalty == 0.0 and params.frequency_penalty == 0.0) return;
-    for (recent) |id| {
+    for (recent, 0..) |id, i| {
         if (id >= logits.len) continue;
         var v = logits[id];
         if (params.repetition_penalty != 1.0) {
             v = if (v > 0) v / params.repetition_penalty else v * params.repetition_penalty;
         }
-        v -= params.presence_penalty;
-        v -= params.frequency_penalty;
+        if (params.frequency_penalty != 0) v -= params.frequency_penalty;
+        if (params.presence_penalty != 0 and std.mem.indexOfScalar(u32, recent[0..i], id) == null) {
+            v -= params.presence_penalty;
+        }
         logits[id] = v;
     }
 }
@@ -460,7 +467,12 @@ test "penalties push repeated tokens down" {
     var logits = [_]f32{ 5.0, 4.0 };
     applyPenalties(&logits, .{ .repetition_penalty = 2.0 }, &.{0});
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), logits[0], 1e-6);
+    // Two occurrences: presence once, frequency twice.
     var logits2 = [_]f32{ 5.0, 4.0 };
     applyPenalties(&logits2, .{ .presence_penalty = 1.0, .frequency_penalty = 0.5 }, &.{ 0, 0 });
-    try std.testing.expectApproxEqAbs(@as(f32, 2.5), logits2[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), logits2[0], 1e-6);
+    // A token outside the window is untouched.
+    var logits3 = [_]f32{ 5.0, 4.0 };
+    applyPenalties(&logits3, .{ .repetition_penalty = 2.0 }, &.{1});
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), logits3[0], 1e-6);
 }

@@ -769,3 +769,92 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     errdefer down_k.deinit();
     return .{ .qkv = qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k };
 }
+
+// ---------------------------------------------------------------------------
+// Tests. The engine needs the ANE to compile kernels, so these skip cleanly on
+// machines without one; where it is available they pin the invariants that are
+// easy to break (batched prefill vs per-token decode, finite logits).
+// ---------------------------------------------------------------------------
+
+fn fillDeterministic(dst: []f16, seed: u32, scale: f32) void {
+    var s = seed;
+    for (dst) |*v| {
+        s = s *% 1664525 +% 1013904223;
+        const f = @as(f32, @floatFromInt(s >> 8)) / 16777216.0 - 0.5;
+        v.* = @floatCast(f * scale);
+    }
+}
+
+fn fillDeterministicF32(dst: []f32, seed: u32, base: f32, scale: f32) void {
+    var s = seed;
+    for (dst) |*v| {
+        s = s *% 1664525 +% 1013904223;
+        const f = @as(f32, @floatFromInt(s >> 8)) / 16777216.0 - 0.5;
+        v.* = base + f * scale;
+    }
+}
+
+test "batched prefill and per-token decode agree (needs the ANE)" {
+    if (!ane.available()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    const cfg = model.Config{
+        .arch = "llama",
+        .hidden = 32,
+        .layers = 2,
+        .heads = 4,
+        .kv_heads = 2,
+        .head_dim = 8,
+        .inter = 64,
+        .vocab = 128,
+        .eps = 1e-5,
+        .rope_theta = 10000.0,
+        .rope_adjacent = false,
+    };
+    var mw = model.ModelWeights{ .allocator = a, .config = cfg };
+    defer mw.deinit();
+    mw.embed = try a.alloc(f16, @as(usize, cfg.vocab) * cfg.hidden);
+    mw.final_norm = try a.alloc(f32, cfg.hidden);
+    mw.layers = try a.alloc(model.LayerWeights, cfg.layers);
+    @memset(mw.layers, .{});
+    fillDeterministic(mw.embed, 1, 1.0);
+    fillDeterministicF32(mw.final_norm, 2, 1.0, 0.1);
+    for (mw.layers, 0..) |*lw, i| {
+        const li: u32 = @intCast(i);
+        lw.attn_norm = try a.alloc(f32, cfg.hidden);
+        lw.ffn_norm = try a.alloc(f32, cfg.hidden);
+        lw.qkv = try a.alloc(f16, @as(usize, cfg.qkvDim()) * cfg.hidden);
+        lw.o = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.qDim());
+        lw.gate = try a.alloc(f16, @as(usize, cfg.inter) * cfg.hidden);
+        lw.up = try a.alloc(f16, @as(usize, cfg.inter) * cfg.hidden);
+        lw.down = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.inter);
+        fillDeterministicF32(lw.attn_norm, 100 + li, 1.0, 0.1);
+        fillDeterministicF32(lw.ffn_norm, 200 + li, 1.0, 0.1);
+        fillDeterministic(lw.qkv, 300 + li, 0.3);
+        fillDeterministic(lw.o, 400 + li, 0.3);
+        fillDeterministic(lw.gate, 500 + li, 0.3);
+        fillDeterministic(lw.up, 600 + li, 0.3);
+        fillDeterministic(lw.down, 700 + li, 0.3);
+    }
+
+    const rt = try mw.toRuntime(a);
+    var eng = try Engine.init(a, rt, mw.layerSource(), mw.headSource(rt.embed), .{
+        .max_seq = 64,
+        .verbose = false,
+        .chunk = 32,
+    });
+    defer eng.deinit();
+
+    const ids = [_]u32{ 3, 7, 11, 19 };
+    var seq_logits: []const f32 = &.{};
+    for (ids, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
+    var finite: usize = 0;
+    for (seq_logits) |v| if (std.math.isFinite(v)) {
+        finite += 1;
+    };
+    try std.testing.expectEqual(seq_logits.len, finite);
+
+    // Same prompt through the batched path must give the same logits.
+    const batch = try eng.prefill(&ids, 0);
+    for (seq_logits, batch) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
+}

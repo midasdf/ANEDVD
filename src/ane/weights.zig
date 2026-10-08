@@ -120,7 +120,7 @@ test "weight blob layout matches the published fixture" {
     var b: [24]f16 = undefined;
     for (&a, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(i)) * 0.5);
     for (&b, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(i)) * -0.25);
-    const blob = try pack(allocator, &.{ .{ .name = "W1", .data = &a }, .{ .name = "W3", .data = &b } });
+    var blob = try pack(allocator, &.{ .{ .name = "W1", .data = &a }, .{ .name = "W3", .data = &b } });
     defer blob.deinit();
 
     // Chunk 0 payload at 128 -> BLOBFILE offset 64; chunk 1 payload at 240 -> 176.
@@ -132,7 +132,7 @@ test "weight blob layout matches the published fixture" {
     try std.testing.expectEqual(@as(u8, 0xEF), blob.bytes[64]);
     try std.testing.expectEqual(@as(u8, 0xDE), blob.bytes[67]);
     try std.testing.expectEqual(@as(u32, 48), sys.readU32LE(blob.bytes[72..76]));
-    try std.testing.expectEqual(@as(u32, 48), sys.readU32LE(blob.bytes[176..180]));
+    try std.testing.expectEqual(@as(u32, 48), sys.readU32LE(blob.bytes[184..188]));
 
     // `data_off` is the ABSOLUTE offset of each chunk's own payload (128 then
     // 240), not a constant. Assuming a constant compiles fine and silently
@@ -148,7 +148,8 @@ test "weight blob layout matches the published fixture" {
 
 test "chunkOffsets agrees with pack()" {
     const allocator = std.testing.allocator;
-    const sizes = [_]usize{ 48, 96, 24 };
+    // chunkOffsets takes BYTE sizes; the tensors below are 48/96/24 fp16 values.
+    const sizes = [_]usize{ 96, 192, 48 };
     var a: [48]f16 = undefined;
     var b: [96]f16 = undefined;
     var c: [24]f16 = undefined;
