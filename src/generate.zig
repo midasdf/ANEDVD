@@ -156,13 +156,6 @@ pub const Session = struct {
         return formatChatFor(allocator, self.tokenizer, messages, default_system);
     }
 
-    fn commonPrefix(a: []const u32, b: []const u32) usize {
-        const n = @min(a.len, b.len);
-        var i: usize = 0;
-        while (i < n and a[i] == b[i]) : (i += 1) {}
-        return i;
-    }
-
     /// Prefill `prompt_ids`, then sample up to `params.max_tokens` tokens.
     /// `emitter` receives each decoded piece as it is produced.
     pub fn generate(self: *Session, prompt_ids: []const u32, params: Params, emitter: Emitter) !Stats {
@@ -182,7 +175,7 @@ pub const Session = struct {
 
         // Reuse the KV prefix: a growing transcript only needs the new suffix,
         // which is what makes multi-turn chat cheap.
-        const reuse = commonPrefix(self.cached.items, ids);
+        const reuse = reuseLength(self.cached.items, ids);
         stats.prefill_reused = @intCast(@min(reuse, ids.len));
         if (reuse == 0) eng.reset();
         self.cached.shrinkRetainingCapacity(reuse);
@@ -405,6 +398,57 @@ fn plainFixture() []const u8 {
     return
     \\{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}
     ;
+}
+
+fn commonPrefix(a: []const u32, b: []const u32) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+/// How many leading tokens of `prompt` may reuse the engine's KV cache, given
+/// which token ids that cache currently holds.
+///
+/// The cache always holds MORE than a prompt that produced it: generation
+/// appends every emitted token, so after answering a 13-token prompt the cache
+/// holds 13 + generated entries. Reusing a strict prefix of the cache is not
+/// enough — decode reads `reuse + 1` positions, and position `reuse` would be a
+/// leftover from the previous turn. That is a real bug that made a second
+/// identical request return zero tokens: the model saw its own stale output as
+/// context.
+///
+/// So reuse is only safe when the new prompt covers the ENTIRE cached prefix;
+/// otherwise the cache is dropped and everything is re-prefilled.
+pub fn reuseLength(cached: []const u32, prompt: []const u32) usize {
+    const shared = commonPrefix(cached, prompt);
+    if (shared < cached.len) return 0;
+    return shared;
+}
+
+test "reuseLength only reuses a prefix that covers the whole cache" {
+    // Cache holds 13 prompt tokens plus 7 generated ones.
+    const cache = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 50, 51, 52, 53, 54, 55, 56 };
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+
+    // The whole prompt matches the cache's first 13 entries, but the cache holds
+    // more: reusing it would make decode read a stale position 13. Must be 0.
+    try std.testing.expectEqual(@as(usize, 0), reuseLength(&cache, &prompt));
+
+    // A longer prompt that covers the entire cache may reuse all of it.
+    const longer = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 50, 51, 52, 53, 54, 55, 56, 60, 61 };
+    try std.testing.expectEqual(@as(usize, 20), reuseLength(&cache, &longer));
+
+    // Partial coverage of the cache is never safe.
+    const partial = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 50, 51 };
+    try std.testing.expectEqual(@as(usize, 0), reuseLength(&cache, &partial));
+
+    // Divergence at the first token: nothing to reuse.
+    const other = [_]u32{ 9, 9, 9 };
+    try std.testing.expectEqual(@as(usize, 0), reuseLength(&cache, &other));
+
+    // An empty cache means the whole prompt is new.
+    try std.testing.expectEqual(@as(usize, 0), reuseLength(&.{}, &prompt));
 }
 
 test "role parsing" {

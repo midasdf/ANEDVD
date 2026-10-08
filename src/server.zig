@@ -38,6 +38,8 @@ pub const Server = struct {
     listener: ?*http.Server = null,
     /// Requests served while a generation was in flight.
     served_during_generation: u64 = 0,
+    /// Generation requests turned away with 503 because the engine was busy.
+    busy_rejections: u64 = 0,
 
     pub fn run(self: *Server) !void {
         var srv = try http.Server.open(self.opts.host, self.opts.port);
@@ -158,6 +160,7 @@ pub const Server = struct {
             defer collector.deinit();
             const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
 
+            self.logStats(stats);
             var b = Buf.init(self.allocator);
             defer b.deinit();
             try b.print("{{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion\",\"created\":{d},\"model\":\"", .{ created, created });
@@ -203,26 +206,44 @@ pub const Server = struct {
         const a = arena.allocator();
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
-        const req = conn.readRequest(a, &buf) catch return;
+        // A connection reaching here has already sent its request, so it can be
+        // read without waiting.
+        const req = conn.readRequest(a, &buf) catch |e| {
+            if (e != error.ConnectionClosed) {
+                conn.sendBody(400, "Bad Request", "application/json", "{\"error\":{\"message\":\"malformed request\"}}") catch {};
+            }
+            return;
+        };
         const path = req.path();
-        if (!std.mem.eql(u8, req.method, "GET")) return;
-        if (std.mem.eql(u8, path, "/health")) {
+
+        // The cheap read-only routes are answered on the spot.
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, path, "/health")) {
             conn.sendBody(200, "OK", "application/json", "{\"status\":\"ok\"}") catch return;
             self.served_during_generation += 1;
-            sys.eprint("[mid-gen] served /health while generating ({d} so far)\n", .{self.served_during_generation});
-        } else if (std.mem.eql(u8, path, "/v1/models")) {
+            return;
+        }
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
             self.sendModels(&conn) catch return;
             self.served_during_generation += 1;
+            return;
         }
+
+        // Anything that needs the engine cannot be served while it is busy.
+        // Dropping the connection here left the client with an empty reply and no
+        // status at all, which looks like a crash; answer with a real HTTP error
+        // and Retry-After so a client can tell the difference and back off.
+        self.busy_rejections += 1;
+        tryBusyResponse(&conn, self.busy_rejections);
     }
 
     /// One line per request so multi-turn prefix reuse is observable in the
     /// server log.
     fn logStats(self: *Server, stats: generate.Stats) void {
         _ = self;
-        sys.eprint("[req] prompt {d} ({d} reused), +{d} tokens, prefill {d:.2} s, decode {d:.1} tok/s, {s}\n", .{
+        sys.eprint("[req] prompt {d} ({d} reused, {d} new), +{d} tokens, prefill {d:.2} s, decode {d:.1} tok/s, {s}\n", .{
             stats.prompt_tokens,
             stats.prefill_reused,
+            stats.prompt_tokens -| stats.prefill_reused,
             stats.completion_tokens,
             @as(f64, @floatFromInt(stats.prefill_ns)) / 1e9,
             stats.decodeToksPerSec(),
@@ -715,6 +736,19 @@ const SseSink = struct {
         try js.flush();
     }
 };
+
+/// 503 with Retry-After for a request that needs the busy engine.
+///
+/// Retry-After is what makes this a usable answer rather than a mystery: a
+/// client can back off instead of treating the empty reply as a broken server.
+fn tryBusyResponse(conn: *http.Conn, so_far: u64) void {
+    const body = "{\"error\":{\"message\":\"another generation is in progress; retry shortly\",\"type\":\"server_busy\"}}";
+    conn.beginWithLength(503, "Service Unavailable", "application/json", body.len) catch return;
+    conn.write("Retry-After: 1\r\n") catch return;
+    conn.write("\r\n") catch return;
+    conn.write(body) catch return;
+    sys.eprint("[busy] rejected a request while generating ({d} so far)\n", .{so_far});
+}
 
 fn sseEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
     _ = token_id;
