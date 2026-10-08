@@ -67,6 +67,11 @@ zig fmt src build.zig
   the hand-off between kernels (a transposed activation layout did exactly that
   once). Use `anedvd verify <model.gguf>` for a whole-model ANE-vs-CPU compare,
   and `anedvd layers --upto N` to bisect by depth.
+* **Two tokenizer families are supported** (byte-level BPE and SentencePiece),
+  and the chat template comes from the GGUF `tokenizer.chat_template` metadata —
+  not from probing the vocabulary, because models like TinyLlama spell their
+  `<|user|>` markers as plain text in the template rather than as vocabulary
+  entries.
 * **Beware checks that cannot fail.** Three bugs here survived a green run: a
   test build that ran zero tests, an A/B check that compared a buffer with
   itself, and a per-kernel check blind to the hand-off between kernels. When

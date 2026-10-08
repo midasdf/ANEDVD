@@ -43,6 +43,7 @@ across identical invocations, so every number here comes from repeated runs.
 | Qwen2.5-0.5B GGUF Q8_0 | 190 tok/s | 22.7 tok/s | 1.0 GB |
 | Qwen3-0.6B GGUF Q8_0 | 146 tok/s | 17.1 tok/s | ~1.1 GB |
 | Qwen2.5-1.5B GGUF Q4_K_M | 28 tok/s | 9.5 tok/s | 1.6 GB |
+| TinyLlama-1.1B GGUF Q8_0 | ~150 tok/s | 17.0 tok/s | ~1.5 GB |
 
 Decode ranges over 9 repeats are wide (SmolLM2: 32-57 tok/s, Qwen2.5-0.5B:
 21-26) because the ANE's own timing is unstable, which is why every number here

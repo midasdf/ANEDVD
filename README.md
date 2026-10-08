@@ -12,10 +12,11 @@ zero-copy tensor I/O.
 this program. *Vandal* — it drives the ANE through undocumented private
 frameworks, which Apple does not support and App Store review rejects.
 
-It loads **GGUF** models (Q8_0, Q4_0/1, Q5_0/1, F16, F32, BF16, K-quants where
-implemented) and **HuggingFace directories** (safetensors + `config.json` +
-`tokenizer.json`), generates text from the CLI, and serves an OpenAI- and
-Anthropic-compatible HTTP API with a built-in WebUI.
+It loads **GGUF** models (Q8_0, Q4_0/1, Q5_0/1, F16, F32, BF16, Q2_K–Q8_K) and
+**HuggingFace directories** (safetensors + `config.json` + `tokenizer.json`),
+generates text from the CLI, and serves an OpenAI- and Anthropic-compatible HTTP
+API with a built-in WebUI. Both tokenizer families work: byte-level BPE (Llama 3,
+Qwen2/3, SmolLM2/3) and SentencePiece (Llama-2/TinyLlama-era).
 
 ## Verified on this machine
 
@@ -55,6 +56,7 @@ single measurement is not a result:
 | Qwen2.5-0.5B-Instruct | 494 M, GGUF Q8_0 | **22.7 tok/s** | 21–26 | 1.0 GB |
 | Qwen3-0.6B | 600 M, GGUF Q8_0 | **17.1 tok/s** | | ~1.1 GB |
 | Qwen2.5-1.5B-Instruct | 1.5 B, GGUF Q4_K_M | **9.5 tok/s** | 9.2–9.6 | 1.6 GB |
+| TinyLlama-1.1B-Chat | 1.1 B, GGUF Q8_0 | **17.0 tok/s** | | ~1.5 GB |
 
 Long prompts prefill faster per token because the ANE is fed a whole chunk at a
 time: Qwen2.5-0.5B reaches 698 tok/s at 203 prompt tokens. Decode is at the
@@ -491,9 +493,11 @@ quantisation rather than unified memory:
 
 ## Known issues
 
-* **Not all architectures are supported.** Llama, Qwen2, Qwen3, Mistral and
-  SmolLM3 families. Anything with a different attention layout (MoE routing,
-  MLA, sliding-window variants) needs work.
+* **Not all architectures are supported.** Llama, Qwen2, Qwen3, Mistral,
+  SmolLM2/3 and the TinyLlama-era Llama layout. Anything with a different
+  attention layout (MoE routing, MLA, sliding-window variants) needs work.
+  An unrecognised `general.architecture` is accepted with a warning, since the
+  GGUF tensor names are the same — but check the output.
 * **Decode is at the hardware's weight-bandwidth ceiling** (~20–40 GB/s of fp16
   weights measured on this ANE). int8 would be the only large win and the ANE
   rejects the MIL op for it, so decode speed is bounded, not untuned.
