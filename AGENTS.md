@@ -72,6 +72,10 @@ zig fmt src build.zig
   not from probing the vocabulary, because models like TinyLlama spell their
   `<|user|>` markers as plain text in the template rather than as vocabulary
   entries.
+* **MoE experts run on the CPU, not the ANE.** A 60-expert model would need
+  thousands of loaded kernels and the ANE pool holds a few dozen. Attention stays on
+  the ANE; the experts stream from the mapping. `research/moe-design.md` has the
+  arithmetic, the verified forward pass and the measured (bad) speed.
 * **Sampling is not negligible.** At temperature 1.0 the candidate cut leaves
   ~31k of 151936 logits, and ordering them was ~10% of decode (`sortUnstable`,
   not `sort`, for the top-k selection). `anedvd run` prints the cost per token.

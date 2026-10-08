@@ -497,6 +497,12 @@ quantisation rather than unified memory:
   the newest tokens. This is now reported (a log warning, `prompt_tokens_dropped`
   in the OpenAI `usage` object, and a status line in the WebUI) rather than
   answered silently, but the tokens are still gone.
+* **MoE models are supported but large ones are not fast.** Qwen2MoE
+  (Qwen1.5-MoE) works: the router, top-k experts and shared expert are implemented
+  and verified against an independent reference, in both GGUF and safetensors. But
+  decode has to read the routed experts every token, and on this machine that
+  measures 4.6 s/token for Qwen1.5-MoE-A2.7B — see
+  [`research/moe-design.md`](research/moe-design.md) for why, and what would fix it.
 * **Not all architectures are supported.** Llama, Qwen2, Qwen3, Mistral,
   SmolLM2/3 and the TinyLlama-era Llama layout. Anything with a different
   attention layout (MoE routing, MLA, sliding-window variants) needs work.
