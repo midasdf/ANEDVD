@@ -61,6 +61,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdBench(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "verify")) {
         return cmdVerify(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "route")) {
+        return cmdRoute(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "layers")) {
         return cmdLayers(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "kernels")) {
@@ -1789,4 +1791,104 @@ fn cmdLayers(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         used[best] = true;
         sys.print("  {d}. id={d} logit={d:.2} {s}\n", .{ i + 1, best, bv, loaded.tokenizer.tokenText(@intCast(best)) });
     }
+}
+
+/// `anedvd route <model> --prompt "..." --tokens N`
+///
+/// Record which experts the router picks while generating, and report how
+/// concentrated the choices are. A resident-expert cache only pays off if a small
+/// set covers most of the traffic; this is the measurement that decides it, rather
+/// than assuming MoE routing is skewed on a randomly-initialised checkpoint.
+fn cmdRoute(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    if (argv.len < 3) {
+        sys.eprint("usage: anedvd route <model> [--prompt \"...\"] [--tokens N]\n", .{});
+        std.process.exit(2);
+    }
+    const path = argv[2];
+    const prompt = argStr(argv, "--prompt") orelse "The capital of France is";
+    const n_tokens: u32 = argValue(argv, "--tokens", 24);
+
+    var loaded = try model_open.open(allocator, path, .{ .progress = false });
+    defer loaded.deinit();
+    const cfg = loaded.config;
+    if (cfg.num_experts == 0) {
+        sys.eprint("{s} is a dense model (no experts).\n", .{path});
+        std.process.exit(1);
+    }
+
+    const counts = try allocator.alloc(u32, @as(usize, cfg.layers) * cfg.num_experts);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
+        .max_seq = 2048,
+        .verbose = false,
+    });
+    defer eng.deinit();
+    eng.route_counts = counts;
+
+    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
+    defer allocator.free(ids);
+    _ = try eng.prefill(ids, 0);
+    var pos: u32 = @intCast(ids.len);
+    var i: u32 = 0;
+    while (i < n_tokens) : (i += 1) {
+        const logits = try eng.forward(ids[ids.len - 1] +% i +% 1, pos);
+        var best: usize = 0;
+        for (logits, 0..) |v, k| if (v > logits[best]) {
+            best = k;
+        };
+        pos += 1;
+    }
+
+    const tokens = eng.route_tokens;
+    sys.print("{s}: {d} layers, {d} experts, top-{d}; {d} routing decisions\n", .{
+        cfg.arch, cfg.layers, cfg.num_experts, cfg.experts_per_tok, tokens,
+    });
+    if (tokens == 0) return;
+
+    // Per layer: how many of the 60 experts were ever reached, and what share of the
+    // decisions the most-used ones cover.
+    sys.print("\nlayer  distinct  top4 share  top8 share  top16 share  \n", .{});
+    var total_distinct: usize = 0;
+    var min_distinct: usize = cfg.num_experts;
+    var max_distinct: usize = 0;
+    for (0..cfg.layers) |li| {
+        const row = counts[li * cfg.num_experts ..][0..cfg.num_experts];
+
+        // Sort a copy by count, descending, via a simple index sort.
+        const idx = try allocator.alloc(u32, cfg.num_experts);
+        defer allocator.free(idx);
+        for (idx, 0..) |*p2, e| p2.* = @intCast(e);
+        std.mem.sort(u32, idx, row, struct {
+            fn lt(cnt: []const u32, a: u32, b: u32) bool {
+                return cnt[a] > cnt[b];
+            }
+        }.lt);
+        var distinct: usize = 0;
+        for (row) |v| if (v > 0) {
+            distinct += 1;
+        };
+        total_distinct += distinct;
+        min_distinct = @min(min_distinct, distinct);
+        max_distinct = @max(max_distinct, distinct);
+        var total: u64 = 0;
+        for (row) |v| total += v;
+        const share = struct {
+            fn f(cnt: []const u32, ord: []const u32, n: usize, tot: u64) f64 {
+                var s: u64 = 0;
+                for (ord[0..@min(n, ord.len)]) |e| s += cnt[e];
+                return if (tot > 0) @as(f64, @floatFromInt(s)) / @as(f64, @floatFromInt(tot)) else 0;
+            }
+        }.f;
+        sys.print("{d:5} {d:9} {d:11.0}% {d:11.0}% {d:11.0}%\n", .{
+            li,                                 distinct,
+            100.0 * share(row, idx, 4, total),  100.0 * share(row, idx, 8, total),
+            100.0 * share(row, idx, 16, total),
+        });
+    }
+    sys.print("\ndistinct experts per layer: min {d}, max {d}, mean {d:.1} of {d}\n", .{
+        min_distinct,                                                                  max_distinct,
+        @as(f64, @floatFromInt(total_distinct)) / @as(f64, @floatFromInt(cfg.layers)), cfg.num_experts,
+    });
 }

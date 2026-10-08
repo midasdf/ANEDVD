@@ -159,6 +159,12 @@ pub const Engine = struct {
     moe_hidden: []f32 = &.{},
     moe_gate_scratch: []f32 = &.{},
     moe_upd_scratch: []f32 = &.{},
+    /// Optional routing recorder: counts how often each expert of each layer is
+    /// chosen. A resident-expert cache is only worth building if the counts are
+    /// concentrated, so this is how that gets decided rather than assumed.
+    /// Layout: [layer][num_experts]; null when not recording.
+    route_counts: ?[]u32 = null,
+    route_tokens: u32 = 0,
 
     pub fn deinit(self: *Engine) void {
         for (self.kernels) |*k| {
@@ -487,6 +493,12 @@ pub const Engine = struct {
                 // Accumulate the routed experts into a scratch, then add once, so the
                 // residual is touched a single time.
                 @memset(self.moe_out[0..hidden], 0);
+                if (self.route_counts) |counts| {
+                    self.route_tokens += 1;
+                    for (self.moe_idx[0..cfg.experts_per_tok]) |e| {
+                        counts[@as(usize, li) * cfg.num_experts + e] += 1;
+                    }
+                }
                 for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p| {
                     cpu.moeExpertAccum(
                         self.moe_out[0..hidden],
