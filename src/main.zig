@@ -897,6 +897,16 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         });
     }
     const tot = eng.stats.tokens;
+    // MoE: report the CPU expert time separately. On Qwen1.5-MoE it is the largest
+    // single cost by far, and it does not appear in the ANE node split at all.
+    if (eng.stats.moe_ns > 0 and stats.completion_tokens + stats.prompt_tokens > 0) {
+        const tokens: f64 = @floatFromInt(stats.completion_tokens + stats.prompt_tokens);
+        sys.print("CPU MoE experts: {d:.1} ms/token ({d:.0}% of decode+prefill)\n", .{
+            @as(f64, @floatFromInt(eng.stats.moe_ns)) / tokens / 1e6,
+            100.0 * @as(f64, @floatFromInt(eng.stats.moe_ns)) /
+                @as(f64, @floatFromInt(stats.prefill_ns + stats.decode_ns)),
+        });
+    }
     if (tot > 0) {
         const t: f64 = @floatFromInt(tot);
         sys.print("ANE per-token split: qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{

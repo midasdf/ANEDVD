@@ -304,7 +304,12 @@ pub const Engine = struct {
         self.act = try allocator.alloc(f32, @as(usize, cfg.inter) * ch);
         self.logits = try allocator.alloc(f32, cfg.vocab);
         self.scores = try allocator.alloc(f32, opts.max_seq);
-        const stage = @max(@max(cfg.hidden, cfg.qkvDim()), @max(cfg.qDim(), @max(2 * cfg.inter, cfg.inter)));
+        // `stage` sizes the per-layer staging buffers. Prefill ends by reading the
+        // whole vocabulary out of `out16`, so it has to cover `vocab` too: a model
+        // whose vocabulary is larger than every activation (the tiny MoE test
+        // checkpoint: vocab 151936 against hidden 4) indexed past the end and aborted
+        // with "index out of bounds: index 151936, len 1024".
+        const stage = @max(@max(cfg.hidden, cfg.qkvDim()), @max(cfg.qDim(), @max(2 * cfg.inter, @max(cfg.inter, cfg.vocab))));
         self.in16 = try allocator.alloc(f16, @as(usize, stage) * ch);
         self.out16 = try allocator.alloc(f16, @as(usize, stage) * ch);
         self.dec_in = try allocator.alloc(f16, stage);
@@ -696,6 +701,7 @@ pub const Engine = struct {
                     try k.ffn.readOutputF16(0, self.out16[0..proj_len]);
                 }
                 if (k.moe) |*moe| {
+                    const t_moe = sys.nowNs();
                     const hd: usize = hidden;
                     for (0..n) |j| {
                         // Normalised input for THIS column.
@@ -737,7 +743,7 @@ pub const Engine = struct {
                         }
                         for (0..hd) |c| self.x[c * ch + j] += self.moe_out[c];
                     }
-                    self.stats.moe_ns += 0;
+                    self.stats.moe_ns += sys.nowNs() - t_moe;
                 } else {
                     for (0..n) |j| {
                         for (0..hidden) |c| self.x[c * ch + j] += @floatCast(self.out16[c * ch + j]);
@@ -1114,6 +1120,30 @@ test "batched prefill and per-token decode agree (needs the ANE)" {
     // Same prompt through the batched path must give the same logits.
     const batch = try eng.prefill(&ids, 0);
     for (seq_copy, batch) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
+}
+
+test "the staging buffers cover the vocabulary" {
+    // Prefill ends by reading the whole vocabulary out of `out16` via the head
+    // kernel. `stage` used to be sized from the activations only, so a model whose
+    // vocabulary is bigger than all of them (the tiny MoE checkpoint: vocab 151936
+    // against hidden 4) indexed past the end:
+    //   "index out of bounds: index 151936, len 1024"
+    // This asserts the invariant that fix relies on, without needing the ANE.
+    const cases = [_]model.Config{
+        // A small vocabulary where activations dominate.
+        .{ .hidden = 576, .layers = 1, .heads = 9, .kv_heads = 3, .head_dim = 64, .inter = 1536, .vocab = 49152 },
+        // A vocabulary larger than every activation.
+        .{ .hidden = 4, .layers = 1, .heads = 4, .kv_heads = 2, .head_dim = 1, .inter = 2, .vocab = 151936 },
+        // A wide FFN.
+        .{ .hidden = 1024, .layers = 1, .heads = 16, .kv_heads = 8, .head_dim = 64, .inter = 8192, .vocab = 32000 },
+    };
+    for (cases) |cfg| {
+        const stage = @max(@max(cfg.hidden, cfg.qkvDim()), @max(cfg.qDim(), @max(2 * cfg.inter, @max(cfg.inter, cfg.vocab))));
+        try std.testing.expect(stage >= cfg.vocab);
+        try std.testing.expect(stage >= cfg.hidden);
+        try std.testing.expect(stage >= 2 * cfg.inter);
+        try std.testing.expect(stage >= cfg.qkvDim());
+    }
 }
 
 test "prefill calls the tick hook once per chunk (needs the ANE)" {
