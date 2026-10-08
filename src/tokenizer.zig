@@ -278,11 +278,28 @@ pub const Tokenizer = struct {
     ///
     /// Returns `error.UnsupportedTokenizerModel` for non-BPE models (e.g.
     /// SentencePiece `model = "llama"`).
+    /// Diagnostics from the last fromGguf failure (shown by the CLI).
+    pub var last_error_detail: ?[]const u8 = null;
+
     pub fn fromGguf(allocator: Allocator, g: *const gguf.Gguf) !Tokenizer {
+        last_error_detail = null;
         if (g.getString("tokenizer.ggml.model")) |model| {
             if (!std.mem.eql(u8, model, "gpt2") and !std.mem.eql(u8, model, "bpe")) {
+                // Say which vocabulary it is and what would be needed: a bare
+                // "UnsupportedTokenizerModel" sends the reader to the source.
+                last_error_detail = if (std.mem.eql(u8, model, "llama"))
+                    "this model uses a SentencePiece (\"llama\") vocabulary, and only byte-level BPE (\"gpt2\"/\"bpe\") is implemented. Most Llama-2/TinyLlama-era and Gemma GGUFs are SentencePiece; use a model with a GPT-2-style vocabulary (Llama 3, Qwen2/3, SmolLM2/3, Mistral-v0.3+) or convert the vocabulary."
+                else
+                    "only byte-level BPE vocabularies (tokenizer.ggml.model = \"gpt2\" or \"bpe\") are implemented.";
                 return error.UnsupportedTokenizerModel;
             }
+        } else {
+            last_error_detail = "the GGUF file has no tokenizer.ggml.model key, so the vocabulary type is unknown.";
+            return error.UnsupportedTokenizerModel;
+        }
+        if (g.getStringArray("tokenizer.ggml.tokens") == null) {
+            last_error_detail = "the GGUF file has no tokenizer.ggml.tokens array.";
+            return error.MissingTokens;
         }
         const tokens = g.getStringArray("tokenizer.ggml.tokens") orelse return error.MissingTokens;
 

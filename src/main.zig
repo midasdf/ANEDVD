@@ -511,11 +511,18 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     }
 
     sys.print("loading {s}\n", .{path});
-    var loaded = try model_open.open(allocator, path, .{
+    var loaded = model_open.open(allocator, path, .{
         .progress = true,
         .rope_hf = rope_hf,
         .rope_adjacent = rope_adj,
-    });
+    }) catch |e| {
+        if (e == error.UnsupportedTokenizerModel or e == error.MissingTokens) {
+            if (tokenizer_mod.Tokenizer.last_error_detail) |detail| {
+                sys.eprint("cannot load {s}: {s}\n", .{ path, detail });
+            }
+        }
+        return e;
+    };
     defer loaded.deinit();
     const cfg = loaded.config;
     sys.print("  {s} ({s}): hidden={d} layers={d} heads={d}/{d} head_dim={d} inter={d} vocab={d} eps={e} rope_theta={d}\n", .{
@@ -899,7 +906,14 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     if (rope_adj) mw.config.rope_adjacent = true;
     const cfg = mw.config;
     var tok_guard: ?*gguf.Gguf = null;
-    var tok = try openTokenizer(allocator, model_path, &tok_guard);
+    var tok = openTokenizer(allocator, model_path, &tok_guard) catch |e| {
+        if ((e == error.UnsupportedTokenizerModel or e == error.MissingTokens) and
+            tokenizer_mod.Tokenizer.last_error_detail != null)
+        {
+            sys.eprint("cannot load {s}:\n  {s}\n", .{ model_path, tokenizer_mod.Tokenizer.last_error_detail.? });
+        }
+        return e;
+    };
     defer tok.deinit();
     defer closeTokenizerGuard(allocator, tok_guard);
     sys.print("cpu reference: {s} hidden={d} layers={d} heads={d}/{d} rope_adjacent={}\n", .{

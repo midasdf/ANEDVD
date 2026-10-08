@@ -18,6 +18,22 @@ pub const Error = error{
     UnsupportedQuantization,
 };
 
+/// Architectures this loader has been exercised on, or that share their GGUF
+/// layout exactly (the same `*.block_count` config keys and `blk.N.*` tensor
+/// names). Anything else is accepted but warned about, because a wrong
+/// architecture guess produces fluent nonsense rather than an error.
+pub const known_architectures = [_][]const u8{
+    "llama",    "qwen2",   "qwen3",    "mistral",   "smollm",
+    "smollm2",  "smollm3", "qwen2moe", "qwen3moe",  "granite",
+    "stablelm", "olmo",    "olmo2",    "phi3",      "gemma",
+    "gemma2",   "gemma3",  "gptneox",  "internlm2",
+};
+
+pub fn isKnownArchitecture(arch: []const u8) bool {
+    for (known_architectures) |a| if (std.mem.eql(u8, arch, a)) return true;
+    return false;
+}
+
 /// Architectures whose HF implementation uses `rotate_half` (half-split RoPE).
 /// llama.cpp selects `LLAMA_ROPE_TYPE_NEOX` for these; everything else uses the
 /// adjacent-pair layout, which is also the layout `convert_hf_to_gguf.py`
@@ -62,6 +78,16 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     cfg.tie_embeddings = g.tensor("output.weight") == null;
     cfg.rope_adjacent = ropeIsAdjacent(arch);
     try cfg.validate();
+
+    // A wrong guess here is silent: the model still runs and produces fluent
+    // text. Say so once, loudly enough to be seen in a log.
+    if (!isKnownArchitecture(arch)) {
+        sys.eprint("warning: architecture \"{s}\" is not one this loader has been tested with.\n", .{arch});
+        sys.eprint("  Treating it like llama: blk.N.* tensor names, RoPE {s}.\n", .{
+            if (cfg.rope_adjacent) "adjacent-pair" else "half-split",
+        });
+        sys.eprint("  If the output is fluent nonsense, force the other convention with --rope-hf / --rope-adjacent.\n", .{});
+    }
     return cfg;
 }
 

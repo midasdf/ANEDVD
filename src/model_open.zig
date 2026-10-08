@@ -75,8 +75,31 @@ fn applyRopeOverrides(cfg: *model.Config, opts: Options) void {
 }
 
 pub fn open(allocator: std.mem.Allocator, path: []const u8, opts: Options) !Loaded {
-    if (isGguf(path)) return openGguf(allocator, path, opts);
-    return openHf(allocator, path, opts);
+    // Report a helpful reason rather than a bare error name: an unsupported
+    // tokenizer is the most common way a real model fails to load, and the fix
+    // ("this file is SentencePiece; use a GPT-2-vocabulary model") is not
+    // guessable from `error.UnsupportedTokenizerModel`.
+    return if (isGguf(path))
+        openGguf(allocator, path, opts) catch |e| explain(path, e)
+    else
+        openHf(allocator, path, opts) catch |e| explain(path, e);
+}
+
+fn explain(path: []const u8, e: anyerror) anyerror {
+    switch (e) {
+        error.UnsupportedTokenizerModel, error.MissingTokens => {
+            if (tokenizer_mod.Tokenizer.last_error_detail) |detail| {
+                sys.eprint("cannot load {s}:\n  {s}\n", .{ path, detail });
+            } else {
+                sys.eprint("cannot load {s}: the tokenizer format is not supported.\n", .{path});
+            }
+        },
+        error.UnsupportedArchitecture => {
+            sys.eprint("cannot load {s}: unsupported architecture (see src/hf.zig for the list).\n", .{path});
+        },
+        else => {},
+    }
+    return e;
 }
 
 fn openGguf(allocator: std.mem.Allocator, path: []const u8, opts: Options) !Loaded {
