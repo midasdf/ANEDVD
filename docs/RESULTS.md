@@ -377,6 +377,32 @@ log line ("dropped 2967 leading prompt tokens (5010 sent, 2043 used) to fit the
 2048-token context"), a `prompt_tokens_dropped` field in the OpenAI `usage` object
 on both the streaming and non-streaming paths, and a status line in the WebUI.
 
+## MoE support
+
+Qwen2MoE runs end to end on the real 9.5 GB Qwen1.5-MoE-A2.7B-Chat Q4_K_M:
+
+| prompt | output |
+|---|---|
+| The capital of France is | Paris |
+| 2 + 2 = | 4 |
+| The sun rises in the | east |
+
+The routing, the top-k experts and the shared expert are verified against an
+independent Python forward (`tools/moe_reference.py`) on the tiny-random checkpoint:
+identical top-5 ids and logits matching to six decimals.
+
+Three things were missing when this started, and each produced plausible rather than
+broken output:
+
+1. The routed experts never reached the engine — `LayerSource.load` returns
+   `Matrices`, which had no field for them.
+2. Prefill had no routing at all, so a prompt's routed-expert contribution was absent.
+3. The shared expert's `sigmoid(gate . h)` scale was applied nowhere, because the ANE
+   kernel cannot express a 1-wide projection plus a sigmoid.
+
+Speed is the caveat and it is severe: ~35 s/token, 89% of it the CPU expert matmuls.
+`research/moe-design.md` records the measurements.
+
 ## Server liveness during a long prefill
 
 The mid-generation hook that keeps `/health` answerable only ran between decode
