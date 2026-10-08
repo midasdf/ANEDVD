@@ -705,8 +705,19 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         ab = true;
     };
     if (ab) {
+        // Both paths return the engine's internal logits buffer, so the first
+        // result must be COPIED before the second run overwrites it. Comparing
+        // the two slices directly compares a buffer with itself and always
+        // reports zero -- which is exactly how the prefill attention layout bug
+        // survived an "A/B bit-identical" claim.
         var seq_logits: []f32 = undefined;
-        for (ids, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
+        for (ids, 0..) |id, pos| {
+            const l = try eng.forward(id, @intCast(pos));
+            if (pos + 1 == ids.len) {
+                seq_logits = try allocator.dupe(f32, l);
+            }
+        }
+        defer allocator.free(seq_logits);
         const batch_logits = try eng.prefill(ids, 0);
         var max_d: f32 = 0;
         var argmax_seq: u32 = 0;
@@ -716,7 +727,12 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
             if (a > seq_logits[argmax_seq]) argmax_seq = @intCast(i);
             if (b > batch_logits[argmax_batch]) argmax_batch = @intCast(i);
         }
-        sys.print("A/B sequential vs batched: max|diff| = {e:.6}, argmax {d} vs {d}\n", .{ max_d, argmax_seq, argmax_batch });
+        sys.print("A/B sequential vs batched: max|diff| = {e:.6}, argmax {d} vs {d} ({s})\n", .{
+            max_d,
+            argmax_seq,
+            argmax_batch,
+            if (max_d < 1e-3 and argmax_seq == argmax_batch) "ok" else "MISMATCH",
+        });
     }
 
     // Generation goes through the shared session so the CLI, the HTTP API and
@@ -733,17 +749,16 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     var samples = std.ArrayList(f64).empty;
     defer samples.deinit(allocator);
     var stats: generate_mod.Stats = .{};
-    var t_gen0 = sys.nowNs();
-    var t_end = t_gen0;
-    for (0..repeat) |rep| {
+    // Wall clock of the whole generation phase. This used to be overwritten with
+    // the last iteration's end time, which made it zero for --repeat 1 and made
+    // the "ANE share of wall time" line print 0%.
+    const t_gen0 = sys.nowNs();
+    for (0..repeat) |_| {
         session.reset();
-        const t0 = sys.nowNs();
         stats = try session.generate(ids, params, .{ .func = if (repeat == 1) stdoutEmit else nullEmit });
-        t_end = sys.nowNs();
-        _ = t0;
-        if (rep + 1 == repeat) t_gen0 = t_end;
         try samples.append(allocator, stats.decodeToksPerSec());
     }
+    const t_end = sys.nowNs();
     if (repeat > 1) {
         std.mem.sort(f64, samples.items, {}, comptime std.sort.asc(f64));
         const median = samples.items[samples.items.len / 2];

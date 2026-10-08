@@ -134,6 +134,8 @@ pub const Engine = struct {
     sa: []f32,
 
     stats: Stats = .{},
+    /// Number of layers actually executed (all of them; see stopAfterLayer).
+    active_layers: u32 = 0,
 
     pub fn deinit(self: *Engine) void {
         for (self.kernels) |*k| {
@@ -493,6 +495,7 @@ pub const Engine = struct {
                     self.attn[0..],
                     self.qkv[0..],
                     ch,
+                    1,
                     self.k_cache[li],
                     self.v_cache[li],
                     @as(usize, base_pos) + n,
@@ -502,6 +505,8 @@ pub const Engine = struct {
                     cfg.kv_heads,
                     cfg.head_dim,
                     self.scores,
+                    self.sq,
+                    self.sa,
                 );
                 self.stats.pf_attn_ns += sys.nowNs() - ta0;
 
@@ -653,6 +658,18 @@ pub const Engine = struct {
         for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
         cpu.matmulF16(ref, self.head, h32[0..hidden], cfg.vocab, hidden);
         reportKernel("lm_head", self.logits, ref);
+    }
+
+    /// Run only the first `n` layers, then the final norm and lm head. Used to
+    /// bisect a model that produces garbage: the logits at each depth show
+    /// where it first goes wrong.
+    pub fn stopAfterLayer(self: *Engine, n: u32) !void {
+        if (n == 0 or n > self.kernels.len) return error.InvalidLayerCount;
+        // The prefill/forward loops iterate over self.kernels, so a prefix view
+        // is enough: the head kernel still runs at the end.
+        self.kernels = self.kernels[0..n];
+        self.norms = self.norms[0..n];
+        self.active_layers = n;
     }
 
     /// Forget the KV cache (start a new conversation).
@@ -882,15 +899,27 @@ test "batched prefill and per-token decode agree (needs the ANE)" {
     defer eng.deinit();
 
     const ids = [_]u32{ 3, 7, 11, 19 };
-    var seq_logits: []const f32 = &.{};
-    for (ids, 0..) |id, pos| seq_logits = try eng.forward(id, @intCast(pos));
+
+    // forward() and prefill() both return the engine's internal logits slice,
+    // so the sequential result has to be copied out before prefill runs. The
+    // first version of this test compared the two slices directly, i.e. a
+    // buffer with itself, and passed no matter what prefill computed.
+    var seq_copy: []f32 = &.{};
+    for (ids, 0..) |id, pos| {
+        const l = try eng.forward(id, @intCast(pos));
+        if (pos + 1 == ids.len) {
+            seq_copy = try a.dupe(f32, l);
+            try std.testing.expectEqual(@as(usize, 128), seq_copy.len);
+        }
+    }
+    defer a.free(seq_copy);
     var finite: usize = 0;
-    for (seq_logits) |v| if (std.math.isFinite(v)) {
+    for (seq_copy) |v| if (std.math.isFinite(v)) {
         finite += 1;
     };
-    try std.testing.expectEqual(seq_logits.len, finite);
+    try std.testing.expectEqual(seq_copy.len, finite);
 
     // Same prompt through the batched path must give the same logits.
     const batch = try eng.prefill(&ids, 0);
-    for (seq_logits, batch) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
+    for (seq_copy, batch) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
 }

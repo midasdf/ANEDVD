@@ -126,9 +126,14 @@ fn axpyF16(out: []f32, v: []const f16, weight: f32) void {
 
 /// Multi-query attention for a chunk of prompt positions.
 ///
-/// `q` holds `n_q * n_heads * head_dim` values laid out as [position][head][dim]
-/// (stride `q_stride` in f32 elements), the KV cache is `n_past` entries of
-/// `n_kv_heads * head_dim`, and `out` has the same layout as `q`.
+/// `q` and `out` use the engine's channel-major activation layout: element
+/// (channel, column) lives at `base[channel * chan_stride + col * col_stride]`.
+/// A channel is `head * head_dim + dim`, so query `qi` head `h` dim `d` is at
+/// `q[(h * head_dim + d) * chan_stride + (q_pos0 + qi) * col_stride]`.
+///
+/// Getting this wrong is silent: reading the buffer as position-major returns
+/// plausible-looking numbers, and an earlier version of the A/B check compared
+/// the batched output against itself, so nothing caught it.
 ///
 /// The per-position path calls `attentionDecode` n_q times, which re-walks the
 /// whole cache for every query — at 1000 prompt tokens that is 1000x more work
@@ -137,7 +142,8 @@ fn axpyF16(out: []f32, v: []const f16, weight: f32) void {
 pub fn attentionPrefill(
     out: []f32,
     q: []const f32,
-    q_stride: usize,
+    chan_stride: usize,
+    col_stride: usize,
     k_cache: []const f16,
     v_cache: []const f16,
     n_past: usize,
@@ -147,31 +153,37 @@ pub fn attentionPrefill(
     n_kv_heads: u32,
     head_dim: u32,
     scores: []f32,
+    query_scratch: []f32,
+    out_scratch: []f32,
 ) void {
     const hd: usize = head_dim;
     const kv_dim: usize = @as(usize, n_kv_heads) * hd;
     const group = n_heads / n_kv_heads;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     std.debug.assert(scores.len >= n_past);
+    std.debug.assert(query_scratch.len >= hd and out_scratch.len >= hd);
 
     for (0..n_q) |qi| {
         const pos = q_pos0 + qi;
         const visible = @min(n_past, pos + 1);
+        const col = qi * col_stride;
         for (0..n_heads) |h| {
             const kvh = h / group;
-            const q_h = q[qi * q_stride + h * hd ..][0..hd];
+            const base = h * hd * chan_stride + col;
+            for (0..hd) |d| query_scratch[d] = q[base + d * chan_stride];
+            const q_h = query_scratch[0..hd];
             const sc = scores[0..visible];
             for (0..visible) |t| {
                 const k_t = k_cache[t * kv_dim + kvh * hd ..][0..hd];
                 sc[t] = dotF32F16(q_h, k_t) * scale;
             }
             softmax(sc);
-            const o_h = out[qi * q_stride + h * hd ..][0..hd];
-            @memset(o_h, 0);
+            @memset(out_scratch[0..hd], 0);
             for (0..visible) |t| {
                 const v_t = v_cache[t * kv_dim + kvh * hd ..][0..hd];
-                axpyF16(o_h, v_t, sc[t]);
+                axpyF16(out_scratch[0..hd], v_t, sc[t]);
             }
+            for (0..hd) |d| out[base + d * chan_stride] = out_scratch[d];
         }
     }
 }
@@ -606,11 +618,15 @@ test "attentionPrefill matches attentionDecode for a single query" {
         x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
     }
     var a: [heads * hd]f32 = undefined;
+    // Channel-major with one column.
     var b: [heads * hd]f32 = undefined;
     var scratch: [8]f32 = undefined;
-    // Query at position 2 sees all three cached entries.
+    var qs: [heads * hd]f32 = undefined;
+    var os: [heads * hd]f32 = undefined;
+    // Query at position 2 sees all three cached entries. One column, so the
+    // channel-major buffer is just [channel * 1 + 0] = plain channel order.
     attentionDecode(&a, &q, &k, &v, 3, heads, kv_heads, hd, &scratch);
-    attentionPrefill(&b, &q, heads * hd, &k, &v, n_past, 1, 2, heads, kv_heads, hd, &scratch);
+    attentionPrefill(&b, &q, 1, 1, &k, &v, n_past, 1, 2, heads, kv_heads, hd, &scratch, &qs, &os);
     for (a, b) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
 }
 
@@ -622,12 +638,17 @@ test "attentionPrefill honours the causal mask" {
     const k = [_]f16{ 1, 0, 1, 0 };
     const v = [_]f16{ 10, 10, 0, 0 };
     // Two queries: position 0 may only see entry 0, position 1 sees both.
-    const q = [_]f32{ 1, 0, 1, 0 };
+    // Channel-major [channel * 2 + column]: column 0 = (1,0), column 1 = (1,0).
+    const q = [_]f32{ 1, 1, 0, 0 };
     var out: [2 * 2]f32 = undefined;
     var scratch: [4]f32 = undefined;
-    attentionPrefill(&out, &q, hd, &k, &v, 2, 2, 0, heads, kv_heads, hd, &scratch);
+    var qs: [2]f32 = undefined;
+    var os: [2]f32 = undefined;
+    attentionPrefill(&out, &q, 2, 1, &k, &v, 2, 2, 0, heads, kv_heads, hd, &scratch, &qs, &os);
+    // Column 0 of the output (channel 0, column 0) sees only cache entry 0.
     try std.testing.expectApproxEqAbs(@as(f32, 10), out[0], 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 5), out[2], 1e-3);
+    // Column 1 sees both entries, so the mean of v (10 and 0) on channel 0.
+    try std.testing.expectApproxEqAbs(@as(f32, 5), out[1], 1e-3);
 }
 
 test "dotF32 matches a scalar dot product" {
