@@ -1328,10 +1328,53 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
     else
         0;
     sys.print("CPU attention at ctx={d} (heads {d}/{d}, head_dim {d})\n", .{ ctx, heads, kv_heads, hd });
-    sys.print("  full        {d:>9.1} us\n", .{full_us});
-    sys.print("  dot only    {d:>9.1} us  ({d:.0}%)\n", .{ dot_us, 100.0 * dot_us / full_us });
-    sys.print("  softmax     {d:>9.1} us  ({d:.0}%)\n", .{ soft_us, 100.0 * soft_us / full_us });
-    sys.print("  AV + rest   {d:>9.1} us  ({d:.0}%)\n", .{ rest_us, 100.0 * rest_us / full_us });
+    sys.print("  decode (1 query)\n", .{});
+    sys.print("    full        {d:>9.1} us\n", .{full_us});
+    sys.print("    dot only    {d:>9.1} us  ({d:.0}%)\n", .{ dot_us, 100.0 * dot_us / full_us });
+    sys.print("    softmax     {d:>9.1} us  ({d:.0}%)\n", .{ soft_us, 100.0 * soft_us / full_us });
+    sys.print("    AV + rest   {d:>9.1} us  ({d:.0}%)\n", .{ rest_us, 100.0 * rest_us / full_us });
+
+    // Prefill attention over a whole chunk. This is the phase that dominates
+    // prefill (measured at 92% of it, ~3.2 ms per prompt token on Qwen2.5-0.5B),
+    // and the decode numbers above say nothing about it: the chunk path reads
+    // the same K/V for every query position in the chunk, so it is far more
+    // memory intensive than the single-query case.
+    const chunk: usize = argValue(argv, "--chunk", 128);
+    const n_q = @min(chunk, ctx);
+    const q_buf = try allocator.alloc(f32, @as(usize, heads) * hd * n_q);
+    defer allocator.free(q_buf);
+    const out_buf = try allocator.alloc(f32, @as(usize, heads) * hd * n_q);
+    defer allocator.free(out_buf);
+    const qs = try allocator.alloc(f32, hd);
+    defer allocator.free(qs);
+    const os_buf = try allocator.alloc(f32, hd);
+    defer allocator.free(os_buf);
+    for (q_buf) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+    }
+
+    cpu.attentionPrefill(out_buf, q_buf, n_q, 1, k, v, ctx, n_q, ctx - n_q, heads, kv_heads, hd, scores, qs, os_buf);
+    const pf_iters: u32 = @max(1, iters / 8);
+    t0 = sys.nowNs();
+    for (0..pf_iters) |_| {
+        cpu.attentionPrefill(out_buf, q_buf, n_q, 1, k, v, ctx, n_q, ctx - n_q, heads, kv_heads, hd, scores, qs, os_buf);
+    }
+    const pf_ns = (sys.nowNs() - t0) / pf_iters;
+
+    // Bytes the chunk path must read: for every query position and every head,
+    // the whole visible K and V for that head's kv group.
+    var total_pairs: usize = 0;
+    for (0..n_q) |qi| total_pairs += (ctx - n_q) + qi + 1;
+    const bytes_per_pair: usize = @as(usize, heads) * hd * 2 * 2; // k and v, fp16
+    const gbps = if (pf_ns > 0)
+        @as(f64, @floatFromInt(total_pairs * bytes_per_pair)) / @as(f64, @floatFromInt(pf_ns))
+    else
+        0;
+    const pf_us = @as(f64, @floatFromInt(pf_ns)) / 1000.0;
+    sys.print("  prefill ({d} queries, {d} past)\n", .{ n_q, ctx - n_q });
+    sys.print("    full        {d:>9.1} us  = {d:.2} us/query\n", .{ pf_us, pf_us / @as(f64, @floatFromInt(n_q)) });
+    sys.print("    K/V read    {d:>9.1} GB/s implied\n", .{gbps});
 }
 
 /// Time each of a real model's layer-0 kernels individually and report the
