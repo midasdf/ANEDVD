@@ -476,6 +476,45 @@ pub const Gguf = struct {
         return all[@as(usize, expert) * per ..][0..per];
     }
 
+    /// Dequantise ONE expert of a stacked expert tensor into `out` as fp16.
+    ///
+    /// This is the streaming path: it touches only that expert's bytes, so the
+    /// other `n_experts - 1` never become resident. On Qwen1.5-MoE (9.5 GB file,
+    /// 8 GB machine) the eager alternative cannot run at all.
+    ///
+    /// The expert is a contiguous 1/n slice of the payload because the expert axis
+    /// is ggml's slowest, and the slice starts on a block boundary since every
+    /// block size divides the per-expert element count.
+    pub fn readExpertF16(
+        self: *const Gguf,
+        name: []const u8,
+        expert: u32,
+        n_experts: u32,
+        out: []f16,
+    ) !void {
+        const t = self.tensor(name) orelse return error.TensorNotFound;
+        const per_expert: u64 = @as(u64, @intCast(out.len));
+        if (t.elemCount() != per_expert * n_experts) return error.DimensionMismatch;
+        const epb = t.ttype.blockElems() orelse return error.UnsupportedType;
+        if (per_expert % epb != 0) return error.InvalidTensorShape;
+        const bpb = t.ttype.blockBytes() orelse return error.UnsupportedType;
+        const per_bytes = per_expert / epb * bpb;
+
+        const start = self.tensor_data_offset + t.offset + @as(u64, expert) * per_bytes;
+        const end = start + per_bytes;
+        if (end > self.data.len) return error.TensorDataOutOfRange;
+        const src = self.data[@intCast(start)..@intCast(end)];
+
+        var buf: [2048]f32 = undefined;
+        var done: usize = 0;
+        while (done < out.len) {
+            const m = @min(buf.len, out.len - done);
+            try dequantizeRange(t.ttype, src, done, buf[0..m]);
+            for (buf[0..m], 0..) |v, k| out[done + k] = @floatCast(v);
+            done += m;
+        }
+    }
+
     pub fn readF16(self: *const Gguf, allocator: Allocator, name: []const u8) ![]f16 {
         const t = self.tensor(name) orelse return error.TensorNotFound;
         const n = t.elemCount();

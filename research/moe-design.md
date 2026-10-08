@@ -118,6 +118,49 @@ Python  top5 ids: 103920 101469 145307 109789 147842
 chosen token ids and prints this summary, so the comparison is numeric rather than
 by eyeballing generated text.
 
-Not yet done: GGUF MoE (metadata is read, the 3-D expert tensors are not consumed),
-and running the experts on the ANE at all — see the arithmetic above for why that
-is the wrong target.
+## Measured limits on this machine (A18 Pro, 8 GB, macOS 27)
+
+Qwen1.5-MoE-A2.7B Q4_K_M is 9.5 GB on disk. Dequantised to fp16 it is ~33 GB, so
+the eager loader cannot run it here at all (26.6 GB for the experts alone, one
+layer being 1.11 GB). `Gguf.readExpertF16` streams one expert out of the mapped
+file instead, touching only its own bytes.
+
+Measured on the real file, reading `blk.0.ffn_gate_exps` (60 experts of 2048x1408):
+
+| | |
+|---|---|
+| all 60 experts, cold | 1.54 s, 225 MB/s |
+| top-4 experts per token, warm | 105 ms/token, 219 MB/s |
+
+So the rate is the same cold and warm, which says the bottleneck is **not** page
+faults or disk: it is the scalar dequantiser. The GGUF dequantisers are bit-exact
+against ggml (verified by the fixture cross-check) but they process one value at a
+time.
+
+That makes the full model impractical as written: ~1.66 GB of fp16 expert output
+per token across 24 layers, at ~220 MB/s, is **7.6 s/token**. Correct, and far from
+useful.
+
+What would change it, in the order the numbers suggest:
+
+1. **SIMD dequantisation.** 220 MB/s for scalar block dequantisation is the wall.
+   This is the single highest-value change and it helps the dense GGUF path too.
+2. **Keep hot experts resident.** This is exactly what Strata does — experts no card
+   holds are page-locked in RAM and only cold ones are `pread`. A routing histogram
+   over a few hundred tokens would say whether 1.5 GB of experts covers most of the
+   traffic.
+3. **Batch prefill.** One expert read then serves every token in a chunk that
+   routes to it, so prompt processing amortises the read over 128 positions instead
+   of one.
+
+## Status
+
+- **Verified**: safetensors Qwen2MoE, end to end, against an independent Python
+  reference (identical top-5 ids, logits to six decimals).
+- **Implemented, config verified against a real 9.5 GB file**: GGUF MoE metadata
+  and expert tensors. Widths come from the tensor shapes, because the metadata
+  omits them (see the commit for the two bugs that caused).
+- **Implemented, measured, not yet fast**: streaming one expert at a time out of
+  the mapping. The rate above is the honest state.
+- **Not attempted**: running experts on the ANE. The arithmetic at the top of this
+  file is why.
