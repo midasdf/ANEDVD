@@ -931,3 +931,74 @@ test "batched prefill and per-token decode agree (needs the ANE)" {
     const batch = try eng.prefill(&ids, 0);
     for (seq_copy, batch) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
 }
+
+test "prefill calls the tick hook once per chunk (needs the ANE)" {
+    // The hook is what lets the server answer /health during a long prefill:
+    // without it a 6.4 s prefill left the server unresponsive for its whole
+    // duration. Assert it fires once per chunk, not once per request.
+    if (!ane.available()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    const cfg = model.Config{
+        .arch = "llama",
+        .hidden = 32,
+        .layers = 1,
+        .heads = 4,
+        .kv_heads = 2,
+        .head_dim = 8,
+        .inter = 64,
+        .vocab = 128,
+        .eps = 1e-5,
+        .rope_theta = 10000.0,
+        .rope_adjacent = false,
+    };
+    var mw = model.ModelWeights{ .allocator = a, .config = cfg };
+    defer mw.deinit();
+    mw.embed = try a.alloc(f16, @as(usize, cfg.vocab) * cfg.hidden);
+    mw.final_norm = try a.alloc(f32, cfg.hidden);
+    mw.layers = try a.alloc(model.LayerWeights, 1);
+    @memset(mw.layers, .{});
+    fillDeterministic(mw.embed, 1, 1.0);
+    fillDeterministicF32(mw.final_norm, 2, 1.0, 0.1);
+    {
+        const lw = &mw.layers[0];
+        lw.attn_norm = try a.alloc(f32, cfg.hidden);
+        lw.ffn_norm = try a.alloc(f32, cfg.hidden);
+        lw.qkv = try a.alloc(f16, @as(usize, cfg.qkvDim()) * cfg.hidden);
+        lw.o = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.qDim());
+        lw.gate = try a.alloc(f16, @as(usize, cfg.inter) * cfg.hidden);
+        lw.up = try a.alloc(f16, @as(usize, cfg.inter) * cfg.hidden);
+        lw.down = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.inter);
+        fillDeterministicF32(lw.attn_norm, 100, 1.0, 0.1);
+        fillDeterministicF32(lw.ffn_norm, 200, 1.0, 0.1);
+        fillDeterministic(lw.qkv, 300, 0.3);
+        fillDeterministic(lw.o, 400, 0.3);
+        fillDeterministic(lw.gate, 500, 0.3);
+        fillDeterministic(lw.up, 600, 0.3);
+        fillDeterministic(lw.down, 700, 0.3);
+    }
+    const rt = try mw.toRuntime(a);
+    var eng = try Engine.init(a, rt, mw.layerSource(), mw.headSource(rt.embed), .{
+        .max_seq = 64,
+        .verbose = false,
+        .chunk = 8,
+    });
+    defer eng.deinit();
+
+    const Ctx = struct {
+        fn tick(ctx: ?*anyopaque) void {
+            const n: *usize = @ptrCast(@alignCast(ctx.?));
+            n.* += 1;
+        }
+    };
+    var ticks: usize = 0;
+    eng.prefill_tick = Ctx.tick;
+    eng.prefill_tick_ctx = &ticks;
+
+    // 20 tokens at chunk 8 is 3 chunks (8 + 8 + 4).
+    const ids = try a.alloc(u32, 20);
+    defer a.free(ids);
+    @memset(ids, 1);
+    _ = try eng.prefill(ids, 0);
+    try std.testing.expectEqual(@as(usize, 3), ticks);
+}
