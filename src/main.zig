@@ -892,15 +892,16 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         if (std.mem.eql(u8, a, "--chat")) chat = true;
     }
 
-    var g = try gguf.Gguf.load(allocator, model_path);
-    defer g.deinit();
-    var tok = try tokenizer_mod.Tokenizer.fromGguf(allocator, &g);
-    defer tok.deinit();
-    var mw = try load_gguf.loadWeights(allocator, &g, false);
+    // Both formats, via the same loader `verify` uses for its reference.
+    var mw = try cloneForReference(allocator, model_path, std.math.maxInt(usize));
     defer mw.deinit();
     if (rope_hf) mw.config.rope_adjacent = false;
     if (rope_adj) mw.config.rope_adjacent = true;
     const cfg = mw.config;
+    var tok_guard: ?*gguf.Gguf = null;
+    var tok = try openTokenizer(allocator, model_path, &tok_guard);
+    defer tok.deinit();
+    defer closeTokenizerGuard(allocator, tok_guard);
     sys.print("cpu reference: {s} hidden={d} layers={d} heads={d}/{d} rope_adjacent={}\n", .{
         cfg.arch, cfg.hidden, cfg.layers, cfg.heads, cfg.kv_heads, cfg.rope_adjacent,
     });
@@ -1476,6 +1477,35 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const ok = rel < 0.05 and am_ane == am_cpu;
     sys.print("  RESULT: {s}\n", .{if (ok) "MATCH" else "MISMATCH"});
     if (!ok) std.process.exit(1);
+}
+
+/// Open the tokenizer for a model path, whichever format it is.
+///
+/// For GGUF this keeps the mapping open in `guard`: Tokenizer.fromGguf keeps
+/// slices into the mapped file for its vocabulary, so releasing the map here
+/// would leave the tokenizer pointing at unmapped memory (a segfault the moment
+/// it is used, which is how this was found).
+fn openTokenizer(allocator: std.mem.Allocator, path: []const u8, guard: *?*gguf.Gguf) !tokenizer_mod.Tokenizer {
+    guard.* = null;
+    if (std.mem.endsWith(u8, path, ".gguf")) {
+        const g = try allocator.create(gguf.Gguf);
+        errdefer allocator.destroy(g);
+        g.* = try gguf.Gguf.load(allocator, path);
+        errdefer g.deinit();
+        const tok = try tokenizer_mod.Tokenizer.fromGguf(allocator, g);
+        guard.* = g;
+        return tok;
+    }
+    const tok_path = try std.fs.path.join(allocator, &.{ path, "tokenizer.json" });
+    defer allocator.free(tok_path);
+    return tokenizer_mod.Tokenizer.fromTokenizerJson(allocator, tok_path);
+}
+
+fn closeTokenizerGuard(allocator: std.mem.Allocator, guard: ?*gguf.Gguf) void {
+    if (guard) |g| {
+        g.deinit();
+        allocator.destroy(g);
+    }
 }
 
 /// Load `cap` layers plus the runtime weights as an independent ModelWeights for
