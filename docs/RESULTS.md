@@ -36,12 +36,17 @@ Two regimes:
 Single runs are not trustworthy: the ANE's own per-token time varied 16.9-32.1 ms
 across identical invocations, so every number here comes from repeated runs.
 
-| model | prefill (short) | decode | peak RSS |
+| model | prefill (short) | decode (median of 9) | peak RSS |
 |---|---|---|---|
-| SmolLM2-135M GGUF Q8_0 | 400 tok/s | 31.7 tok/s | 297 MB |
-| SmolLM2-135M HF safetensors F16 | 371 tok/s | 32.5 tok/s | ~450 MB |
-| Qwen2.5-0.5B GGUF Q8_0 | 190 tok/s | 17.4 tok/s | 891 MB |
-| Qwen3-0.6B GGUF Q8_0 | 68-190 tok/s | 13.4 tok/s | ~1.1 GB |
+| SmolLM2-135M GGUF Q8_0 | 488 tok/s | 52.2 tok/s | 304 MB |
+| SmolLM2-135M HF safetensors F16 | 371 tok/s | 47.4 tok/s | ~450 MB |
+| Qwen2.5-0.5B GGUF Q8_0 | 190 tok/s | 22.7 tok/s | 1.0 GB |
+| Qwen3-0.6B GGUF Q8_0 | 146 tok/s | 17.1 tok/s | ~1.1 GB |
+| Qwen2.5-1.5B GGUF Q4_K_M | 28 tok/s | 9.5 tok/s | 1.6 GB |
+
+Decode ranges over 9 repeats are wide (SmolLM2: 32-57 tok/s, Qwen2.5-0.5B:
+21-26) because the ANE's own timing is unstable, which is why every number here
+is a repeated measurement.
 
 Prefill is faster with longer prompts because the ANE takes a whole chunk at
 once; Qwen2.5-0.5B:
@@ -292,7 +297,7 @@ range-reduced polynomial (worst case 4.1e-6 relative error):
 
 | prompt | before | after |
 |---|---|---|
-| 203 tokens | 500 tok/s | **683** |
+| 203 tokens | 500 tok/s | **698** |
 | 491 tokens | 337 tok/s | **453** |
 | 971 tokens | 172 tok/s | **289** |
 

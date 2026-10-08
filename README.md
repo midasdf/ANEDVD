@@ -44,18 +44,20 @@ decode: 40 tokens in 1.26 s (31.7 tok/s; ANE 88%, CPU 12%)
 ANE per-token split: qkv 0.20 ms, o 0.18 ms, ffn 0.24 ms, lm_head 1.65 ms
 ```
 
-Decode medians from `--repeat 5` (single runs vary by up to ±40% because the
-ANE's own time is not stable):
+Five model families run on the ANE. Decode is the median of 9 repeats; the range
+column is min..max, because the ANE's own timing varies a lot run to run and a
+single measurement is not a result:
 
-| model | params / format | prefill | decode | peak RSS |
+| model | params / format | decode | range | peak RSS |
 |---|---|---|---|---|
-| SmolLM2-135M-Instruct | 135 M, GGUF Q8_0 | 400 tok/s | **31.7 tok/s** | 297 MB |
-| SmolLM2-135M-Instruct | 135 M, HF safetensors F16 | 371 tok/s | **32.5 tok/s** | ~450 MB |
-| Qwen2.5-0.5B-Instruct | 494 M, GGUF Q8_0 | 190 tok/s | **17.4 tok/s** | 891 MB |
-| Qwen3-0.6B | 600 M, GGUF Q8_0 | 68–190 tok/s | **13.4 tok/s** | ~1.1 GB |
+| SmolLM2-135M-Instruct | 135 M, GGUF Q8_0 | **52.2 tok/s** | 32–57 | 304 MB |
+| SmolLM2-135M-Instruct | 135 M, HF safetensors F16 | **47.4 tok/s** | | ~450 MB |
+| Qwen2.5-0.5B-Instruct | 494 M, GGUF Q8_0 | **22.7 tok/s** | 21–26 | 1.0 GB |
+| Qwen3-0.6B | 600 M, GGUF Q8_0 | **17.1 tok/s** | | ~1.1 GB |
+| Qwen2.5-1.5B-Instruct | 1.5 B, GGUF Q4_K_M | **9.5 tok/s** | 9.2–9.6 | 1.6 GB |
 
 Long prompts prefill faster per token because the ANE is fed a whole chunk at a
-time: Qwen2.5-0.5B reaches 683 tok/s at 203 prompt tokens. Decode is at the
+time: Qwen2.5-0.5B reaches 698 tok/s at 203 prompt tokens. Decode is at the
 ANE's weight-bandwidth ceiling, so it barely changes with model size in
 relative terms; [`docs/RESULTS.md`](docs/RESULTS.md) has the full measurements,
 the per-kernel bandwidth table and the accuracy numbers.
