@@ -460,6 +460,22 @@ pub const Gguf = struct {
 
     /// Dequantizes tensor `name` into f16 (lossy for types wider than f16).
     /// The caller owns the result.
+    /// Bytes of ONE expert inside a stacked expert tensor.
+    ///
+    /// `blk.N.ffn_{gate,up,down}_exps` keeps its experts on the slowest axis, so
+    /// expert `e` of `n_experts` is the contiguous range `[e/n, (e+1)/n)` of the
+    /// tensor's payload. This is what makes expert streaming possible: a 9.5 GB
+    /// MoE cannot be resident on an 8 GB machine, but the four experts a token
+    /// actually routes to are a few MB, and they can be read without touching the
+    /// other 56.
+    pub fn expertBytes(self: *const Gguf, name: []const u8, expert: u32, n_experts: u32) ![]const u8 {
+        if (n_experts == 0 or expert >= n_experts) return error.InvalidTensorShape;
+        const all = try self.tensorBytes(self.tensor(name) orelse return error.TensorNotFound);
+        if (all.len % n_experts != 0) return error.InvalidTensorShape;
+        const per = all.len / n_experts;
+        return all[@as(usize, expert) * per ..][0..per];
+    }
+
     pub fn readF16(self: *const Gguf, allocator: Allocator, name: []const u8) ![]f16 {
         const t = self.tensor(name) orelse return error.TensorNotFound;
         const n = t.elemCount();
