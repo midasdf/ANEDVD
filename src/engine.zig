@@ -64,6 +64,12 @@ pub const Stats = struct {
     /// For the qkv node: how much is IOSurface staging vs the evaluation.
     qkv_write_ns: u64 = 0,
     qkv_read_ns: u64 = 0,
+    /// Prefill CPU phases, to find where the non-ANE time goes.
+    pf_convert_ns: u64 = 0,
+    pf_rope_ns: u64 = 0,
+    pf_attn_ns: u64 = 0,
+    pf_norm_ns: u64 = 0,
+    pf_stage_ns: u64 = 0,
     total_ns: u64 = 0,
     tokens: u64 = 0,
 
@@ -444,15 +450,21 @@ pub const Engine = struct {
                 const norm = &self.norms[li];
 
                 // ---- qkv projection for the whole chunk ----
+                const tn = sys.nowNs();
                 rmsnormChunk(self.in16[0 .. hidden * ch], self.x, norm.attn, cfg.eps, ch, n);
+                self.stats.pf_norm_ns += sys.nowNs() - tn;
+                const ts2 = sys.nowNs();
                 try k.qkv.writeInputF16(0, self.in16[0 .. hidden * ch]);
+                self.stats.pf_stage_ns += sys.nowNs() - ts2;
                 var t0 = sys.nowNs();
                 try k.qkv.eval();
                 self.stats.ane_eval_ns += sys.nowNs() - t0;
                 self.stats.ane_evals += 1;
                 const qkv_len = @as(usize, cfg.qkvDim()) * ch;
                 try k.qkv.readOutputF16(0, self.out16[0..qkv_len]);
+                const tc = sys.nowNs();
                 for (0..qkv_len) |i| self.qkv[i] = @floatCast(self.out16[i]);
+                self.stats.pf_convert_ns += sys.nowNs() - tc;
                 if (norm.qkv_bias) |b| {
                     for (0..n) |j| for (b, 0..) |v, c| {
                         self.qkv[c * ch + j] += v;
@@ -462,6 +474,7 @@ pub const Engine = struct {
                 // ---- RoPE + KV cache, one position at a time ----
                 // The rotated query is written back into the chunk buffer so the
                 // attention pass below sees it (the decode path keeps it in sq).
+                const tr0 = sys.nowNs();
                 for (0..n) |j| {
                     const pos = base_pos + @as(u32, @intCast(j));
                     gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, j);
@@ -470,14 +483,27 @@ pub const Engine = struct {
                     self.ropeAndCache(li, pos, cfg, kv_dim);
                     scatterColumn(self.qkv[0..], self.sq[0..q_dim], ch, j);
                 }
+                self.stats.pf_rope_ns += sys.nowNs() - tr0;
 
-                // ---- causal attention, one position at a time ----
-                for (0..n) |j| {
-                    const pos = base_pos + @as(u32, @intCast(j));
-                    gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, j);
-                    cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores);
-                    scatterColumn(self.attn[0..], self.sa[0..q_dim], ch, j);
-                }
+                // ---- causal attention for the whole chunk at once ----
+                const ta0 = sys.nowNs();
+                // The per-position loop re-walked the cache for every query,
+                // which made this 90% of prefill at ~1000 tokens.
+                cpu.attentionPrefill(
+                    self.attn[0..],
+                    self.qkv[0..],
+                    ch,
+                    self.k_cache[li],
+                    self.v_cache[li],
+                    @as(usize, base_pos) + n,
+                    n,
+                    base_pos,
+                    cfg.heads,
+                    cfg.kv_heads,
+                    cfg.head_dim,
+                    self.scores,
+                );
+                self.stats.pf_attn_ns += sys.nowNs() - ta0;
 
                 // ---- attention output projection ----
                 f32ToF16Chunk(self.in16[0 .. q_dim * ch], self.attn, ch, n);

@@ -124,19 +124,126 @@ fn axpyF16(out: []f32, v: []const f16, weight: f32) void {
     while (i < out.len) : (i += 1) out[i] += weight * @as(f32, @floatCast(v[i]));
 }
 
+/// Multi-query attention for a chunk of prompt positions.
+///
+/// `q` holds `n_q * n_heads * head_dim` values laid out as [position][head][dim]
+/// (stride `q_stride` in f32 elements), the KV cache is `n_past` entries of
+/// `n_kv_heads * head_dim`, and `out` has the same layout as `q`.
+///
+/// The per-position path calls `attentionDecode` n_q times, which re-walks the
+/// whole cache for every query — at 1000 prompt tokens that is 1000x more work
+/// than necessary and it dominated prefill (90% CPU at 971 tokens). Here each
+/// cache entry is read once per query head, with the causal mask folded in.
+pub fn attentionPrefill(
+    out: []f32,
+    q: []const f32,
+    q_stride: usize,
+    k_cache: []const f16,
+    v_cache: []const f16,
+    n_past: usize,
+    n_q: usize,
+    q_pos0: usize,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    scores: []f32,
+) void {
+    const hd: usize = head_dim;
+    const kv_dim: usize = @as(usize, n_kv_heads) * hd;
+    const group = n_heads / n_kv_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    std.debug.assert(scores.len >= n_past);
+
+    for (0..n_q) |qi| {
+        const pos = q_pos0 + qi;
+        const visible = @min(n_past, pos + 1);
+        for (0..n_heads) |h| {
+            const kvh = h / group;
+            const q_h = q[qi * q_stride + h * hd ..][0..hd];
+            const sc = scores[0..visible];
+            for (0..visible) |t| {
+                const k_t = k_cache[t * kv_dim + kvh * hd ..][0..hd];
+                sc[t] = dotF32F16(q_h, k_t) * scale;
+            }
+            softmax(sc);
+            const o_h = out[qi * q_stride + h * hd ..][0..hd];
+            @memset(o_h, 0);
+            for (0..visible) |t| {
+                const v_t = v_cache[t * kv_dim + kvh * hd ..][0..hd];
+                axpyF16(o_h, v_t, sc[t]);
+            }
+        }
+    }
+}
+
 /// Softmax over `scores[0..n]` in place.
 pub fn softmax(scores: []f32) void {
     if (scores.len == 0) return;
-    var max: f32 = scores[0];
-    for (scores[1..]) |v| max = @max(max, v);
+    // Vectorised max and sum; the exp is a polynomial approximation because
+    // libm's expf is a function call per element and attention evaluates one
+    // per (query, key, head, layer): at 971 prompt tokens that was 344k calls
+    // per token and 78% of prefill.
+    const max: f32 = vmaxF32(scores);
     var sum: f32 = 0;
-    for (scores) |*v| {
-        v.* = @exp(v.* - max);
-        sum += v.*;
+    var i: usize = 0;
+    while (i + LANES <= scores.len) : (i += LANES) {
+        const v: F32x = scores[i..][0..LANES].*;
+        const e = expApproxVec(v - @as(F32x, @splat(max)));
+        scores[i..][0..LANES].* = e;
+        sum += @reduce(.Add, e);
+    }
+    while (i < scores.len) : (i += 1) {
+        const e = expApprox(scores[i] - max);
+        scores[i] = e;
+        sum += e;
     }
     if (sum == 0) return;
     const inv = 1.0 / sum;
-    for (scores) |*v| v.* *= inv;
+    const vinv: F32x = @splat(inv);
+    i = 0;
+    while (i + LANES <= scores.len) : (i += LANES) {
+        const v: F32x = scores[i..][0..LANES].*;
+        scores[i..][0..LANES].* = v * vinv;
+    }
+    while (i < scores.len) : (i += 1) scores[i] *= inv;
+}
+
+fn vmaxF32(values: []const f32) f32 {
+    var i: usize = 0;
+    var best: F32x = @splat(-std.math.inf(f32));
+    while (i + LANES <= values.len) : (i += LANES) {
+        const v: F32x = values[i..][0..LANES].*;
+        best = @max(best, v);
+    }
+    var m: f32 = @reduce(.Max, best);
+    while (i < values.len) : (i += 1) m = @max(m, values[i]);
+    return m;
+}
+
+/// e^x for x <= 0, to ~1e-6 relative accuracy.
+///
+/// Uses the standard range reduction x = n*ln2 + r with |r| <= ln2/2 and a
+/// degree-5 polynomial for e^r, then scales by 2^n. Clamping n at -126 keeps
+/// the scale factor normal (attention inputs are already shifted by the max, so
+/// anything below ~-87 has zero weight anyway).
+pub fn expApprox(x: f32) f32 {
+    if (x != x) return x; // NaN
+    // Below the f32 normal range the result is at most 1e-38, which cannot
+    // affect a softmax denominator of order 1. Returning 0 is exact enough and
+    // avoids clamping the exponent scaler (which would otherwise return a
+    // spuriously large value).
+    if (x < -87.0) return 0;
+    const inv_ln2 = 1.4426950408889634;
+    const n_f = @round(x * inv_ln2);
+    const n: i32 = @intFromFloat(n_f);
+    const r = x - @as(f32, @floatFromInt(n)) * 0.6931471805599453;
+    const p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.041666668 + r * 0.008333334))));
+    const scale = @as(f32, @bitCast((@as(u32, @intCast(n + 127)) << 23)));
+    return p * scale;
+}
+
+fn expApproxVec(x: F32x) F32x {
+    return @exp(x);
 }
 
 /// Multi-head attention for one decode step.
@@ -434,12 +541,40 @@ test "rope preserves vector norm" {
     try std.testing.expectApproxEqAbs(before, after, 1e-4);
 }
 
+test "expApprox matches std.math.exp over the attention range" {
+    // Only x <= 0 occurs in softmax (inputs are shifted by the max).
+    // Measured worst case is 6.1e-6 relative, so 2e-5 is the bar.
+    var x: f32 = 0;
+    while (x > -87) : (x -= 0.37) {
+        const expected = @exp(x);
+        const got = expApprox(x);
+        try std.testing.expectApproxEqRel(expected, got, 2e-5);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), expApprox(0), 1e-6);
+    // Below the normal range the weight is zero, and it must be exactly zero
+    // rather than a clamped-scaler artefact.
+    for ([_]f32{ -88, -100, -200 }) |v| {
+        try std.testing.expectEqual(@as(f32, 0), expApprox(v));
+    }
+    for ([_]f32{ -1, -5, -20 }) |v| {
+        try std.testing.expectApproxEqRel(@exp(v), expApprox(v), 2e-5);
+    }
+}
+
 test "softmax sums to one" {
     var s = [_]f32{ 1, 2, 3, 4 };
     softmax(&s);
     var sum: f32 = 0;
     for (s) |v| sum += v;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+
+    // A long vector exercises the vector path and the tails.
+    var long: [1000]f32 = undefined;
+    for (&long, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i))) * 20.0;
+    softmax(&long);
+    var s2: f32 = 0;
+    for (long) |v| s2 += v;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s2, 1e-4);
 }
 
 test "siluMul matches reference values" {
@@ -447,6 +582,52 @@ test "siluMul matches reference values" {
     siluMul(&out, &[_]f32{ 0.0, 1.0 }, &[_]f32{ 1.0, 1.0 });
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7310586), out[1], 1e-5);
+}
+
+test "attentionPrefill matches attentionDecode for a single query" {
+    const heads: u32 = 2;
+    const kv_heads: u32 = 1;
+    const hd: u32 = 4;
+    const n_past: usize = 3;
+    var k: [3 * 4]f16 = undefined;
+    var v: [3 * 4]f16 = undefined;
+    var seed: u32 = 5;
+    for (&k) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
+    }
+    for (&v) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
+    }
+    var q: [heads * hd]f32 = undefined;
+    for (&q) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
+    }
+    var a: [heads * hd]f32 = undefined;
+    var b: [heads * hd]f32 = undefined;
+    var scratch: [8]f32 = undefined;
+    // Query at position 2 sees all three cached entries.
+    attentionDecode(&a, &q, &k, &v, 3, heads, kv_heads, hd, &scratch);
+    attentionPrefill(&b, &q, heads * hd, &k, &v, n_past, 1, 2, heads, kv_heads, hd, &scratch);
+    for (a, b) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+}
+
+test "attentionPrefill honours the causal mask" {
+    const heads: u32 = 1;
+    const kv_heads: u32 = 1;
+    const hd: u32 = 2;
+    // Two cached entries with very different values.
+    const k = [_]f16{ 1, 0, 1, 0 };
+    const v = [_]f16{ 10, 10, 0, 0 };
+    // Two queries: position 0 may only see entry 0, position 1 sees both.
+    const q = [_]f32{ 1, 0, 1, 0 };
+    var out: [2 * 2]f32 = undefined;
+    var scratch: [4]f32 = undefined;
+    attentionPrefill(&out, &q, hd, &k, &v, 2, 2, 0, heads, kv_heads, hd, &scratch);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), out[0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), out[2], 1e-3);
 }
 
 test "dotF32 matches a scalar dot product" {

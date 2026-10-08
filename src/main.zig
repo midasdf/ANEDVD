@@ -761,10 +761,12 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     const total_wall = t_end - t_gen0;
     sys.print("stop: {s}\n", .{stats.stop_reason.toString()});
-    sys.print("prefill: {d} tokens in {d:.2} s ({d:.1} tok/s)\n", .{
+    sys.print("prefill: {d} tokens in {d:.2} s ({d:.1} tok/s; ANE {d:.2} s, CPU {d:.2} s)\n", .{
         stats.prompt_tokens,
         @as(f64, @floatFromInt(stats.prefill_ns)) / 1e9,
         if (stats.prefill_ns > 0) @as(f64, @floatFromInt(stats.prompt_tokens)) / (@as(f64, @floatFromInt(stats.prefill_ns)) / 1e9) else 0,
+        @as(f64, @floatFromInt(stats.prefill_ane_ns)) / 1e9,
+        @as(f64, @floatFromInt(stats.prefill_ns -| stats.prefill_ane_ns)) / 1e9,
     });
     sys.print("decode: {d} tokens in {d:.2} s ({d:.1} tok/s; ANE {d:.0}%, CPU {d:.0}%)\n", .{
         stats.completion_tokens,
@@ -783,6 +785,16 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     sys.print("ANE share of wall time: {d:.0}%\n", .{
         if (total_wall > 0) 100.0 * @as(f64, @floatFromInt(eng.stats.ane_eval_ns)) / @as(f64, @floatFromInt(total_wall)) else 0,
     });
+    if (stats.prompt_tokens > 0) {
+        const p: f64 = @floatFromInt(stats.prompt_tokens);
+        sys.print("prefill CPU phases per token: convert {d:.2} ms, rope+cache {d:.2} ms, attn {d:.2} ms, norm {d:.2} ms, stage {d:.2} ms\n", .{
+            @as(f64, @floatFromInt(eng.stats.pf_convert_ns)) / 1e6 / p,
+            @as(f64, @floatFromInt(eng.stats.pf_rope_ns)) / 1e6 / p,
+            @as(f64, @floatFromInt(eng.stats.pf_attn_ns)) / 1e6 / p,
+            @as(f64, @floatFromInt(eng.stats.pf_norm_ns)) / 1e6 / p,
+            @as(f64, @floatFromInt(eng.stats.pf_stage_ns)) / 1e6 / p,
+        });
+    }
     if (stats.completion_tokens > 0) {
         const n: f64 = @floatFromInt(stats.completion_tokens);
         sys.print("sampling: {d:.2} ms/token, candidates avg {d:.0} max {d} of {d} vocab\n", .{

@@ -63,6 +63,8 @@ pub const Stats = struct {
     decode_ns: u64 = 0,
     /// Time spent inside ANE evaluations during the decode phase.
     decode_ane_ns: u64 = 0,
+    /// ANE time inside the prefill phase.
+    prefill_ane_ns: u64 = 0,
     /// Prompt tokens that were already in the KV cache and did not need to be
     /// recomputed (multi-turn).
     prefill_reused: u32 = 0,
@@ -185,8 +187,11 @@ pub const Session = struct {
         // One batched pass over the new tokens: the ANE is weight-bandwidth
         // bound, so a chunk of tokens costs about the same as a single one.
         const p0 = nowNs();
+        const ane_p0 = eng.stats.ane_eval_ns;
         var logits: []f32 = try eng.prefill(ids[reuse..], @intCast(reuse));
-        stats.prefill_ns = nowNs() - p0;
+        const p1 = nowNs();
+        stats.prefill_ane_ns = eng.stats.ane_eval_ns - ane_p0;
+        stats.prefill_ns = p1 - p0;
         try self.cached.appendSlice(self.allocator, ids[reuse..]);
 
         // Recent tokens for the repetition / presence / frequency penalties.
