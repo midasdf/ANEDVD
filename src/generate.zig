@@ -66,6 +66,10 @@ pub const Stats = struct {
     /// Prompt tokens that were already in the KV cache and did not need to be
     /// recomputed (multi-turn).
     prefill_reused: u32 = 0,
+    /// Sampling cost over the whole run, and the worst-case candidate count.
+    sample_ns: u64 = 0,
+    sample_candidates_max: usize = 0,
+    sample_candidates_total: u64 = 0,
     stop_reason: StopReason = .stop,
 
     pub fn decodeToksPerSec(self: Stats) f64 {
@@ -199,10 +203,14 @@ pub const Session = struct {
         const d0 = nowNs();
         var produced: u32 = 0;
         while (produced < params.max_tokens and pos < max_seq) : (produced += 1) {
+            var sinfo: cpu.SamplerInfo = undefined;
             const next = if (self.candidates.len >= logits.len)
-                cpu.sample(logits, params.sampler, recent.items, &self.rng, self.candidates)
+                cpu.sampleProfiled(logits, params.sampler, recent.items, &self.rng, self.candidates, &sinfo)
             else
                 cpu.argmax(logits);
+            stats.sample_ns += sinfo.ns;
+            stats.sample_candidates_total += sinfo.candidates;
+            stats.sample_candidates_max = @max(stats.sample_candidates_max, sinfo.candidates);
 
             if (self.isStop(next)) {
                 stats.stop_reason = .stop;

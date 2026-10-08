@@ -31,7 +31,10 @@ pub const Options = struct {
     /// once per evaluation regardless of width (measured: width 128 costs 5%
     /// more than width 1), so one token and a whole prompt chunk cost the same.
     /// Must be a multiple of 32 for the planar layout to stay contiguous.
-    chunk: u32 = 64,
+    /// 128 measured ~50% faster prefill than 64 with no decode regression
+    /// (the weights are read once per eval either way); 256 is no better and
+    /// costs more activation memory.
+    chunk: u32 = 128,
     /// Fuse gate/up/SiLU/down into one ANE program (3 BLOBFILEs, one kernel
     /// instead of two). Keeps the intermediate activation on the ANE instead of
     /// round-tripping it through the CPU, and measured ~45% faster decode.
@@ -58,6 +61,9 @@ pub const Stats = struct {
     /// rather than guessed.
     node_ns: [4]u64 = .{ 0, 0, 0, 0 },
     node_evals: [4]u64 = .{ 0, 0, 0, 0 },
+    /// For the qkv node: how much is IOSurface staging vs the evaluation.
+    qkv_write_ns: u64 = 0,
+    qkv_read_ns: u64 = 0,
     total_ns: u64 = 0,
     tokens: u64 = 0,
 
@@ -288,7 +294,9 @@ pub const Engine = struct {
 
             // ---- attention: qkv projection on ANE (column 0) ----
             rmsnormColumn(self.dec_in[0..hidden], self.x, norm.attn, cfg.eps, ch);
+            const tw = sys.nowNs();
             try k.qkv.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
+            self.stats.qkv_write_ns += sys.nowNs() - tw;
             var t0 = sys.nowNs();
             try k.qkv.eval();
             const dt_qkv = sys.nowNs() - t0;
@@ -296,7 +304,9 @@ pub const Engine = struct {
             self.stats.ane_evals += 1;
             self.stats.node_ns[@backingInt(Node.qkv)] += dt_qkv;
             self.stats.node_evals[@backingInt(Node.qkv)] += 1;
+            const tr = sys.nowNs();
             try k.qkv.readOutputColumnF16(0, 0, self.dec_out[0..cfg.qkvDim()]);
+            self.stats.qkv_read_ns += sys.nowNs() - tr;
             for (0..cfg.qkvDim()) |c| self.qkv[c * ch] = @floatCast(self.dec_out[c]);
             if (norm.qkv_bias) |b| {
                 for (b, 0..) |v, c| self.qkv[c * ch] += v;

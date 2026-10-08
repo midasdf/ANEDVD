@@ -239,6 +239,17 @@ pub const Candidate = struct {
     index: u32,
 };
 
+/// What the last `sample` call actually did, for profiling.
+pub const SamplerInfo = struct {
+    /// Vocabulary entries above the `max_logit - min_keep_delta*T` cut.
+    candidates: usize = 0,
+    /// Entries actually drawn from (after top_k / top_p).
+    kept: usize = 0,
+    /// True when the top-p sort ran (it is skipped when top_p >= 1).
+    sorted_for_top_p: bool = false,
+    ns: u64 = 0,
+};
+
 pub const SamplerParams = struct {
     temperature: f32 = 1.0,
     /// 0 disables top-k.
@@ -293,10 +304,27 @@ pub fn sample(
     rng: *u32,
     scratch: []Candidate,
 ) u32 {
+    var info: SamplerInfo = undefined;
+    return sampleProfiled(logits, params, recent, rng, scratch, &info);
+}
+
+pub fn sampleProfiled(
+    logits: []f32,
+    params: SamplerParams,
+    recent: []const u32,
+    rng: *u32,
+    scratch: []Candidate,
+    info: *SamplerInfo,
+) u32 {
     std.debug.assert(scratch.len >= logits.len);
+    info.* = .{};
+    const t0 = nowNs();
     applyPenalties(logits, params, recent);
 
-    if (params.temperature <= 0) return argmax(logits);
+    if (params.temperature <= 0) {
+        info.ns = nowNs() - t0;
+        return argmax(logits);
+    }
 
     // Pass 1: max (used as the softmax reference and the cut-off).
     var max_v: f32 = -std.math.inf(f32);
@@ -312,7 +340,11 @@ pub fn sample(
             n += 1;
         }
     }
-    if (n == 0) return argmax(logits);
+    info.candidates = n;
+    if (n == 0) {
+        info.ns = nowNs() - t0;
+        return argmax(logits);
+    }
 
     // Top-k: keep only the k best (sorting n candidates, n is small).
     var keep = n;
@@ -331,6 +363,7 @@ pub fn sample(
 
     // Top-p: sort and truncate at the nucleus (only needed if enabled).
     if (params.top_p < 1.0) {
+        info.sorted_for_top_p = true;
         std.mem.sort(Candidate, scratch[0..keep], {}, compareCandidates);
         var acc: f32 = 0;
         var cut_n: usize = keep;
@@ -347,14 +380,25 @@ pub fn sample(
         if (sum <= 0) return argmax(logits);
     }
 
+    info.kept = keep;
     rng.* = rng.* *% 1664525 +% 1013904223;
     const r = @as(f32, @floatFromInt(rng.* >> 8)) / 16777216.0;
     var target = r * sum;
     for (scratch[0..keep]) |c| {
         target -= c.logit;
-        if (target <= 0) return c.index;
+        if (target <= 0) {
+            info.ns = nowNs() - t0;
+            return c.index;
+        }
     }
+    info.ns = nowNs() - t0;
     return scratch[0].index;
+}
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 test "rmsnorm normalises to unit rms" {

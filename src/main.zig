@@ -22,6 +22,8 @@ const USAGE =
     \\                                  measure ANE matmul throughput
     \\  anedvd width [--size N]         cost of extra activation columns (prefill batching)
     \\  anedvd attnbench [--ctx N]      CPU attention cost breakdown (dot / softmax / AV)
+    \\  anedvd kernels <model> [--iters K] [--chunk N]
+    \\                                  per-kernel timing and weight-bandwidth of a real model
     \\  anedvd selftest [--split]       ANE engine vs CPU reference on a tiny model
     \\  anedvd check <model.gguf>       load a real GGUF, compile all ANE kernels, run a step
     \\  anedvd run --model <m.gguf> --prompt "..." [--max-tokens N] [--temp T] [--top-k K]
@@ -57,6 +59,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdProbe(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         return cmdBench(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "kernels")) {
+        return cmdKernels(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "attnbench")) {
         return cmdAttnBench(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "width")) {
@@ -635,7 +639,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const max_tokens: u32 = argValue(argv, "--max-tokens", 48);
     const temperature = argF32(argv, "--temp", 0.0);
     const top_k: usize = argValue(argv, "--top-k", 40);
-    const chunk: u32 = argValue(argv, "--chunk", 64);
+    const chunk: u32 = argValue(argv, "--chunk", 128);
     const top_p = argF32(argv, "--top-p", 1.0);
     const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
     var fuse = true;
@@ -724,9 +728,36 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         .max_tokens = max_tokens,
         .sampler = .{ .temperature = temperature, .top_k = top_k, .top_p = top_p, .repetition_penalty = rep_penalty },
     };
-    const t_gen0 = sys.nowNs();
-    const stats = try session.generate(ids, params, .{ .func = stdoutEmit });
-    const t_end = sys.nowNs();
+    const repeat: u32 = @max(1, argValue(argv, "--repeat", 1));
+    if (repeat > 1) sys.print("\n", .{});
+    var samples = std.ArrayList(f64).empty;
+    defer samples.deinit(allocator);
+    var stats: generate_mod.Stats = .{};
+    var t_gen0 = sys.nowNs();
+    var t_end = t_gen0;
+    for (0..repeat) |rep| {
+        session.reset();
+        const t0 = sys.nowNs();
+        stats = try session.generate(ids, params, .{ .func = if (repeat == 1) stdoutEmit else nullEmit });
+        t_end = sys.nowNs();
+        _ = t0;
+        if (rep + 1 == repeat) t_gen0 = t_end;
+        try samples.append(allocator, stats.decodeToksPerSec());
+    }
+    if (repeat > 1) {
+        std.mem.sort(f64, samples.items, {}, comptime std.sort.asc(f64));
+        const median = samples.items[samples.items.len / 2];
+        var sum: f64 = 0;
+        for (samples.items) |v| sum += v;
+        sys.print("\n[repeat {d}] decode tok/s: min {d:.1} median {d:.1} max {d:.1} mean {d:.1}\n", .{
+            repeat,
+            samples.items[0],
+            median,
+            samples.items[samples.items.len - 1],
+            sum / @as(f64, @floatFromInt(samples.items.len)),
+        });
+        stats.completion_tokens = 0; // per-run numbers below would be misleading
+    }
 
     const total_wall = t_end - t_gen0;
     sys.print("stop: {s}\n", .{stats.stop_reason.toString()});
@@ -752,6 +783,15 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     sys.print("ANE share of wall time: {d:.0}%\n", .{
         if (total_wall > 0) 100.0 * @as(f64, @floatFromInt(eng.stats.ane_eval_ns)) / @as(f64, @floatFromInt(total_wall)) else 0,
     });
+    if (stats.completion_tokens > 0) {
+        const n: f64 = @floatFromInt(stats.completion_tokens);
+        sys.print("sampling: {d:.2} ms/token, candidates avg {d:.0} max {d} of {d} vocab\n", .{
+            @as(f64, @floatFromInt(stats.sample_ns)) / 1e6 / n,
+            @as(f64, @floatFromInt(stats.sample_candidates_total)) / n,
+            stats.sample_candidates_max,
+            cfg.vocab,
+        });
+    }
     const tot = eng.stats.tokens;
     if (tot > 0) {
         const t: f64 = @floatFromInt(tot);
@@ -760,6 +800,17 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
             eng.stats.nodeMs(.o) / t,
             eng.stats.nodeMs(.ffn) / t,
             eng.stats.nodeMs(.head) / t,
+        });
+        sys.print("  qkv staging: write {d:.2} ms, read {d:.2} ms per token\n", .{
+            @as(f64, @floatFromInt(eng.stats.qkv_write_ns)) / 1e6 / t,
+            @as(f64, @floatFromInt(eng.stats.qkv_read_ns)) / 1e6 / t,
+        });
+        sys.print("  counters: tokens {d}, node evals qkv {d} o {d} ffn {d} head {d}\n", .{
+            eng.stats.tokens,
+            eng.stats.node_evals[0],
+            eng.stats.node_evals[1],
+            eng.stats.node_evals[2],
+            eng.stats.node_evals[3],
         });
     }
 }
@@ -876,6 +927,14 @@ fn stdoutEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
     return true;
 }
 
+/// Discards output: used by --repeat so only the summary is printed.
+fn nullEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
+    _ = ctx;
+    _ = piece;
+    _ = token_id;
+    return true;
+}
+
 fn fileStem(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     const ext = std.fs.path.extension(base);
@@ -893,7 +952,7 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const system = argStr(argv, "--system");
     const max_seq: u32 = argValue(argv, "--max-seq", 2048);
     const default_max_tokens: u32 = argValue(argv, "--max-tokens", 512);
-    const chunk: u32 = argValue(argv, "--chunk", 64);
+    const chunk: u32 = argValue(argv, "--chunk", 128);
     const top_p = argF32(argv, "--top-p", 1.0);
     const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
     var fuse = true;
@@ -1017,7 +1076,7 @@ fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     };
     const system = argStr(argv, "--system");
     const max_tokens: u32 = argValue(argv, "--max-tokens", 256);
-    const chunk: u32 = argValue(argv, "--chunk", 64);
+    const chunk: u32 = argValue(argv, "--chunk", 128);
     var temperature = argF32(argv, "--temp", 0.7);
     var top_p = argF32(argv, "--top-p", 0.9);
     var rep_penalty = argF32(argv, "--repeat-penalty", 1.15);
@@ -1204,4 +1263,72 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
     sys.print("  dot only    {d:>9.1} us  ({d:.0}%)\n", .{ dot_us, 100.0 * dot_us / full_us });
     sys.print("  softmax     {d:>9.1} us  ({d:.0}%)\n", .{ soft_us, 100.0 * soft_us / full_us });
     sys.print("  AV + rest   {d:>9.1} us  ({d:.0}%)\n", .{ rest_us, 100.0 * rest_us / full_us });
+}
+
+/// Time each of a real model's layer-0 kernels individually and report the
+/// achieved weight bandwidth. Aggregated per-token numbers hide which kernel is
+/// off; this is the measurement that says whether a kernel is bandwidth bound
+/// (~12-30 GB/s here) or has some other problem.
+fn cmdKernels(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    if (argv.len < 3) {
+        sys.eprint("usage: anedvd kernels <model.gguf|hf-dir> [--iters K] [--chunk N]\n", .{});
+        std.process.exit(2);
+    }
+    const path = argv[2];
+    const iters: u32 = argValue(argv, "--iters", 100);
+    const chunk: u32 = argValue(argv, "--chunk", 128);
+
+    var loaded = try model_open.open(allocator, path, .{ .progress = false });
+    defer loaded.deinit();
+    const cfg = loaded.config;
+
+    // Layer 0 weights are needed both for the kernel weights and to size the
+    // byte counters.
+    var m0 = try loaded.layers.load(allocator, 0);
+    defer m0.deinit(allocator);
+
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
+        .max_seq = 64,
+        .verbose = false,
+        .chunk = chunk,
+    });
+    defer eng.deinit();
+
+    sys.print("per-kernel timing: {s}, chunk {d}, {d} iterations\n", .{ path, chunk, iters });
+    // Warm up once so the first-token cost (KV growth, cache effects) is out.
+    _ = try eng.forward(1, 0);
+    eng.stats = .{};
+    const t0 = sys.nowNs();
+    for (0..iters) |_| {
+        _ = try eng.forward(1, 0);
+    }
+    const full_us = @as(f64, @floatFromInt((sys.nowNs() - t0) / iters)) / 1000.0;
+
+    // nodeMs accumulates over ALL layers, so a per-layer comparison has to
+    // divide by layers as well as by tokens. Getting this wrong made every
+    // kernel look ~24x slower than the standalone probe.
+    const t = eng.stats.tokens;
+    if (t > 0) {
+        const evals_per_token: f64 = @floatFromInt(@max(eng.stats.node_evals[0], 1));
+        const tf: f64 = @floatFromInt(t);
+        const layers: f64 = @floatFromInt(@max(cfg.layers, 1));
+        const per_layer_evals = evals_per_token / tf / layers; // 1 normally
+        const rows = [_]struct { name: []const u8, ms: f64, bytes: f64 }{
+            .{ .name = "qkv", .ms = eng.stats.nodeMs(.qkv) / tf / layers, .bytes = @floatFromInt(@as(u64, cfg.qkvDim()) * cfg.hidden * 2) },
+            .{ .name = "o", .ms = eng.stats.nodeMs(.o) / tf / layers, .bytes = @floatFromInt(@as(u64, cfg.hidden) * cfg.qDim() * 2) },
+            .{ .name = "ffn", .ms = eng.stats.nodeMs(.ffn) / tf / layers, .bytes = @floatFromInt((2 * @as(u64, cfg.inter) * cfg.hidden + @as(u64, cfg.hidden) * cfg.inter) * 2) },
+            .{ .name = "lm_head", .ms = eng.stats.nodeMs(.head) / tf, .bytes = @floatFromInt(@as(u64, cfg.vocab) * cfg.hidden * 2) },
+        };
+        sys.print("{s:<10} {s:>12} {s:>12} {s:>10} {s:>14}\n", .{ "kernel", "ms/1 layer", "ms/1 eval", "x layers", "GB/s" });
+        for (rows) |r| {
+            const per_eval = r.ms / per_layer_evals;
+            const gbs = if (per_eval > 0) r.bytes / (per_eval / 1000.0) / 1e9 else 0;
+            const n_layers = if (std.mem.eql(u8, r.name, "lm_head")) 1 else cfg.layers;
+            const per_token = r.ms * @as(f64, @floatFromInt(n_layers));
+            _ = per_token;
+            sys.print("{s:<10} {d:>12.3} {d:>12.3} {d:>10} {d:>14.1}\n", .{ r.name, r.ms, per_eval, n_layers, gbs });
+        }
+        sys.print("{s:<10} {d:>11.2} {s:>11} {s:>8} {s:>13}\n", .{ "TOTAL", full_us / 1000.0, "", "", "" });
+    }
+    sys.print("\nms/head is one layer's eval (qkv/o/ffn run once per layer) or one lm_head eval;\nGB/s is that kernel's weights divided by that time.\n", .{});
 }
