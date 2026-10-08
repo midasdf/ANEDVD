@@ -67,6 +67,13 @@ zig fmt src build.zig
   the hand-off between kernels (a transposed activation layout did exactly that
   once). Use `anedvd verify <model.gguf>` for a whole-model ANE-vs-CPU compare,
   and `anedvd layers --upto N` to bisect by depth.
+* **Beware checks that cannot fail.** Three bugs here survived a green run: a
+  test build that ran zero tests, an A/B check that compared a buffer with
+  itself, and a per-kernel check blind to the hand-off between kernels. When
+  adding a check, prove it fails on a deliberately broken input.
+* **`Tokenizer.fromGguf` and `load_gguf.viewF16` alias the mapped GGUF file.**
+  The `Gguf` must outlive them; returning either from a helper that closes the
+  map is a segfault waiting for first use.
 * **The ANE fails silently.** A wrong weight-blob offset, a transposed weight or
   a mis-strided IOSurface all *compile and run* and return plausible numbers.
   Always validate a new kernel against a CPU matmul (`anedvd check`).

@@ -491,13 +491,19 @@ quantisation rather than unified memory:
 
 ## Known issues
 
-
-* K-quants are implemented but only lightly exercised; Q8_0/Q4_0/F16 are the
-  best-tested paths.
-* `check` and `cpu` are still GGUF-only (`run`, `serve` and `selftest` handle
-  both formats). Wiring `check`'s per-kernel diff to `model_open` is mechanical.
-* The engine keeps the KV cache in fp32 on the CPU; attention is CPU-bound for
-  long contexts.
+* **Not all architectures are supported.** Llama, Qwen2, Qwen3, Mistral and
+  SmolLM3 families. Anything with a different attention layout (MoE routing,
+  MLA, sliding-window variants) needs work.
+* **Decode is at the hardware's weight-bandwidth ceiling** (~20–40 GB/s of fp16
+  weights measured on this ANE). int8 would be the only large win and the ANE
+  rejects the MIL op for it, so decode speed is bounded, not untuned.
+* **The HTTP server serialises requests.** One ANE engine, one KV cache; a second
+  generation waits for the first. Cheap GETs are served mid-generation, but a
+  second completion queues.
+* No tokeniser-level `logprobs`, `n>1`, tool calling, embeddings or images.
+* The chat template is selected by probing for ChatML markers; a model's own
+  Jinja template from GGUF metadata is not evaluated.
+* `probe/*.m` establishes the private-API facts but is not part of the build.
 
 ## Layout
 

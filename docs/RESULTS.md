@@ -329,15 +329,39 @@ but not sufficient: it cannot see a mistake in the hand-off *between* kernels.
 ANE engine and through the pure-CPU reference and comparing the final logits.
 All four GGUF models on this machine:
 
-| model | max abs diff | relative | verdict |
+| model | prefill rel | decode rel | verdict |
 |---|---|---|---|
-| SmolLM2-135M Q8_0 | 3.50e-1 | 1.71e-2 | MATCH |
-| Qwen2.5-0.5B Q8_0 | 2.32e-1 | 1.32e-2 | MATCH |
-| Qwen3-0.6B Q8_0 | 2.01e-1 | 1.15e-2 | MATCH |
-| Qwen2.5-1.5B Q4_K_M | 3.08e-1 | 1.50e-2 | MATCH |
+| SmolLM2-135M GGUF Q8_0 | 1.71e-2 | 1.48e-2 | MATCH |
+| SmolLM2-135M HF F16 | 1.70e-2 | 1.43e-2 | MATCH |
+| Qwen2.5-0.5B Q8_0 | 1.32e-2 | 2.30e-2 | MATCH |
+| Qwen3-0.6B Q8_0 | 1.15e-2 | 1.46e-2 | MATCH |
+| Qwen2.5-1.5B Q4_K_M | 1.50e-2 | 1.97e-2 | MATCH |
 
 A relative error of ~1.5% is fp16 accumulation over ~30 layers, not a layout
 error (an actual layout error showed up as >100%).
+
+## The recurring failure mode: checks that could not fail
+
+Three separate bugs survived a green test run because the thing that was
+supposed to catch them could not actually fail. Worth recording as a pattern:
+
+1. **`zig build test` ran zero tests.** The test build was rooted at
+   `src/main.zig`, and Zig only runs `test` blocks from the test root and the
+   files it references. Every "tests pass" report was vacuous until
+   `src/tests.zig` referenced the modules. Running the suite for real failed
+   3 of 76 immediately.
+2. **`run --ab` and the engine test compared a buffer with itself.** `forward()`
+   and `prefill()` both return the engine's internal `logits` slice, so
+   `for (seq, batch) |a, b|` diffed that one buffer against itself and always
+   printed `max|diff| = 0`. Both now copy the first result out, and the test was
+   verified to fail when a bug is deliberately reintroduced.
+3. **`check` only ever validated layer 0, kernel by kernel.** It cannot see a
+   mistake in the hand-off between kernels, which is exactly where the
+   transposed prefill-attention layout lived.
+
+`anedvd verify` exists because of (3), and (1) is why it took so long to notice
+(2): with the suite actually running, the copy bug would have been caught by the
+deliberate-mutation check from the start.
 
 ## Bugs found and fixed during development
 
