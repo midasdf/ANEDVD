@@ -9,7 +9,7 @@ measurements live in `docs/RESULTS.md`.
 
 | File | Role |
 |---|---|
-| `src/main.zig` | CLI: `info`, `probe`, `bench`, `width`, `attnbench`, `selftest`, `check`, `run`, `chat`, `cpu`, `serve` |
+| `src/main.zig` | CLI: `info`, `probe`, `bench`, `width`, `attnbench`, `kernels`, `verify`, `layers`, `selftest`, `check`, `run`, `chat`, `cpu`, `serve` |
 | `src/tests.zig` | the test root; references every module so `zig build test` is real |
 | `src/ane/shim.m` / `shim.h` | the only Objective-C + private-API code (`_ANEInMemoryModel`, IOSurfaces) |
 | `src/ane/runtime.zig` | Zig kernel wrapper, planar fp16 scatter/gather |
@@ -63,6 +63,10 @@ zig fmt src build.zig
   everywhere at once.
 * **Use `run --ab`** after touching the prefill path: it asserts the batched and
   per-token logits are bit-identical.
+* **`check` only validates layer 0, kernel by kernel.** It cannot see a bug in
+  the hand-off between kernels (a transposed activation layout did exactly that
+  once). Use `anedvd verify <model.gguf>` for a whole-model ANE-vs-CPU compare,
+  and `anedvd layers --upto N` to bisect by depth.
 * **The ANE fails silently.** A wrong weight-blob offset, a transposed weight or
   a mis-strided IOSurface all *compile and run* and return plausible numbers.
   Always validate a new kernel against a CPU matmul (`anedvd check`).

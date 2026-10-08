@@ -62,7 +62,14 @@ ANE's weight-bandwidth ceiling, so it barely changes with model size in
 relative terms; [`docs/RESULTS.md`](docs/RESULTS.md) has the full measurements,
 the per-kernel bandwidth table and the accuracy numbers.
 
-Numerical correctness is checked at two levels:
+Numerical correctness is checked at three levels:
+
+* `anedvd verify <model.gguf>` runs the whole prompt through the ANE **and**
+  through the pure-CPU reference and compares the final logits. This is the check
+  that matters: `check` validates single kernels in isolation, and a transposed
+  activation layout *between* kernels once turned Qwen2.5-1.5B into garbage while
+  every per-kernel check still passed. All four GGUF models report a relative
+  error of 1.2–1.7% (fp16 accumulation across ~30 layers).
 
 * `anedvd selftest` builds a tiny random transformer, runs it through the ANE
   and compares against a pure-CPU reference of the same model: **4.3×10⁻⁴**
@@ -126,6 +133,9 @@ larger models need a machine with more unified memory.
 | `anedvd bench` | matmul throughput sweep (128 … 4096) |
 | `anedvd selftest` | tiny transformer: ANE engine vs CPU reference |
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
+| `anedvd verify <model.gguf>` | whole-model check: every layer on the ANE vs the pure-CPU reference |
+| `anedvd layers <model.gguf> --upto N` | run only the first N layers (bisect a model that produces garbage) |
+| `anedvd kernels <model.gguf>` | per-kernel timing and achieved weight bandwidth |
 | `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--top-p P] [--repeat-penalty R] [--chunk N] [--ab]` | generate text on the ANE |
 | `anedvd chat --model <m.gguf\|hf-dir> [--system "…"]` | interactive multi-turn chat in the terminal (`/help`, `/reset`, `/temp`, `/topp`, `/rep`) |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |

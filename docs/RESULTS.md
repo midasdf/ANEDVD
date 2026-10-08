@@ -321,6 +321,24 @@ tests. Running the suite for real (76 tests) failed three of them immediately:
 All 76 pass now, including an engine test that builds a tiny model and asserts
 the batched-prefill logits equal the per-token ones.
 
+## Whole-model verification
+
+`anedvd check` validates single kernels against a CPU matmul, which is necessary
+but not sufficient: it cannot see a mistake in the hand-off *between* kernels.
+`anedvd verify <model.gguf>` fixes that by running the same prompt through the
+ANE engine and through the pure-CPU reference and comparing the final logits.
+All four GGUF models on this machine:
+
+| model | max abs diff | relative | verdict |
+|---|---|---|---|
+| SmolLM2-135M Q8_0 | 3.50e-1 | 1.71e-2 | MATCH |
+| Qwen2.5-0.5B Q8_0 | 2.32e-1 | 1.32e-2 | MATCH |
+| Qwen3-0.6B Q8_0 | 2.01e-1 | 1.15e-2 | MATCH |
+| Qwen2.5-1.5B Q4_K_M | 3.08e-1 | 1.50e-2 | MATCH |
+
+A relative error of ~1.5% is fp16 accumulation over ~30 layers, not a layout
+error (an actual layout error showed up as >100%).
+
 ## Bugs found and fixed during development
 
 These are worth recording because each one produced *plausible-looking* output
@@ -346,7 +364,22 @@ rather than an error:
    unrotated vector. Symptom: the model answered with EOS immediately for some
    prompts. The `--ab` check (sequential vs batched logits) now pins this at
    bit-identical.
-8. **Debug builds made prefill look broken.** The Zig-side CPU work (batching,
+8. **Prefill attention read the activations transposed.** cpu.attentionPrefill
+   indexed its buffers as [position][head][dim] while the engine's activations
+   are channel-major [channel * chunk + column]. Reading them transposed returns
+   plausible numbers, so every per-kernel check passed; the damage only appeared
+   once full layers were chained (Qwen2.5-1.5B produced "</>A, and with two, and
+   with three"). Fixed, and `anedvd verify` now exists to catch this class.
+9. **Two checks that could not fail.** `run --ab` and the engine test both
+   compared the sequential and batched logits directly, but forward() and
+   prefill() return the SAME internal buffer, so they compared a buffer with
+   itself and always reported "max|diff| = 0". That is why bug 8 survived an
+   "A/B is bit-identical" claim. Both now copy the first result out, and the test
+   was verified to fail when the bug is deliberately reintroduced.
+10. **The CPU reference skipped Qwen3's Q/K normalisation**, so `verify` blamed
+    the ANE for a mismatch that was the reference's fault. LayerWeights now
+    carries q_norm/k_norm and refForward applies them like the engine does.
+11. **Debug builds made prefill look broken.** The Zig-side CPU work (batching,
    attention, dequantisation) is ~8× slower unoptimised: the same 33-token
    prefill took 0.59 s in Debug and 0.12 s in ReleaseFast. `zig build` now
    defaults to ReleaseFast.
