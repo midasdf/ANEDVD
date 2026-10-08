@@ -398,11 +398,15 @@ fn compareCandidates(_: void, a: Candidate, b: Candidate) bool {
 /// pins.
 pub fn applyPenalties(logits: []f32, params: SamplerParams, recent: []const u32) void {
     if (params.repetition_penalty == 1.0 and params.presence_penalty == 0.0 and params.frequency_penalty == 0.0) return;
+    // A penalty of 0 divides by zero below, turning every penalised logit into
+    // NaN and the model's answer into empty string. Guard here as well as at the
+    // API boundary so no caller can get that far.
+    const rep = if (params.repetition_penalty > 0.0) params.repetition_penalty else 1.0;
     for (recent, 0..) |id, i| {
         if (id >= logits.len) continue;
         var v = logits[id];
-        if (params.repetition_penalty != 1.0) {
-            v = if (v > 0) v / params.repetition_penalty else v * params.repetition_penalty;
+        if (rep != 1.0) {
+            v = if (v > 0) v / rep else v * rep;
         }
         if (params.frequency_penalty != 0) v -= params.frequency_penalty;
         if (params.presence_penalty != 0 and std.mem.indexOfScalar(u32, recent[0..i], id) == null) {
@@ -464,6 +468,11 @@ pub fn sampleProfiled(
     const t0 = nowNs();
     applyPenalties(logits, params, recent);
 
+    // A non-positive temperature means greedy, handled below. A top_p of 0 would
+    // keep no tokens at all; treat it as "no nucleus limit" rather than as "no
+    // answer".
+    const top_p: f32 = if (params.top_p > 0.0) @min(params.top_p, 1.0) else 1.0;
+
     if (params.temperature <= 0) {
         info.ns = nowNs() - t0;
         return argmax(logits);
@@ -511,7 +520,7 @@ pub fn sampleProfiled(
     if (sum <= 0) return argmax(logits);
 
     // Top-p: order the kept set and truncate at the nucleus.
-    if (params.top_p < 1.0) {
+    if (top_p < 1.0) {
         info.sorted_for_top_p = true;
         // Already ordered when top_k ran; only sort when it did not (or when the
         // kept set is small enough that the sort is free).
@@ -522,7 +531,7 @@ pub fn sampleProfiled(
         var cut_n: usize = keep;
         for (scratch[0..keep], 0..) |c, i| {
             acc += c.logit / sum;
-            if (acc >= params.top_p) {
+            if (acc >= top_p) {
                 cut_n = i + 1;
                 break;
             }
@@ -911,6 +920,33 @@ test "sampling: every drawn token has non-zero probability" {
         counts[t] += 1;
     }
     for (counts) |c| try std.testing.expect(c > 500); // roughly uniform
+}
+
+test "invalid sampler parameters produce a usable answer, not NaN" {
+    // repetition_penalty 0 used to divide by zero, turning every penalised logit
+    // into NaN; the model then answered with an empty string. top_p 0 kept no
+    // candidates at all. Both arrive from real HTTP clients.
+    const a = std.testing.allocator;
+    const v = 64;
+    const logits = try a.alloc(f32, v);
+    defer a.free(logits);
+    const scratch = try a.alloc(Candidate, v);
+    defer a.free(scratch);
+    const recent = [_]u32{ 1, 2, 3 };
+
+    inline for (.{
+        SamplerParams{ .temperature = 1.0, .repetition_penalty = 0.0, .top_p = 0.9 },
+        SamplerParams{ .temperature = 1.0, .repetition_penalty = -1.0, .top_p = 0.9 },
+        SamplerParams{ .temperature = 1.0, .repetition_penalty = 0.0, .top_p = 0.0 },
+    }) |params| {
+        for (logits, 0..) |*x, i| x.* = @floatFromInt(i % 7);
+        var rng: u32 = 7;
+        var info: SamplerInfo = undefined;
+        const id = sampleProfiled(logits, params, &recent, &rng, scratch, &info);
+        try std.testing.expect(id < v);
+        // Every logit the sampler will actually use must be finite.
+        for (logits) |x| try std.testing.expect(std.math.isFinite(x));
+    }
 }
 
 test "penalties push repeated tokens down" {

@@ -149,12 +149,14 @@ pub const Server = struct {
         const params = generate.Params{
             .max_tokens = max_tokens,
             .sampler = .{
-                .temperature = temperature,
+                // Clamped, not passed through: 0 for top_p means "no tokens" and
+                // a repetition penalty of 0 divides by zero inside the sampler.
+                .temperature = clampF32(temperature, 0.0, 4.0),
                 .top_k = top_k,
-                .top_p = getFloat(root, "top_p", self.opts.default_top_p),
-                .repetition_penalty = getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty),
-                .presence_penalty = getFloat(root, "presence_penalty", 0.0),
-                .frequency_penalty = getFloat(root, "frequency_penalty", 0.0),
+                .top_p = clampF32(getFloat(root, "top_p", self.opts.default_top_p), 0.01, 1.0),
+                .repetition_penalty = clampRepetitionPenalty(getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty)),
+                .presence_penalty = clampF32(getFloat(root, "presence_penalty", 0.0), -8.0, 8.0),
+                .frequency_penalty = clampF32(getFloat(root, "frequency_penalty", 0.0), -8.0, 8.0),
             },
         };
         const created = sys.unixTime();
@@ -316,9 +318,9 @@ pub const Server = struct {
         const params = generate.Params{
             .max_tokens = max_tokens,
             .sampler = .{
-                .temperature = temperature,
-                .top_p = getFloat(root, "top_p", self.opts.default_top_p),
-                .repetition_penalty = getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty),
+                .temperature = clampF32(temperature, 0.0, 4.0),
+                .top_p = clampF32(getFloat(root, "top_p", self.opts.default_top_p), 0.01, 1.0),
+                .repetition_penalty = clampRepetitionPenalty(getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty)),
             },
         };
         const created = sys.unixTime();
@@ -386,9 +388,9 @@ pub const Server = struct {
         const params = generate.Params{
             .max_tokens = max_tokens,
             .sampler = .{
-                .temperature = temperature,
-                .top_p = getFloat(root, "top_p", self.opts.default_top_p),
-                .repetition_penalty = getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty),
+                .temperature = clampF32(temperature, 0.0, 4.0),
+                .top_p = clampF32(getFloat(root, "top_p", self.opts.default_top_p), 0.01, 1.0),
+                .repetition_penalty = clampRepetitionPenalty(getFloat(root, "repetition_penalty", self.opts.default_repetition_penalty)),
             },
         };
         const created = sys.unixTime();
@@ -496,6 +498,27 @@ fn getFloat(obj: std.json.ObjectMap, key: []const u8, default: f32) f32 {
         .float => |f| @floatCast(f),
         else => default,
     };
+}
+
+/// Coerce a numeric request field into a sane range.
+///
+/// Clients send nonsense: `repetition_penalty: 0` used to reach the sampler,
+/// which divides by it, so every penalised logit became NaN and the model
+/// answered with nothing at all (HTTP 200, empty content). Negative penalties
+/// produced fluent garbage. Same for temperature and the p/k cut-offs, where 0
+/// means "no tokens" or "every token".
+fn clampF32(v: f32, lo: f32, hi: f32) f32 {
+    if (std.math.isNan(v)) return lo;
+    return @min(hi, @max(lo, v));
+}
+
+/// A repetition penalty of 0 (or negative) is invalid, and treating it as a very
+/// small positive number would push the sampler to always pick the least likely
+/// token -- measured as 20 newlines in a row. The useful reading of an invalid
+/// penalty is "no penalty".
+fn clampRepetitionPenalty(v: f32) f32 {
+    if (std.math.isNan(v) or v <= 0.0) return 1.0;
+    return @min(4.0, v);
 }
 
 fn getBool(obj: std.json.ObjectMap, key: []const u8, default: bool) bool {
