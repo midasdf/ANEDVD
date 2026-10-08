@@ -501,9 +501,10 @@ quantisation rather than unified memory:
 * **Decode is at the hardware's weight-bandwidth ceiling** (~20–40 GB/s of fp16
   weights measured on this ANE). int8 would be the only large win and the ANE
   rejects the MIL op for it, so decode speed is bounded, not untuned.
-* **The HTTP server serialises requests.** One ANE engine, one KV cache; a second
-  generation waits for the first. Cheap GETs are served mid-generation, but a
-  second completion queues.
+* **The HTTP server serialises requests.** One ANE engine, one KV cache. Cheap
+  GETs (`/health`, `/v1/models`) are answered mid-generation, but a second
+  completion is refused with **503 Service Unavailable and `Retry-After: 1`**
+  rather than queued, so a client can tell "busy" from "broken".
 * No tokeniser-level `logprobs`, `n>1`, tool calling, embeddings or images.
 * The chat template is selected by probing for ChatML markers; a model's own
   Jinja template from GGUF metadata is not evaluated.

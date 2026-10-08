@@ -86,6 +86,11 @@ zig fmt src build.zig
   strides come back from `modelAttributes` — never assume them.
 * **RoPE convention is per-architecture** (llama = adjacent, qwen2 = half-split).
   The wrong one produces fluent repetition, not garbage.
+* **Test the server with two requests, not one.** Both server bugs found so
+  far were invisible to single-request tests: a stale-KV bug that returned
+  zero tokens on the second identical request, and a request silently
+  dropped with no HTTP status while a generation was running. A second
+  completion is now refused with 503 + Retry-After rather than queued.
 * The HTTP server handles **one request at a time** on purpose: one ANE engine,
   one KV cache. Do not add a thread pool without giving each thread its own
   engine.

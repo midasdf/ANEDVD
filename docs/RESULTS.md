@@ -341,6 +341,33 @@ All four GGUF models on this machine:
 A relative error of ~1.5% is fp16 accumulation over ~30 layers, not a layout
 error (an actual layout error showed up as >100%).
 
+## Server bugs found by testing two requests instead of one
+
+Every earlier test used a single request, which hid two bugs in the same code
+path:
+
+1. **A second identical request returned zero tokens.** `generate.Session`
+   tracks which token ids the engine's KV cache holds, and that list included
+   every *generated* token, not just the prompt. So `commonPrefix` matched the
+   whole new prompt against the previous turn's prompt + output, reuse equalled
+   the prompt length, nothing was prefilled, and decode then read `reuse + 1`
+   positions — the extra entry being stale KV data from the model's own previous
+   answer. The model saw its old output as context and emitted EOS immediately.
+   Three identical requests: `+7 tok`, `+0 tok`, `+0 tok`, all HTTP 200.
+
+   Reuse is now only allowed when the new prompt covers the entire cached prefix
+   (`generate.reuseLength`), which keeps multi-turn chat working (turn 2 reused
+   36 tokens) while a fresh prompt starts clean.
+
+2. **A request needing the engine during a generation was silently dropped.**
+   The mid-generation hook accepted the connection, read the request, and
+   returned without answering if it was not a cheap GET — so the client saw a
+   closed connection and no status line at all. It now returns 503 with
+   `Retry-After: 1` and a JSON body.
+
+Both were invisible because the server logged only streaming completions;
+every completed generation is now logged with prompt/new/reused token counts.
+
 ## The recurring failure mode: checks that could not fail
 
 Three separate bugs survived a green test run because the thing that was
