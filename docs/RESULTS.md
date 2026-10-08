@@ -5,59 +5,70 @@ All numbers from the development machine:
 * **Apple A18 Pro** (Mac17,5), 6 cores, 8 GB unified memory
 * **macOS 27.0.1** (26A434), SIP enabled
 * unsigned binary, **no entitlements**
-* Zig 0.17.0, `-O Debug` (the Zig side is not the bottleneck; the ANE is)
+* Zig 0.17.0, ReleaseFast (the Zig side matters: Debug is ~8x slower there)
+* every number from repeated runs — a single run can be 40% off
 
 ## ANE matmul throughput
 
-`anedvd bench` — a single 1×1 conv kernel, fp16, batch 1, weights baked in,
-timed over 50 evaluations after warm-up.
+`anedvd bench` — a single 1x1 conv kernel, fp16, batch 1, weights baked in,
+timed over 40-60 evaluations after warm-up. Best of three runs, because the ANE
+itself is noisy (an identical run can come out 30-40% slower).
 
-| size (in=out) | µs/eval | GFLOP/s | implied weight read |
+| size (in=out) | us/eval | GFLOP/s | weight read |
 |---|---|---|---|
-| 128 | 80.9 | 0.4 | launch-bound |
-| 256 | 86.6 | 1.5 | launch-bound |
-| 512 | 156.5 | 3.4 | |
-| 1024 | 191.0 | 11.0 | 5.5 GB/s |
-| 2048 | 395.2 | 21.2 | 10.6 GB/s |
-| 4096 | 1409.8 | 23.8 | 11.9 GB/s |
+| 128 | 71 | 0.5 | launch-bound |
+| 256 | 101 | 1.3 | launch-bound |
+| 512 | 96 | 5.5 | |
+| 1024 | 131 | 16.1 | 16 GB/s |
+| 2048 | 289 | 29.1 | 29 GB/s |
+| 4096 | 1161 | 28.9 | 29 GB/s |
 
 Two regimes:
 
-* **Below ~256×256** the ~80–90 µs per-evaluation launch overhead dominates.
-* **Above ~1024** the kernel is memory-bandwidth-bound at ≈12 GB/s of fp16
-  weights. A 4096×4096 fp16 matrix is 33.5 MB, and 33.5 MB / 1.41 ms ≈ 23.8
-  GB/s of traffic counting the read+write of the output; the ANE's share of DRAM
-  bandwidth is the limit, not the MAC array.
+* **Below ~512** a ~70-100 us per-evaluation overhead dominates: the same kernel
+  costs about the same for 1 column as for 128 (see the width sweep), so small
+  projections are launch-bound but prompt tokens are nearly free.
+* **Above ~1024** the kernel saturates at ~29 GB/s of fp16 weights, which is
+  where the decode speed comes from: 32.5 MB of weights in 1.16 ms.
 
-That is why the engine fuses projections as aggressively as the data
-dependencies allow (4 kernels per layer instead of 6) and why int8 weight
-quantisation is the most promising future optimisation: it would halve the bytes
-per token.
+## Current numbers (all via `--repeat`, medians)
 
-## Prompt batching (activation width)
+Single runs are not trustworthy: the ANE's own per-token time varied 16.9-32.1 ms
+across identical invocations, so every number here comes from repeated runs.
 
-`anedvd width` — one 1x1 conv, fp16, 2048→2048, weights read once per eval:
-
-| width | µs/eval | vs width 1 | GFLOP/s |
+| model | prefill (short) | decode | peak RSS |
 |---|---|---|---|
-| 1 | 304.97 | 1.00× | 27.5 |
-| 8 | 286.93 | 0.94× | 233.9 |
-| 32 | 305.47 | 1.00× | 878.8 |
-| 64 | 290.23 | 0.95× | 1849.8 |
-| 128 | 321.40 | 1.05× | 3340.8 |
+| SmolLM2-135M GGUF Q8_0 | 400 tok/s | 31.7 tok/s | 297 MB |
+| SmolLM2-135M HF safetensors F16 | 371 tok/s | 32.5 tok/s | ~450 MB |
+| Qwen2.5-0.5B GGUF Q8_0 | 190 tok/s | 17.4 tok/s | 891 MB |
+| Qwen3-0.6B GGUF Q8_0 | 68-190 tok/s | 13.4 tok/s | ~1.1 GB |
 
-Flat within 5% across a 128× range of work: the kernel is reading weights, not
-computing. So every kernel is compiled for `chunk` columns (default 64), a decode
-step fills column 0 only, and a prefill step fills up to 64 — one kernel set, no
-extra compiles, no decode penalty.
+Prefill is faster with longer prompts because the ANE takes a whole chunk at
+once; Qwen2.5-0.5B:
 
-`anedvd run --ab` runs the prompt through both paths and compares:
+| prompt tokens | prefill |
+|---|---|
+| 59 | 527 tok/s |
+| 203 | 683 tok/s |
+| 491 | 453 tok/s |
+| 971 | 283 tok/s |
 
-```
-A/B sequential vs batched: max|diff| = 0.000000e0, argmax 504 vs 504
-```
+## Per-kernel bandwidth
 
-Bit-identical, which is also how the bug below was caught.
+`anedvd kernels <model>` times each layer kernel and reports achieved bandwidth.
+Qwen2.5-0.5B, chunk 128:
+
+| kernel | ms/1 eval | weights | GB/s |
+|---|---|---|---|
+| qkv | 0.200 | 2.1 MB | 10.3 |
+| o | 0.176 | 1.6 MB | 9.1 |
+| ffn (fused) | 0.902 | 26.2 MB | 29.0 |
+| lm_head | 6.750 | 272 MB | 40.3 |
+
+The small kernels run at lower bandwidth simply because a fixed per-eval cost
+(~100 us) is a larger fraction of a shorter eval; the large ones reach 30-40 GB/s,
+which is the practical ceiling. `lm_head` is 14% of decode time for Qwen2.5-0.5B
+(17% for SmolLM2-135M at 7%) because the vocabulary is 151 936 wide.
 
 ## Model runs
 
@@ -270,8 +281,20 @@ registers instead of writing o_h back per position, and an fp16 KV cache:
 
 | ctx | before | after | speedup |
 |---|---|---|---|
-| 1024 | 967 us | 234 us | 4.1x |
-| 2048 | 2098 us | 483 us | 4.3x |
+| 1024 | 967 us | 131 us | 7.4x |
+| 2048 | 2098 us | 266 us | 7.9x |
+
+Prefill attention was worse: the per-position loop re-walked the whole KV cache
+for every query, and softmax called libm expf once per (query, key, head, layer)
+— 344k calls per token at 971 tokens, 78% of prefill. `cpu.attentionPrefill`
+batches a whole chunk and `cpu.expApprox` replaces the libm call with a
+range-reduced polynomial (worst case 4.1e-6 relative error):
+
+| prompt | before | after |
+|---|---|---|
+| 203 tokens | 500 tok/s | **683** |
+| 491 tokens | 337 tok/s | **453** |
+| 971 tokens | 172 tok/s | **289** |
 
 End to end on Qwen2.5-0.5B decode (tok/s): ctx 16 19.6 -> 30.2, ctx 128
 19.2 -> 28.6, ctx 512 13.6 -> 26.8, ctx 1024 12.2 -> 19.4. The CPU share of

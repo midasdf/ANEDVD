@@ -39,26 +39,26 @@ The capital of France is Paris. Paris is a city located in the northern part of
 the country, and it is known for its historical landmarks, cultural institutions,
 and cultural attractions. Paris is famous for
 ---
-prefill: 16 tokens in 0.04 s (400 tok/s)
-decode: 40 tokens in 1.57 s (25.4 tok/s)
-ANE: 6776 evals, 1293.2 ms total, 23.09 ms/token (82% of wall time)
+prefill: 16 tokens in 0.04 s (400 tok/s; ANE 0.02 s, CPU 0.02 s)
+decode: 40 tokens in 1.26 s (31.7 tok/s; ANE 88%, CPU 12%)
+ANE per-token split: qkv 0.20 ms, o 0.18 ms, ffn 0.24 ms, lm_head 1.65 ms
 ```
 
-* **Prompt batching works**: a whole chunk of prompt tokens goes through the ANE
-  in one pass, because the ANE reads the weights once per evaluation regardless
-  of width (measured below). SmolLM2-135M prefill is ~400 tok/s and Qwen2.5-0.5B
-  is ~260 tok/s, against ~25 and ~17 before batching.
-* **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at ~47 tok/s decode, HF
-  safetensors F16 at ~47 tok/s (no dequantisation), same output.
-* **Qwen3-0.6B** works too (per-head Q/K normalisation before RoPE).
-* **SmolLM2-135M-Instruct (Q8_0)**: 30 layers, 121 ANE kernels, **25.4 tok/s** decode.
-* **Qwen2.5-0.5B-Instruct (Q8_0)**: 24 layers, 97 ANE kernels, **10.1 tok/s** decode,
-  GQA + QKV biases + RoPE θ=10⁶ — answers "The capital of France is Paris."
-  and writes fluent paragraphs.
+Decode medians from `--repeat 5` (single runs vary by up to ±40% because the
+ANE's own time is not stable):
 
-Both are at the ANE's memory-bandwidth ceiling (≈12–15 GB/s of fp16 weights per
-token); [`docs/RESULTS.md`](docs/RESULTS.md) has the full measurements and the
-per-kernel accuracy table.
+| model | params / format | prefill | decode | peak RSS |
+|---|---|---|---|---|
+| SmolLM2-135M-Instruct | 135 M, GGUF Q8_0 | 400 tok/s | **31.7 tok/s** | 297 MB |
+| SmolLM2-135M-Instruct | 135 M, HF safetensors F16 | 371 tok/s | **32.5 tok/s** | ~450 MB |
+| Qwen2.5-0.5B-Instruct | 494 M, GGUF Q8_0 | 190 tok/s | **17.4 tok/s** | 891 MB |
+| Qwen3-0.6B | 600 M, GGUF Q8_0 | 68–190 tok/s | **13.4 tok/s** | ~1.1 GB |
+
+Long prompts prefill faster per token because the ANE is fed a whole chunk at a
+time: Qwen2.5-0.5B reaches 683 tok/s at 203 prompt tokens. Decode is at the
+ANE's weight-bandwidth ceiling, so it barely changes with model size in
+relative terms; [`docs/RESULTS.md`](docs/RESULTS.md) has the full measurements,
+the per-kernel bandwidth table and the accuracy numbers.
 
 Numerical correctness is checked at two levels:
 
@@ -418,8 +418,8 @@ quantisation rather than unified memory:
 
 1. **The ANE bakes weights into the compiled program.** A 0.5B model at fp16 is
    ~1 GB inside the ANE's own memory, on top of whatever the CPU side holds.
-   int8 would halve that and halve the per-token bandwidth (currently the
-   limiting factor at ~12–15 GB/s).
+   int8 would halve that and halve the per-token bandwidth (the current
+   limiting factor: ~20-40 GB/s measured).
 2. **The ANE program pool is shared machine-wide, not per-process.** A running
    `anedvd serve` holds its kernels loaded; a second process that tries to load
    a full model gets `no ANE resources (transient; retry)` (status 0x5). The
@@ -428,11 +428,12 @@ quantisation rather than unified memory:
 
 ## Findings worth knowing (all reproduced locally)
 
-1. **The ANE is weight-bandwidth bound, not compute bound.** At 2048×2048 a
-   1x1 conv takes ~300 µs whether it processes 1 column or 128; a 4096×4096 one
-   takes 1.4 ms ≈ 24 GFLOP/s but ≈12 GB/s of weights. Every design decision
-   here follows from that (fused projections, prompt batching, and the fact that
-   int8 would be the only way to go substantially faster).
+1. **The ANE is weight-bandwidth bound, not compute bound.** A 2048×2048 1x1
+   conv takes ~290 µs whether it processes 1 column or 128, so the same kernel
+   serves decode and 128-token prefill. Measured per-kernel bandwidth on real
+   models ranges 5–40 GB/s of fp16 weights, with the big kernels at ~30-40 GB/s.
+   Every design decision here follows from that (fused projections, prompt
+   batching, and the fact that int8 would be the only way to go much faster).
 2. **No entitlement, no SIP changes, no signing.** The ANE is reached over XPC
    through `aned`; the kernel-level `com.apple.ane.iokit-user-access` entitlement
    only gates the in-process `H11ANEIn` user client, which this project does not
@@ -449,7 +450,7 @@ quantisation rather than unified memory:
    int8 dtype. That matches Orion ("quantization not yet supported") and
    Espresso ("INT8/quantized weights: unsupported"). See
    [`probe/ane_int8_probe.m`](probe/ane_int8_probe.m) to reproduce. Weight
-   bandwidth therefore stays at fp16: ~12–15 GB/s, the current ceiling.
+   bandwidth therefore stays at fp16: ~20-40 GB/s on the larger kernels.
 6. **Compile budget**: 121 `ANECCompile()` calls in one process worked here.
    Published reports put the daemon's limit near 119 on M4/macOS 15, so the
    engine keeps the per-layer kernel count low and reports `ane.compileCount()`.
@@ -470,9 +471,9 @@ quantisation rather than unified memory:
    model's kernels; the second gets a transient "no ANE resources" error. See
    the unified-memory section above.
 10. **Weight bandwidth is the decode ceiling**: Qwen2.5-0.5B reads ~1 GB of
-   fp16 weights per token, which is 28–35 ms at the ANE's ~12–15 GB/s share of
-   DRAM. Quantised weights would be the only large win left, and int8 is not
-   reachable (finding 5).
+   fp16 weights per token, which is ~50 ms at the ~20-40 GB/s the ANE delivers.
+   Quantised weights would be the only large win left, and int8 is not reachable
+   (finding 5), so decode speed is now bounded by the hardware.
 11. **The ANE is deterministic**: the CPU reference in `anedvd cpu` reproduces
    the ANE's generated text token-for-token on both models.
 
