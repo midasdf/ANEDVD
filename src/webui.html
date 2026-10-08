@@ -185,7 +185,7 @@ const ui = {
   topP: el('top-p'), topPOut: el('topp-out'), repeatPenalty: el('repeat-penalty'),
 };
 // `messages` is the transcript replayed to the server; the DOM is only a view.
-const state = { model: '', messages: [], generating: false, controller: null, pinned: true, cleared: false };
+const state = { model: '', messages: [], generating: false, controller: null, pinned: true, cleared: false, droppedTokens: 0 };
 const settings = Object.assign({}, DEFAULTS);
 
 // --- settings persistence (localStorage can throw in private mode) ----------
@@ -415,6 +415,11 @@ function handleEvent(raw, onDelta) {
     const choice = parsed && Array.isArray(parsed.choices) ? parsed.choices[0] : null;
     const delta = choice ? choice.delta : null;
     if (delta && typeof delta.content === 'string' && delta.content !== '') onDelta(delta.content);
+    // The server reports dropped prompt tokens in the final chunk's usage; a
+    // truncated context must be visible, not silently produce a shorter answer.
+    if (parsed && parsed.usage && Number(parsed.usage.prompt_tokens_dropped) > 0) {
+      state.droppedTokens = Number(parsed.usage.prompt_tokens_dropped);
+    }
   }
   return false;
 }
@@ -428,6 +433,12 @@ function buildRequestMessages() {
     out.push({ role: state.messages[i].role, content: state.messages[i].content });
   }
   return out;
+}
+function reportTruncation() {
+  if (state.droppedTokens > 0) {
+    setStatus(false, 'context truncated: the oldest ' + state.droppedTokens +
+      ' prompt tokens were dropped to fit the model\u2019s window');
+  }
 }
 function setGenerating(on) {
   state.generating = on;
@@ -507,6 +518,7 @@ async function send() {
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (res.body && contentType.indexOf('application/json') === -1) {
       // Event stream, or an unlabelled body we can still parse as SSE.
+      state.droppedTokens = 0;
       await readStream(res.body, (delta) => { answer += delta; schedulePaint(); });
     } else {
       // Non-streaming fallback: a plain chat.completion object.
@@ -544,6 +556,7 @@ async function send() {
   } finally {
     state.cleared = false;
     setGenerating(false);
+    reportTruncation();
     scrollToEnd(false);
   }
 }

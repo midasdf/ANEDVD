@@ -765,7 +765,16 @@ const SseSink = struct {
         var js = JsonSink{ .conn = self.conn };
         try js.print("data: {{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"", .{ self.created, self.created });
         try js.string(self.model);
-        try js.print("\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{finishReason(stats.stop_reason)});
+        // The final chunk carries usage, which is where a client learns that its
+        // prompt was truncated (prompt_tokens_dropped > 0) instead of having to
+        // infer it from a token count smaller than what it sent.
+        try js.print("\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_dropped\":{d}}}}}\n\n", .{
+            finishReason(stats.stop_reason),
+            stats.prompt_tokens,
+            stats.completion_tokens,
+            stats.prompt_tokens + stats.completion_tokens,
+            stats.prompt_tokens_dropped,
+        });
         try js.write("data: [DONE]\n\n");
         try js.flush();
     }
