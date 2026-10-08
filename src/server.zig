@@ -918,3 +918,36 @@ test "finish reasons map to each API's vocabulary" {
     try std.testing.expectEqualStrings("max_tokens", anthropicStop(.length));
     try std.testing.expectEqualStrings("end_turn", anthropicStop(.stop));
 }
+
+test "intToU32 clamps out-of-range and negative request values" {
+    // max_tokens arrives as a signed JSON number; a client can send 0 or a
+    // negative value for "no limit" or by accident. intToU32's floor keeps the
+    // engine from being asked for zero tokens, which would break the decode loop.
+    try std.testing.expectEqual(@as(u32, 1), intToU32(0, 1)); // floor wins
+    try std.testing.expectEqual(@as(u32, 1), intToU32(-5, 1));
+    try std.testing.expectEqual(@as(u32, 7), intToU32(7, 1));
+    try std.testing.expectEqual(@as(u32, 1), intToU32(1, 1));
+    // Enormous values saturate rather than wrapping into a small number.
+    try std.testing.expectEqual(std.math.maxInt(u32), intToU32(1 << 40, 1));
+    try std.testing.expectEqual(std.math.maxInt(u32), intToU32(std.math.maxInt(i64), 1));
+    // A top_k floor of 0 is legitimate ("no limit"); check the floor is honoured.
+    try std.testing.expectEqual(@as(u32, 0), intToU32(-1, 0));
+    try std.testing.expectEqual(@as(u32, 5), intToU32(5, 0));
+}
+
+test "clampF32 and clampRepetitionPenalty produce usable values" {
+    try std.testing.expectEqual(@as(f32, 0.5), clampF32(0.5, 0.0, 1.0));
+    try std.testing.expectEqual(@as(f32, 0.0), clampF32(-3.0, 0.0, 1.0));
+    try std.testing.expectEqual(@as(f32, 1.0), clampF32(9.0, 0.0, 1.0));
+    // NaN must not pass through to the sampler.
+    try std.testing.expectEqual(@as(f32, 0.0), clampF32(std.math.nan(f32), 0.0, 1.0));
+
+    // An invalid repetition penalty means "no penalty", not "a tiny penalty":
+    // clamping 0 to 0.01 made the sampler pick the least likely token every
+    // time, which measured as 20 newlines in a row.
+    try std.testing.expectEqual(@as(f32, 1.0), clampRepetitionPenalty(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), clampRepetitionPenalty(-1.0));
+    try std.testing.expectEqual(@as(f32, 1.0), clampRepetitionPenalty(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1.15), clampRepetitionPenalty(1.15));
+    try std.testing.expectEqual(@as(f32, 4.0), clampRepetitionPenalty(100.0));
+}
