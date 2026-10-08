@@ -663,13 +663,13 @@ pub const Engine = struct {
     /// Run only the first `n` layers, then the final norm and lm head. Used to
     /// bisect a model that produces garbage: the logits at each depth show
     /// where it first goes wrong.
-    pub fn stopAfterLayer(self: *Engine, n: u32) !void {
-        if (n == 0 or n > self.kernels.len) return error.InvalidLayerCount;
-        // The prefill/forward loops iterate over self.kernels, so a prefix view
-        // is enough: the head kernel still runs at the end.
-        self.kernels = self.kernels[0..n];
-        self.norms = self.norms[0..n];
-        self.active_layers = n;
+    pub fn stopAfterLayer(self: *Engine, n: u32) void {
+        // The forward/prefill loops iterate over self.kernels, so a prefix view
+        // is enough; the head kernel still runs at the end.
+        const k: usize = @min(n, self.kernels.len);
+        self.kernels = self.kernels[0..k];
+        self.norms = self.norms[0..k];
+        self.active_layers = @intCast(k);
     }
 
     /// Forget the KV cache (start a new conversation).

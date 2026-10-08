@@ -151,6 +151,11 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         @memcpy(lw.qkv[q.len + k.len ..][0..v.len], v);
 
         lw.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
+        // Qwen3: per-head q/k normalisation, needed by the CPU reference too.
+        if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
+            lw.q_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+            lw.k_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+        }
 
         // Qwen2 (and a few others) add biases to the attention projections.
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable) != null) {

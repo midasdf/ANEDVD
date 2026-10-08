@@ -59,6 +59,10 @@ pub fn main(init: std.process.Init) !void {
         return cmdProbe(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         return cmdBench(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "verify")) {
+        return cmdVerify(allocator, argv);
+    } else if (std.mem.eql(u8, cmd, "layers")) {
+        return cmdLayers(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "kernels")) {
         return cmdKernels(allocator, argv);
     } else if (std.mem.eql(u8, cmd, "attnbench")) {
@@ -278,6 +282,7 @@ fn refForward(
     st: *RefState,
     token: u32,
     pos: u32,
+    layers: usize,
 ) ![]f32 {
     const cfg = mw.config;
     const hidden: usize = cfg.hidden;
@@ -307,13 +312,27 @@ fn refForward(
 
     for (0..hidden) |i| x[i] = @floatCast(mw.embed[@as(usize, token) * hidden + i]);
 
-    for (mw.layers, 0..) |*lw, li| {
+    for (mw.layers[0..@min(layers, mw.layers.len)], 0..) |*lw, li| {
         cpu.rmsnorm(h, x, lw.attn_norm, cfg.eps);
         matmulF16(qkv, lw.qkv, h, cfg.qkvDim(), hidden);
         if (lw.qkv_bias) |b| cpu.addInPlace(qkv, b);
         const q = qkv[0..q_dim];
         const kk = qkv[q_dim..][0..kv_dim];
         const vv = qkv[q_dim + kv_dim ..][0..kv_dim];
+        // Qwen3 normalises each head's q/k before RoPE; the reference has to do
+        // the same or `verify` reports a mismatch that is the reference's fault.
+        if (lw.q_norm) |w| {
+            for (0..cfg.heads) |qh| {
+                const v = q[qh * cfg.head_dim ..][0..cfg.head_dim];
+                cpu.rmsnorm(v, v, w, cfg.eps);
+            }
+        }
+        if (lw.k_norm) |w| {
+            for (0..cfg.kv_heads) |kh| {
+                const v = kk[kh * cfg.head_dim ..][0..cfg.head_dim];
+                cpu.rmsnorm(v, v, w, cfg.eps);
+            }
+        }
         if (cfg.rope_adjacent) {
             cpu.ropeAdjacent(q, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
             cpu.ropeAdjacent(kk, cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
@@ -445,7 +464,7 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
     var max_ref: f32 = 0;
     for (tokens, 0..) |tok, pos| {
         const got = try engine.forward(tok, @intCast(pos));
-        const ref = try refForward(allocator, &ref_mw, &st, tok, @intCast(pos));
+        const ref = try refForward(allocator, &ref_mw, &st, tok, @intCast(pos), cfg.layers);
         defer allocator.free(ref);
         var step_max: f32 = 0;
         for (got, ref) |a, b| {
@@ -921,7 +940,7 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     var logits: []f32 = undefined;
     for (ids, 0..) |id, pos| {
         if (pos > 0) allocator.free(logits);
-        logits = try refForward(allocator, &mw, &st, id, @intCast(pos));
+        logits = try refForward(allocator, &mw, &st, id, @intCast(pos), cfg.layers);
     }
     defer allocator.free(logits);
     const t1 = sys.nowNs();
@@ -936,7 +955,7 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         defer allocator.free(bytes);
         sys.writeAll(1, bytes);
         if (pos > 0) allocator.free(logits);
-        logits = try refForward(allocator, &mw, &st, next, pos);
+        logits = try refForward(allocator, &mw, &st, next, pos, cfg.layers);
         pos += 1;
     }
     const t2 = sys.nowNs();
@@ -1366,4 +1385,170 @@ fn cmdKernels(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         sys.print("{s:<10} {d:>11.2} {s:>11} {s:>8} {s:>13}\n", .{ "TOTAL", full_us / 1000.0, "", "", "" });
     }
     sys.print("\nms/head is one layer's eval (qkv/o/ffn run once per layer) or one lm_head eval;\nGB/s is that kernel's weights divided by that time.\n", .{});
+}
+
+/// Whole-model cross-check: run the prompt through the ANE engine and through
+/// the pure-CPU reference and compare the final logits.
+///
+/// `check` only exercises layer 0's kernels in isolation, which is exactly why
+/// a transposed activation layout in the prefill attention could produce garbage
+/// for Qwen2.5-1.5B while every per-kernel check passed: the bug lived in the
+/// hand-off between kernels, not inside any one of them. This command is the one
+/// that catches that class of mistake.
+fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    if (argv.len < 3) {
+        sys.eprint("usage: anedvd verify <model> [--prompt \"...\"] [--layers N]\n", .{});
+        std.process.exit(2);
+    }
+    const path = argv[2];
+    const prompt = argStr(argv, "--prompt") orelse "The capital of France is";
+    const layers_cap: u32 = argValue(argv, "--layers", 0);
+
+    // The reference needs a second copy of the weights, which this command can
+    // only build from GGUF today (load_gguf.loadWeights). Saying so beats
+    // failing with a bare read error.
+    if (!std.mem.endsWith(u8, path, ".gguf")) {
+        sys.eprint("verify needs a GGUF file (the CPU reference loads from GGUF; \"{s}\" is not one).\n", .{path});
+        sys.eprint("For safetensors models use `anedvd run --ab` and `anedvd check`.\n", .{});
+        std.process.exit(2);
+    }
+
+    var loaded = try model_open.open(allocator, path, .{ .progress = false });
+    defer loaded.deinit();
+    const cfg = loaded.config;
+    const layers: usize = if (layers_cap > 0) @min(layers_cap, cfg.layers) else cfg.layers;
+
+    sys.print("verify {s}: {d} layers, hidden {d}, heads {d}/{d}, head_dim {d}\n", .{
+        path, layers, cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim,
+    });
+
+    // The CPU reference needs its own copy of the weights: the engine takes
+    // ownership of the ones in `loaded`.
+    var ref_mw = try cloneForReference(allocator, path, cfg, layers);
+    defer ref_mw.deinit();
+
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
+        .max_seq = 1024,
+        .verbose = false,
+        .chunk = 128,
+    });
+    defer eng.deinit();
+    if (layers < cfg.layers) eng.stopAfterLayer(@intCast(layers));
+
+    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
+    defer allocator.free(ids);
+
+    // ANE: batched prefill over the whole prompt. Copied, because the engine
+    // returns its own buffer and the CPU pass below would otherwise be
+    // compared against it twice.
+    const ane_logits = try allocator.dupe(f32, try eng.prefill(ids, 0));
+    defer allocator.free(ane_logits);
+
+    // CPU reference: one token at a time, same prompt.
+    var st = RefState{ .k = try allocator.alloc([]f16, layers), .v = try allocator.alloc([]f16, layers) };
+    defer {
+        for (st.k) |c| allocator.free(c);
+        for (st.v) |c| allocator.free(c);
+        allocator.free(st.k);
+        allocator.free(st.v);
+    }
+    for (0..layers) |i| {
+        st.k[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
+        st.v[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
+        @memset(st.k[i], 0);
+        @memset(st.v[i], 0);
+    }
+    var cpu_logits: []f32 = undefined;
+    for (ids, 0..) |id, pos| {
+        if (pos > 0) allocator.free(cpu_logits);
+        cpu_logits = try refForward(allocator, &ref_mw, &st, id, @intCast(pos), layers);
+    }
+    defer allocator.free(cpu_logits);
+
+    var max_d: f32 = 0;
+    var max_mag: f32 = 0;
+    var am_ane: u32 = 0;
+    var am_cpu: u32 = 0;
+    for (ane_logits, cpu_logits, 0..) |a, c, i| {
+        max_d = @max(max_d, @abs(a - c));
+        max_mag = @max(max_mag, @abs(c));
+        if (a > ane_logits[am_ane]) am_ane = @intCast(i);
+        if (c > cpu_logits[am_cpu]) am_cpu = @intCast(i);
+    }
+    const rel = if (max_mag > 0) max_d / max_mag else max_d;
+    sys.print("  max|ANE - CPU| = {e:.5}  (max|logit| {e:.3}, rel {e:.5})\n", .{ max_d, max_mag, rel });
+    sys.print("  argmax: ANE {d} \"{s}\" vs CPU {d} \"{s}\"\n", .{
+        am_ane, loaded.tokenizer.tokenText(am_ane), am_cpu, loaded.tokenizer.tokenText(am_cpu),
+    });
+    const ok = rel < 0.05 and am_ane == am_cpu;
+    sys.print("  RESULT: {s}\n", .{if (ok) "MATCH" else "MISMATCH"});
+    if (!ok) std.process.exit(1);
+}
+
+/// Load `cap` layers plus the runtime weights as an independent ModelWeights for
+/// the CPU reference. Re-opening the file is simplest and keeps the two paths
+/// from sharing any buffer.
+fn cloneForReference(allocator: std.mem.Allocator, path: []const u8, cfg: model_mod.Config, cap: usize) !model_mod.ModelWeights {
+    var g = try gguf.Gguf.load(allocator, path);
+    defer g.deinit();
+    var mw = try load_gguf.loadWeights(allocator, &g, false);
+    if (cap >= mw.layers.len) return mw;
+    // Drop the layers the reference will not run.
+    for (mw.layers[cap..]) |*lw| lw.deinit(allocator);
+    const kept = try allocator.alloc(model_mod.LayerWeights, cap);
+    @memcpy(kept, mw.layers[0..cap]);
+    allocator.free(mw.layers);
+    mw.layers = kept;
+    _ = cfg;
+    return mw;
+}
+
+/// Run the prompt through the first N layers and report the top tokens at that
+/// depth, for bisecting a model that produces garbage. `verify` is the sharper
+/// tool when the question is "ANE vs CPU"; this one answers "which layer".
+fn cmdLayers(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
+    if (argv.len < 3) {
+        sys.eprint("usage: anedvd layers <model> --prompt \"...\" [--upto N]\n", .{});
+        std.process.exit(2);
+    }
+    const path = argv[2];
+    const prompt = argStr(argv, "--prompt") orelse "The capital of France is";
+    const upto: u32 = argValue(argv, "--upto", 0);
+
+    var loaded = try model_open.open(allocator, path, .{ .progress = false });
+    defer loaded.deinit();
+    const cfg = loaded.config;
+    sys.print("{s}: {d} layers, hidden {d}, heads {d}/{d}, head_dim {d}\n", .{
+        cfg.arch, cfg.layers, cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim,
+    });
+
+    var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
+        .max_seq = 256,
+        .verbose = false,
+    });
+    defer eng.deinit();
+    if (upto > 0) {
+        eng.stopAfterLayer(upto);
+        sys.print("stopping after layer {d}\n", .{upto});
+    }
+
+    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
+    defer allocator.free(ids);
+    sys.print("prompt {d} tokens\n", .{ids.len});
+    const logits = try eng.prefill(ids, 0);
+    const used = try allocator.alloc(bool, logits.len);
+    defer allocator.free(used);
+    @memset(used, false);
+    for (0..5) |i| {
+        var best: usize = 0;
+        var bv: f32 = -std.math.inf(f32);
+        for (logits, 0..) |v, k| {
+            if (!used[k] and v > bv) {
+                bv = v;
+                best = k;
+            }
+        }
+        used[best] = true;
+        sys.print("  {d}. id={d} logit={d:.2} {s}\n", .{ i + 1, best, bv, loaded.tokenizer.tokenText(@intCast(best)) });
+    }
 }

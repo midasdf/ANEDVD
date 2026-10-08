@@ -154,6 +154,11 @@ pub const HeadSource = struct {
 pub const LayerWeights = struct {
     attn_norm: []f32 = &.{}, // [hidden]
     ffn_norm: []f32 = &.{}, // [hidden]
+    /// Per-head Q/K normalisation (Qwen3): [head_dim] each. The engine keeps
+    /// these in `Norm`, but the CPU reference walks LayerWeights, so they are
+    /// loaded here too.
+    q_norm: ?[]f32 = null,
+    k_norm: ?[]f32 = null,
     /// [(q + k + v) dims][hidden]
     qkv: []f16 = &.{},
     /// [hidden][q_dim]
@@ -192,9 +197,16 @@ pub const LayerWeights = struct {
 
     /// Move the norms out.
     pub fn takeNorm(self: *LayerWeights) Norm {
-        const n = Norm{ .attn = self.attn_norm, .ffn = self.ffn_norm };
+        const n = Norm{
+            .attn = self.attn_norm,
+            .ffn = self.ffn_norm,
+            .q_norm = self.q_norm,
+            .k_norm = self.k_norm,
+        };
         self.attn_norm = &.{};
         self.ffn_norm = &.{};
+        self.q_norm = null;
+        self.k_norm = null;
         return n;
     }
 
@@ -208,6 +220,8 @@ pub const LayerWeights = struct {
         if (self.down.len > 0) allocator.free(self.down);
         if (self.qkv_bias) |b| allocator.free(b);
         if (self.o_bias) |b| allocator.free(b);
+        if (self.q_norm) |b| allocator.free(b);
+        if (self.k_norm) |b| allocator.free(b);
         self.* = .{};
     }
 };
@@ -254,6 +268,8 @@ pub const ModelWeights = struct {
             out.layers[i].down = try allocator.dupe(f16, lw.down);
             if (lw.qkv_bias) |b| out.layers[i].qkv_bias = try allocator.dupe(f32, b);
             if (lw.o_bias) |b| out.layers[i].o_bias = try allocator.dupe(f32, b);
+            if (lw.q_norm) |b| out.layers[i].q_norm = try allocator.dupe(f32, b);
+            if (lw.k_norm) |b| out.layers[i].k_norm = try allocator.dupe(f32, b);
         }
         return out;
     }
