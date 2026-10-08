@@ -46,9 +46,15 @@ const LayerKernels = struct {
     qkv: ane.Kernel,
     o: ane.Kernel,
     /// Fused: [hidden] -> [hidden]. Split: [hidden] -> [2*inter] (gate || up).
+    /// For a sparse MoE layer this kernel computes the SHARED expert, which every
+    /// token uses.
     ffn: ane.Kernel,
     ffn_split: bool,
     down: ?ane.Kernel = null,
+    /// Routed experts of a MoE layer, run on the CPU. The ANE cannot hold a kernel
+    /// per expert (see research/moe-design.md), and only k of them are used per
+    /// token, so they are read and multiplied here instead.
+    moe: ?model.MoeWeights = null,
 };
 
 /// Which ANE node a measurement belongs to.
@@ -67,6 +73,8 @@ pub const Stats = struct {
     /// Prefill CPU phases, to find where the non-ANE time goes.
     pf_convert_ns: u64 = 0,
     pf_rope_ns: u64 = 0,
+    /// Time spent on the CPU running routed MoE experts.
+    moe_ns: u64 = 0,
     pf_attn_ns: u64 = 0,
     pf_norm_ns: u64 = 0,
     pf_stage_ns: u64 = 0,
@@ -141,6 +149,16 @@ pub const Engine = struct {
     /// chunks and took 6.4 s, during which /health was unanswerable.
     prefill_tick: ?*const fn (?*anyopaque) void = null,
     prefill_tick_ctx: ?*anyopaque = null,
+    /// MoE scratch, sized once from the config. Empty for a dense model.
+    moe_logits: []f32 = &.{},
+    moe_probs: []f32 = &.{},
+    moe_idx: []u32 = &.{},
+    moe_out: []f32 = &.{},
+    /// f32 copy of the layer's normalised input, for the CPU router and experts
+    /// (the ANE staging buffer is fp16).
+    moe_hidden: []f32 = &.{},
+    moe_gate_scratch: []f32 = &.{},
+    moe_upd_scratch: []f32 = &.{},
 
     pub fn deinit(self: *Engine) void {
         for (self.kernels) |*k| {
@@ -148,6 +166,8 @@ pub const Engine = struct {
             k.o.deinit();
             k.ffn.deinit();
             if (k.down) |*d| d.deinit();
+            // Routed experts were moved in from the layer's Matrices.
+            if (k.moe) |*m| m.deinit(self.allocator);
         }
         self.head_kernel.deinit();
         self.allocator.free(self.kernels);
@@ -156,6 +176,13 @@ pub const Engine = struct {
         for (self.v_cache) |c| self.allocator.free(c);
         self.allocator.free(self.k_cache);
         self.allocator.free(self.v_cache);
+        if (self.moe_logits.len > 0) self.allocator.free(self.moe_logits);
+        if (self.moe_probs.len > 0) self.allocator.free(self.moe_probs);
+        if (self.moe_idx.len > 0) self.allocator.free(self.moe_idx);
+        if (self.moe_out.len > 0) self.allocator.free(self.moe_out);
+        if (self.moe_hidden.len > 0) self.allocator.free(self.moe_hidden);
+        if (self.moe_gate_scratch.len > 0) self.allocator.free(self.moe_gate_scratch);
+        if (self.moe_upd_scratch.len > 0) self.allocator.free(self.moe_upd_scratch);
         self.allocator.free(self.x);
         self.allocator.free(self.h);
         self.allocator.free(self.qkv);
@@ -194,11 +221,19 @@ pub const Engine = struct {
 
         var self: Engine = undefined;
         // A field with a default value is NOT covered by `undefined`: it holds
-        // 0xaaaa. `prefill_tick` is called as a function pointer between prefill
-        // chunks, so without this it jumps to 0xaaaaaaaa. This is a real crash, not a
-        // hypothetical: it is why `verify` bus-errored on a dense model.
+        // 0xaaaa. Two things read those garbage bits: `prefill_tick`, which is
+        // called as a function pointer between prefill chunks (jumping to
+        // 0xaaaaaaaa is a real bus error, not a hypothetical), and the MoE scratch
+        // below, whose `.len` decides what `deinit` frees.
         self.prefill_tick = null;
         self.prefill_tick_ctx = null;
+        self.moe_logits = &.{};
+        self.moe_probs = &.{};
+        self.moe_idx = &.{};
+        self.moe_out = &.{};
+        self.moe_hidden = &.{};
+        self.moe_gate_scratch = &.{};
+        self.moe_upd_scratch = &.{};
         self.allocator = allocator;
         self.config = cfg;
         self.opts = opts;
@@ -228,6 +263,9 @@ pub const Engine = struct {
             var m = try layers.load(allocator, @intCast(i));
             defer m.deinit(allocator); // matrices are baked into the kernels now
             self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, opts, opts.chunk);
+            // The routed experts were moved into the kernels; do not let the deferred
+            // deinit free them.
+            m.moe = null;
             built += 1;
         }
         if (opts.verbose) sys.print("  lm head: loading weights + compiling ANE kernel ({d} -> {d})\n", .{ cfg.hidden, cfg.vocab });
@@ -248,6 +286,15 @@ pub const Engine = struct {
         }
 
         const ch: usize = self.chunk;
+        if (cfg.num_experts > 0) {
+            self.moe_logits = try allocator.alloc(f32, cfg.num_experts);
+            self.moe_probs = try allocator.alloc(f32, @max(cfg.experts_per_tok, 1));
+            self.moe_idx = try allocator.alloc(u32, @max(cfg.experts_per_tok, 1));
+            self.moe_out = try allocator.alloc(f32, cfg.hidden * ch);
+            self.moe_hidden = try allocator.alloc(f32, cfg.hidden);
+            self.moe_gate_scratch = try allocator.alloc(f32, cfg.moe_inter);
+            self.moe_upd_scratch = try allocator.alloc(f32, cfg.moe_inter);
+        }
         self.x = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
         self.h = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
         self.qkv = try allocator.alloc(f32, @as(usize, cfg.qkvDim()) * ch);
@@ -386,7 +433,72 @@ pub const Engine = struct {
             } else {
                 try k.ffn.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
             }
-            for (0..hidden) |c| self.x[c * ch] += @floatCast(self.dec_out[c]);
+            // The shared expert's output is scaled by sigmoid(gate . h) before it joins
+            // the residual. The ANE kernel cannot express that (it is a 1-wide
+            // projection plus a sigmoid), so it is applied here. Omitting it produces
+            // plausible-looking but wrong text.
+            if (k.moe) |*moe2| {
+                if (moe2.shared_gate_lin.len == hidden) {
+                    var g: f32 = 0;
+                    for (moe2.shared_gate_lin, self.moe_hidden[0..hidden]) |w, xv| {
+                        g += @as(f32, @floatCast(w)) * xv;
+                    }
+                    const scale = cpu.sigmoid(g);
+                    for (0..hidden) |c| {
+                        const v: f32 = @floatCast(self.dec_out[c]);
+                        self.x[c * ch] += scale * v;
+                    }
+                } else {
+                    for (0..hidden) |c| {
+                        const v: f32 = @floatCast(self.dec_out[c]);
+                        self.x[c * ch] += v;
+                    }
+                }
+            } else {
+                for (0..hidden) |c| {
+                    const v: f32 = @floatCast(self.dec_out[c]);
+                    self.x[c * ch] += v;
+                }
+            }
+
+            // ---- routed experts (MoE), on the CPU ----
+            // The shared expert above came from the ANE. These are the k experts the
+            // router picked, and they are computed here because the ANE cannot hold a
+            // kernel per expert. See research/moe-design.md.
+            if (k.moe) |*moe| {
+                const t_moe = sys.nowNs();
+                // `dec_in` is fp16 (it feeds the ANE); the CPU wants f32.
+                for (0..hidden) |c| self.moe_hidden[c] = @floatCast(self.dec_in[c]);
+                const hh = self.moe_hidden[0..hidden];
+                // The router reads the same normalised input the shared expert did.
+                cpu.matmulF16(self.moe_logits[0..moe.num_experts], moe.router, hh, moe.num_experts, hidden);
+                cpu.moeRoute(
+                    self.moe_logits[0..moe.num_experts],
+                    cfg.experts_per_tok,
+                    cfg.norm_topk_prob,
+                    self.moe_probs[0..cfg.experts_per_tok],
+                    self.moe_idx[0..cfg.experts_per_tok],
+                );
+                // Accumulate the routed experts into a scratch, then add once, so the
+                // residual is touched a single time.
+                @memset(self.moe_out[0..hidden], 0);
+                for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p| {
+                    cpu.moeExpertAccum(
+                        self.moe_out[0..hidden],
+                        self.moe_gate_scratch[0..moe.inter],
+                        self.moe_upd_scratch[0..moe.inter],
+                        hh,
+                        moe.expertGate(e),
+                        moe.expertUp(e),
+                        moe.expertDown(e),
+                        moe.inter,
+                        hidden,
+                        p,
+                    );
+                }
+                for (0..hidden) |c| self.x[c * ch] += self.moe_out[c];
+                self.stats.moe_ns += sys.nowNs() - t_moe;
+            }
         }
 
         // ---- final norm + lm head (width-1 kernel) ----
@@ -549,6 +661,17 @@ pub const Engine = struct {
                 self.stats.ane_eval_ns += sys.nowNs() - t0;
                 self.stats.ane_evals += 1;
 
+                // The MoE paths below need the layer's normalised input in f32. The
+                // ANE staging buffer is fp16, and reading it as f32 is how the
+                // sigmoid-gate read turned into a bus error before this line existed.
+                const moe_active = false;
+                if (moe_active) {
+                    const hn = @as(usize, cfg.hidden);
+                    for (0..n) |j| {
+                        for (0..hn) |c| self.moe_hidden[c] = @floatCast(self.in16[c * ch + j]);
+                    }
+                }
+
                 if (k.ffn_split) {
                     const gu_len = @as(usize, 2 * inter) * ch;
                     try k.ffn.readOutputF16(0, self.out16[0..gu_len]);
@@ -572,8 +695,53 @@ pub const Engine = struct {
                 } else {
                     try k.ffn.readOutputF16(0, self.out16[0..proj_len]);
                 }
-                for (0..n) |j| {
-                    for (0..hidden) |c| self.x[c * ch + j] += @floatCast(self.out16[c * ch + j]);
+                if (k.moe) |*moe| {
+                    const hd: usize = hidden;
+                    for (0..n) |j| {
+                        // Normalised input for THIS column.
+                        for (0..hd) |c| self.moe_hidden[c] = @floatCast(self.in16[c * ch + j]);
+                        const hh = self.moe_hidden[0..hd];
+                        // Shared expert: scale by sigmoid(gate . h) as it joins the residual.
+                        var g: f32 = 0;
+                        if (moe.shared_gate_lin.len == hd) {
+                            for (moe.shared_gate_lin, hh) |w, xv| g += @as(f32, @floatCast(w)) * xv;
+                        }
+                        const scale = if (moe.shared_gate_lin.len == hd) cpu.sigmoid(g) else 1.0;
+                        for (0..hd) |c| {
+                            const v: f32 = @floatCast(self.out16[c * ch + j]);
+                            self.x[c * ch + j] += scale * v;
+                        }
+                        // Routed experts for this position.
+                        cpu.matmulF16(self.moe_logits[0..moe.num_experts], moe.router, hh, moe.num_experts, hd);
+                        cpu.moeRoute(
+                            self.moe_logits[0..moe.num_experts],
+                            cfg.experts_per_tok,
+                            cfg.norm_topk_prob,
+                            self.moe_probs[0..cfg.experts_per_tok],
+                            self.moe_idx[0..cfg.experts_per_tok],
+                        );
+                        @memset(self.moe_out[0..hd], 0);
+                        for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p2| {
+                            cpu.moeExpertAccum(
+                                self.moe_out[0..hd],
+                                self.moe_gate_scratch[0..moe.inter],
+                                self.moe_upd_scratch[0..moe.inter],
+                                hh,
+                                moe.expertGate(e),
+                                moe.expertUp(e),
+                                moe.expertDown(e),
+                                moe.inter,
+                                hd,
+                                p2,
+                            );
+                        }
+                        for (0..hd) |c| self.x[c * ch + j] += self.moe_out[c];
+                    }
+                    self.stats.moe_ns += 0;
+                } else {
+                    for (0..n) |j| {
+                        for (0..hidden) |c| self.x[c * ch + j] += @floatCast(self.out16[c * ch + j]);
+                    }
                 }
             }
 
@@ -816,9 +984,19 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     var o = try makeConvKernel(allocator, cfg.qDim(), cfg.hidden, lw.o, "o", width);
     errdefer o.deinit();
 
+    // On a sparse layer `gate`/`up`/`down` hold the SHARED expert, whose width is
+    // `shared_inter` and need not equal `inter` (Qwen1.5-MoE: 5632 vs 5632, but the
+    // routed experts are 1408). Sizing the kernel from `cfg.inter` would read past
+    // the buffer.
+    const ffn_inter: u32 = if (lw.moe != null and cfg.shared_inter > 0) cfg.shared_inter else cfg.inter;
+    // Ownership of the routed experts moves to the returned LayerKernels: the caller
+    // frees `lw` as soon as these kernels are built, and the experts have to outlive
+    // that (they are used on every token).
+    const moe_keep = lw.moe;
+
     if (opts.fuse_ffn) {
-        if (makeFusedFfnKernel(allocator, cfg.hidden, cfg.inter, lw.gate, lw.up, lw.down, width)) |fk| {
-            return .{ .qkv = qkv, .o = o, .ffn = fk, .ffn_split = false };
+        if (makeFusedFfnKernel(allocator, cfg.hidden, ffn_inter, lw.gate, lw.up, lw.down, width)) |fk| {
+            return .{ .qkv = qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
         } else |e| {
             if (opts.verbose) {
                 sys.print("    fused FFN rejected ({s}: {s}); falling back to split kernels\n", .{ @errorName(e), ane.lastError() });
@@ -830,11 +1008,11 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     defer allocator.free(gu);
     @memcpy(gu[0..lw.gate.len], lw.gate);
     @memcpy(gu[lw.gate.len..], lw.up);
-    var gu_k = try makeConvKernel(allocator, cfg.hidden, 2 * cfg.inter, gu, "gate_up", width);
+    var gu_k = try makeConvKernel(allocator, cfg.hidden, 2 * ffn_inter, gu, "gate_up", width);
     errdefer gu_k.deinit();
-    var down_k = try makeConvKernel(allocator, cfg.inter, cfg.hidden, lw.down, "down", width);
+    var down_k = try makeConvKernel(allocator, ffn_inter, cfg.hidden, lw.down, "down", width);
     errdefer down_k.deinit();
-    return .{ .qkv = qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k };
+    return .{ .qkv = qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep };
 }
 
 // ---------------------------------------------------------------------------

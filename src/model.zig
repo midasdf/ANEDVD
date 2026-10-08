@@ -86,6 +86,9 @@ pub const Matrices = struct {
     qkv: []f16 = &.{},
     /// [hidden][q_dim]
     o: []f16 = &.{},
+    /// Routed experts, for a sparse layer of a MoE model. Owned by whoever fills
+    /// this in; `deinit` frees it. Null for a dense layer.
+    moe: ?MoeWeights = null,
     /// [inter][hidden]
     gate: []f16 = &.{},
     /// [inter][hidden]
@@ -103,6 +106,7 @@ pub const Matrices = struct {
         if (self.down.len > 0) allocator.free(self.down);
         if (self.qkv_bias) |b| allocator.free(b);
         if (self.o_bias) |b| allocator.free(b);
+        if (self.moe) |*m| m.deinit(allocator);
         self.* = .{};
     }
 };
@@ -271,6 +275,7 @@ pub const LayerWeights = struct {
             .down = self.down,
             .qkv_bias = self.qkv_bias,
             .o_bias = self.o_bias,
+            .moe = self.moe,
         };
         self.qkv = &.{};
         self.o = &.{};
@@ -279,6 +284,9 @@ pub const LayerWeights = struct {
         self.down = &.{};
         self.qkv_bias = null;
         self.o_bias = null;
+        // The experts moved with the matrices; leave nothing behind for deinit to
+        // free twice.
+        self.moe = null;
         return m;
     }
 

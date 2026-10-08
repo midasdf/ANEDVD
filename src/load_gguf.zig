@@ -133,9 +133,17 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
 
 /// Load a Linear weight as fp16 in ANE conv layout [out][in].
 fn loadLinear(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u8, in_dim: u32, out_dim: u32) ![]f16 {
-    const t = g.tensor(name) orelse return Error.MissingTensor;
+    const t = g.tensor(name) orelse {
+        sys.eprint("gguf: no tensor {s}\n", .{name});
+        return Error.MissingTensor;
+    };
     const want: u64 = @as(u64, in_dim) * out_dim;
-    if (t.elemCount() != want) return Error.DimensionMismatch;
+    if (t.elemCount() != want) {
+        sys.eprint("gguf: {s} has {d} elements, expected {d} ({d}x{d}), dims {any}\n", .{
+            name, t.elemCount(), want, in_dim, out_dim, t.dims,
+        });
+        return Error.DimensionMismatch;
+    }
 
     const src = try g.readF16(allocator, name);
     errdefer allocator.free(src);
@@ -322,7 +330,7 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
 pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, index: u32) !model.Matrices {
     var m = model.Matrices{};
     errdefer m.deinit(allocator);
-    var buf: [128]u8 = undefined;
+    var buf: [192]u8 = undefined;
     const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{index}) catch unreachable, cfg.hidden, cfg.qDim());
     defer allocator.free(q);
     const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
@@ -334,9 +342,20 @@ pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.C
     @memcpy(m.qkv[q.len..][0..k.len], k);
     @memcpy(m.qkv[q.len + k.len ..][0..v.len], v);
     m.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{index}) catch unreachable, cfg.qDim(), cfg.hidden);
-    m.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
-    m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
-    m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{index}) catch unreachable, cfg.inter, cfg.hidden);
+    if (cfg.layerIsSparse(index)) {
+        // Routed experts run on the CPU; the shared expert takes the dense slots so
+        // the ANE's existing FFN kernel serves it unchanged.
+        m.moe = try loadMoeLayer(allocator, g, cfg, index);
+        if (cfg.shared_inter > 0) {
+            m.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+            m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+            m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_shexp.weight", .{index}) catch unreachable, cfg.shared_inter, cfg.hidden);
+        }
+    } else {
+        m.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
+        m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
+        m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{index}) catch unreachable, cfg.inter, cfg.hidden);
+    }
     return m;
 }
 
@@ -407,7 +426,15 @@ pub fn loadMoeLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: mode
         moe.shared_gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
         moe.shared_up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
         moe.shared_down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_shexp.weight", .{index}) catch unreachable, cfg.shared_inter, cfg.hidden);
-        moe.shared_gate_lin = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp_shexp.weight", .{index}) catch unreachable, cfg.hidden, 1);
+        // A 1-D vector of length hidden, not a [1][hidden] matrix: ggml stores the
+        // shared-expert gate as {n_embd} and loadLinear's rank-2 checks reject it.
+        {
+            const gate_f32 = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp_shexp.weight", .{index}) catch unreachable);
+            defer allocator.free(gate_f32);
+            if (gate_f32.len != cfg.hidden) return Error.DimensionMismatch;
+            moe.shared_gate_lin = try allocator.alloc(f16, cfg.hidden);
+            for (gate_f32, 0..) |v, i| moe.shared_gate_lin[i] = @floatCast(v);
+        }
     }
     return moe;
 }
@@ -426,10 +453,21 @@ fn loadExperts(
     out_dim: u32,
     in_dim: u32,
 ) !void {
-    const t = g.tensor(name) orelse return Error.MissingTensor;
+    const t = g.tensor(name) orelse {
+        sys.eprint("gguf: no expert tensor {s}\n", .{name});
+        return Error.MissingTensor;
+    };
     const per_expert: u64 = @as(u64, out_dim) * in_dim;
-    if (t.elemCount() != per_expert * num_experts) return Error.DimensionMismatch;
-    if (t.dims.len != 3) return Error.DimensionMismatch;
+    if (t.elemCount() != per_expert * num_experts) {
+        sys.eprint("gguf: {s} has {d} elements, expected {d} ({d} experts x {d}x{d}), dims {any}\n", .{
+            name, t.elemCount(), per_expert * num_experts, num_experts, out_dim, in_dim, t.dims,
+        });
+        return Error.DimensionMismatch;
+    }
+    if (t.dims.len != 3) {
+        sys.eprint("gguf: {s} is not 3-D (dims {any})\n", .{ name, t.dims });
+        return Error.DimensionMismatch;
+    }
 
     // The expert axis is whichever dimension equals num_experts.
     var expert_axis: ?usize = null;
@@ -439,7 +477,10 @@ fn loadExperts(
             break;
         }
     }
-    const axis = expert_axis orelse return Error.DimensionMismatch;
+    const axis = expert_axis orelse {
+        sys.eprint("gguf: {s} dims {any} has no axis equal to {d} experts\n", .{ name, t.dims, num_experts });
+        return Error.DimensionMismatch;
+    };
 
     // ggml's ne[0] varies fastest, so the element at (i0, i1, i2) is at
     // i0 + ne0*(i1 + ne1*i2). Requiring the expert axis to be last keeps each
