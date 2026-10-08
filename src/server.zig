@@ -34,18 +34,28 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     session: *generate.Session,
     opts: Options,
+    /// Listener, so the mid-generation hook can poll for new connections.
+    listener: ?*http.Server = null,
+    /// Requests served while a generation was in flight.
+    served_during_generation: u64 = 0,
 
     pub fn run(self: *Server) !void {
         var srv = try http.Server.open(self.opts.host, self.opts.port);
         defer srv.close();
+        self.listener = &srv;
         sys.print("ANEDVD server listening on http://{s}:{d}\n", .{ self.opts.host, self.opts.port });
         sys.print("  model: {s}\n", .{self.opts.model_name});
         sys.print("  endpoints: /v1/chat/completions (OpenAI), /v1/messages (Anthropic), /v1/completions, /v1/models, / (WebUI)\n", .{});
         sys.print("  requests are served one at a time (single ANE engine)\n", .{});
 
         while (true) {
-            var conn = srv.accept() catch |e| {
-                sys.eprint("accept failed: {s}\n", .{@errorName(e)});
+            // Non-blocking so a connection that arrives mid-generation is
+            // noticed by servicePending() rather than queueing behind it.
+            srv.setNonBlocking(true);
+            const maybe = srv.acceptIfPending();
+            srv.setNonBlocking(false);
+            var conn = maybe orelse {
+                sys.sleepMs(2);
                 continue;
             };
             self.handle(&conn) catch |e| {
@@ -144,6 +154,7 @@ pub const Server = struct {
 
         if (!stream) {
             var collector = Collector.init(self.allocator);
+            collector.server = self;
             defer collector.deinit();
             const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
 
@@ -161,12 +172,43 @@ pub const Server = struct {
 
         try conn.beginStream(200, "OK", "text/event-stream");
         var sink = SseSink.init(self.allocator, conn, .openai, model_name, created);
+        sink.server = self;
         defer sink.deinit();
         sink.setStops(stops);
         const stats = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
         self.logStats(stats);
         if (!conn.alive) return;
         return sink.finishOpenAi(stats);
+    }
+
+    /// Called between generated tokens. Answers any connection that has already
+    /// sent a complete request and needs no generation (health, model list) so a
+    /// long generation cannot make the server look dead. Anything heavier is
+    /// left in the queue for the main loop.
+    pub fn servicePending(self: *Server) void {
+        var srv = self.listener orelse return;
+        srv.setNonBlocking(true);
+        const maybe = srv.acceptIfPending();
+        srv.setNonBlocking(false);
+        var conn = maybe orelse return;
+        defer conn.close();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        const req = conn.readRequest(a, &buf) catch return;
+        const path = req.path();
+        if (!std.mem.eql(u8, req.method, "GET")) return;
+        if (std.mem.eql(u8, path, "/health")) {
+            conn.sendBody(200, "OK", "application/json", "{\"status\":\"ok\"}") catch return;
+            self.served_during_generation += 1;
+            sys.eprint("[mid-gen] served /health while generating ({d} so far)\n", .{self.served_during_generation});
+        } else if (std.mem.eql(u8, path, "/v1/models")) {
+            self.sendModels(&conn) catch return;
+            self.served_during_generation += 1;
+        }
     }
 
     /// One line per request so multi-turn prefix reuse is observable in the
@@ -212,6 +254,7 @@ pub const Server = struct {
 
         if (!stream) {
             var collector = Collector.init(self.allocator);
+            collector.server = self;
             defer collector.deinit();
             const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
 
@@ -229,6 +272,7 @@ pub const Server = struct {
 
         try conn.beginStream(200, "OK", "text/event-stream");
         var sink = SseSink.init(self.allocator, conn, .openai_legacy, model_name, created);
+        sink.server = self;
         defer sink.deinit();
         sink.setStops(stops);
         _ = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
@@ -272,6 +316,7 @@ pub const Server = struct {
 
         if (!stream) {
             var collector = Collector.init(self.allocator);
+            collector.server = self;
             defer collector.deinit();
             const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
 
@@ -289,6 +334,7 @@ pub const Server = struct {
 
         try conn.beginStream(200, "OK", "text/event-stream");
         var sink = SseSink.init(self.allocator, conn, .anthropic, model_name, created);
+        sink.server = self;
         defer sink.deinit();
         sink.message_id = msg_id;
         sink.setStops(stops);
@@ -503,6 +549,8 @@ const JsonSink = struct {
 const Collector = struct {
     allocator: std.mem.Allocator,
     text: std.ArrayList(u8) = .empty,
+    /// Set for routes that should service liveness probes mid-generation.
+    server: ?*Server = null,
 
     fn init(allocator: std.mem.Allocator) Collector {
         return .{ .allocator = allocator };
@@ -515,6 +563,7 @@ const Collector = struct {
 fn collectEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
     _ = token_id;
     const c: *Collector = @ptrCast(@alignCast(ctx.?));
+    if (c.server) |srv| srv.servicePending();
     c.text.appendSlice(c.allocator, piece) catch return false;
     return true;
 }
@@ -551,6 +600,8 @@ const SseSink = struct {
     model: []const u8,
     created: i64,
     message_id: []const u8 = "",
+    /// Set for streaming routes so the emitter can service liveness probes.
+    server: ?*Server = null,
     pending: std.ArrayList(u8) = .empty,
     stops: []const []const u8 = &.{},
     holdback: usize = 0,
@@ -663,6 +714,7 @@ const SseSink = struct {
 fn sseEmit(ctx: ?*anyopaque, piece: []const u8, token_id: u32) bool {
     _ = token_id;
     const sink: *SseSink = @ptrCast(@alignCast(ctx.?));
+    if (sink.server) |srv| srv.servicePending();
     return sink.push(piece) catch {
         sink.conn.alive = false;
         return false;

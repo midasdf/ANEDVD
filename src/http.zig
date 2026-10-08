@@ -18,6 +18,7 @@ const libc = struct {
     extern "c" fn bind(fd: c_int, addr: *const std.c.sockaddr, len: std.c.socklen_t) c_int;
     extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
     extern "c" fn accept(fd: c_int, addr: ?*std.c.sockaddr, len: ?*std.c.socklen_t) c_int;
+    extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
     extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
     extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
     extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
@@ -29,6 +30,9 @@ const SOCK_STREAM: c_uint = 1;
 const SOL_SOCKET: c_int = 0xffff;
 const SO_REUSEADDR: c_int = 0x0004;
 const SO_NOSIGPIPE: c_int = 0x1022;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0x0004;
 const SO_RCVTIMEO: c_int = 0x1006;
 const SO_SNDTIMEO: c_int = 0x1005;
 const SHUT_WR: c_int = 1;
@@ -91,9 +95,40 @@ pub const Server = struct {
     pub fn accept(self: *Server) !Conn {
         const fd = libc.accept(self.fd, null, null);
         if (fd < 0) return Error.AcceptFailed;
+        return self.finishAccept(fd);
+    }
+
+    /// Non-blocking accept: returns null immediately when no client is waiting.
+    /// Used to service liveness probes while a generation is in flight.
+    pub fn acceptIfPending(self: *Server) ?Conn {
+        const fd = libc.accept(self.fd, null, null);
+        if (fd < 0) return null;
+        return self.finishAccept(fd) catch null;
+    }
+
+    fn finishAccept(self: *Server, fd: c_int) !Conn {
+        _ = self;
         const one: c_int = 1;
         _ = libc.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, @ptrCast(&one), @sizeOf(c_int));
+        const rcv = std.c.timeval{ .sec = RECV_TIMEOUT_S, .usec = 0 };
+        _ = libc.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, @ptrCast(&rcv), @sizeOf(std.c.timeval));
+        const snd = std.c.timeval{ .sec = SEND_TIMEOUT_S, .usec = 0 };
+        _ = libc.setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, @ptrCast(&snd), @sizeOf(std.c.timeval));
+        // The accepted socket can inherit O_NONBLOCK from the listener; clear it
+        // so recv() waits for a request body the way the parser expects.
+        const flags = libc.fcntl(fd, F_GETFL);
+        if (flags >= 0 and (flags & O_NONBLOCK) != 0) {
+            _ = libc.fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
         return .{ .fd = fd };
+    }
+
+    /// Toggle O_NONBLOCK on the LISTENER (affects acceptIfPending only).
+    pub fn setNonBlocking(self: *Server, enabled: bool) void {
+        const flags = libc.fcntl(self.fd, F_GETFL);
+        if (flags < 0) return;
+        const next = if (enabled) flags | O_NONBLOCK else flags & ~O_NONBLOCK;
+        _ = libc.fcntl(self.fd, F_SETFL, next);
     }
 
     pub fn close(self: *Server) void {

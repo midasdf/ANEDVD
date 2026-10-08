@@ -171,6 +171,18 @@ pub fn unixTime() i64 {
     return @intCast(ts.sec);
 }
 
+/// Sleep for `ms` milliseconds. std.Thread.sleep no longer exists in 0.17 and
+/// std.Io.sleep needs an Io, so this uses the POSIX primitive directly.
+pub fn sleepMs(ms: u64) void {
+    var ts = std.c.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    while (nanosleep(&ts, &ts) != 0) {}
+}
+
+extern "c" fn nanosleep(req: *const std.c.timespec, rem: *std.c.timespec) c_int;
+
 pub fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
