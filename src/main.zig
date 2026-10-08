@@ -309,6 +309,18 @@ fn refForward(
     defer allocator.free(act);
     const scores = try allocator.alloc(f32, pos + 1);
     defer allocator.free(scores);
+    // MoE scratch: sized generously, since the tiny test model has 60 experts and
+    // real ones have 128+. Only allocated, never touched, on the dense path.
+    const moe_experts = @max(cfg.num_experts, 1);
+    const router_logits = try allocator.alloc(f32, moe_experts);
+    defer allocator.free(router_logits);
+    const topk_cap = @max(cfg.experts_per_tok, 1);
+    const topk_probs = try allocator.alloc(f32, topk_cap);
+    defer allocator.free(topk_probs);
+    const topk_idx = try allocator.alloc(u32, topk_cap);
+    defer allocator.free(topk_idx);
+    const shared_out = try allocator.alloc(f32, hidden);
+    defer allocator.free(shared_out);
 
     for (0..hidden) |i| x[i] = @floatCast(mw.embed[@as(usize, token) * hidden + i]);
 
@@ -350,11 +362,43 @@ fn refForward(
         cpu.addInPlace(x, proj);
 
         cpu.rmsnorm(h, x, lw.ffn_norm, cfg.eps);
-        matmulF16(gate, lw.gate, h, inter, hidden);
-        matmulF16(up, lw.up, h, inter, hidden);
-        cpu.siluMul(act, gate, up);
-        matmulF16(proj, lw.down, act, hidden, inter);
-        cpu.addInPlace(x, proj);
+        if (lw.moe) |*moe| {
+            // MoE layer: route the token, run only the selected experts, then the
+            // always-on shared expert. Mirrors the reference block
+            // (see research/moe-design.md).
+            @memset(proj, 0);
+            matmulF16(router_logits, moe.router, h, moe.num_experts, hidden);
+            cpu.moeRoute(router_logits, cfg.experts_per_tok, cfg.norm_topk_prob, topk_probs, topk_idx);
+            for (topk_idx[0..cfg.experts_per_tok], topk_probs[0..cfg.experts_per_tok]) |e, p| {
+                cpu.moeExpertAccum(
+                    proj,
+                    gate,
+                    act,
+                    h,
+                    moe.expertGate(e),
+                    moe.expertUp(e),
+                    moe.expertDown(e),
+                    moe.inter,
+                    hidden,
+                    p,
+                );
+            }
+            if (moe.shared_inter > 0) {
+                cpu.mlpForward(shared_out, gate, h, moe.shared_gate, moe.shared_up, moe.shared_down, moe.shared_inter, hidden);
+                // sigmoid(shared_gate_lin . h) scales the shared expert's output.
+                var g: f32 = 0;
+                for (moe.shared_gate_lin, h) |w, xv| g += @as(f32, @floatCast(w)) * xv;
+                const scale = cpu.sigmoid(g);
+                for (proj, shared_out) |*o, s2| o.* += scale * s2;
+            }
+            cpu.addInPlace(x, proj);
+        } else {
+            matmulF16(gate, lw.gate, h, inter, hidden);
+            matmulF16(up, lw.up, h, inter, hidden);
+            cpu.siluMul(act, gate, up);
+            matmulF16(proj, lw.down, act, hidden, inter);
+            cpu.addInPlace(x, proj);
+        }
     }
     _ = hd;
     cpu.rmsnorm(h, x, mw.final_norm, cfg.eps);
@@ -919,16 +963,38 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    const has_chatml = tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null;
-    if (chat and has_chatml) {
-        try text.appendSlice(allocator, "<|im_start|>user\n");
-        try text.appendSlice(allocator, prompt);
-        try text.appendSlice(allocator, "<|im_end|>\n<|im_start|>assistant\n");
+    // --prompt-ids 1,2,3 bypasses the tokenizer, so this command can be compared
+    // against a different implementation on exactly the same inputs. Text would
+    // only agree up to tokenizer differences, which is not what is being checked.
+    var ids: []u32 = undefined;
+    defer if (ids.len > 0) allocator.free(ids);
+    if (argStr(argv, "--prompt-ids")) |spec| {
+        var list: std.ArrayList(u32) = .empty;
+        errdefer list.deinit(allocator);
+        var it = std.mem.tokenizeAny(u8, spec, ", ");
+        while (it.next()) |piece| {
+            try list.append(allocator, try std.fmt.parseInt(u32, piece, 10));
+        }
+        ids = try list.toOwnedSlice(allocator);
+        var prompt_text = std.ArrayList(u8).empty;
+        defer prompt_text.deinit(allocator);
+        for (ids) |id| {
+            const bytes = tok.tokenBytes(allocator, id) catch continue;
+            defer allocator.free(bytes);
+            try prompt_text.appendSlice(allocator, bytes);
+        }
+        sys.print("prompt ids ({d}): {s}\n---\n", .{ ids.len, prompt_text.items });
     } else {
-        try text.appendSlice(allocator, prompt);
+        const has_chatml = tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null;
+        if (chat and has_chatml) {
+            try text.appendSlice(allocator, "<|im_start|>user\n");
+            try text.appendSlice(allocator, prompt);
+            try text.appendSlice(allocator, "<|im_end|>\n<|im_start|>assistant\n");
+        } else {
+            try text.appendSlice(allocator, prompt);
+        }
+        ids = try tok.encode(allocator, text.items, true);
     }
-    const ids = try tok.encode(allocator, text.items, true);
-    defer allocator.free(ids);
 
     const L: usize = cfg.layers;
     var st = RefState{ .k = try allocator.alloc([]f16, L), .v = try allocator.alloc([]f16, L) };
@@ -952,9 +1018,17 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     const t0 = sys.nowNs();
     var logits: []f32 = undefined;
+    // A copy of the prompt's own prediction, kept because the decode loop below
+    // overwrites `logits` in place.
+    var prompt_logits: ?[]f32 = null;
+    defer if (prompt_logits) |p2| allocator.free(p2);
     for (ids, 0..) |id, pos| {
         if (pos > 0) allocator.free(logits);
         logits = try refForward(allocator, &mw, &st, id, @intCast(pos), cfg.layers);
+        if (pos + 1 == ids.len) {
+            if (prompt_logits) |p2| allocator.free(p2);
+            prompt_logits = try allocator.dupe(f32, logits);
+        }
     }
     defer allocator.free(logits);
     const t1 = sys.nowNs();
@@ -973,6 +1047,37 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         pos += 1;
     }
     const t2 = sys.nowNs();
+    // Report the PROMPT's prediction, not the last generated token's: the decode
+    // loop overwrites `logits`, and comparing a post-generation top-5 against
+    // another implementation's prompt logits silently compares different things.
+    const summary = prompt_logits orelse logits;
+    // Print the final logits' top-5 so another implementation can be compared
+    // numerically instead of by eyeballing generated text.
+    {
+        var best: [5]u32 = @splat(0);
+        var bestv: [5]f32 = @splat(-std.math.inf(f32));
+        for (summary, 0..) |v, i| {
+            for (0..5) |s2| {
+                if (v > bestv[s2]) {
+                    var j: usize = 4;
+                    while (j > s2) : (j -= 1) {
+                        bestv[j] = bestv[j - 1];
+                        best[j] = best[j - 1];
+                    }
+                    bestv[s2] = v;
+                    best[s2] = @intCast(i);
+                    break;
+                }
+            }
+        }
+        sys.print("\nprompt top5 ids:", .{});
+        for (best) |b| sys.print(" {d}", .{b});
+        sys.print("\nprompt top5 logits:", .{});
+        for (bestv) |b| sys.print(" {d:.6}", .{b});
+        var total: f64 = 0;
+        for (summary) |v| total += v;
+        sys.print("\nsum_logits: {d:.6}\n", .{total});
+    }
     sys.print("\n---\ncpu prefill {d:.2} s, decode {d:.2} s ({d:.1} tok/s)\n", .{
         @as(f64, @floatFromInt(t1 - t0)) / 1e9,
         @as(f64, @floatFromInt(t2 - t1)) / 1e9,

@@ -94,7 +94,26 @@ is hundreds of distinct experts x layers compiled and loaded, each compile costi
 milliseconds. Streaming a few MB of fp16 expert weights into a CPU matvec is
 simply faster than compiling a kernel for them.
 
-## Status
+## Status and verification
 
-Implemented for: safetensors Qwen2MoE (the tiny-random checkpoint is the test
-case). GGUF MoE is read for metadata but the expert tensors are not yet consumed.
+Implemented and verified for safetensors Qwen2MoE, against
+`yujiepan/qwen1.5-moe-tiny-random` (hidden 4, 60 experts, top-4, 2 layers).
+
+The check that matters: `tools/moe_reference.py` is a from-scratch Python forward
+written from the transformers reference, in f64, reading the safetensors file
+directly. On tokens 1000,2000,3000 the two implementations agree exactly:
+
+```
+Zig     prompt top5 ids: 103920 101469 145307 109789 147842
+        prompt top5 logits: 0.166585 0.165961 0.164188 0.163087 0.160523
+Python  top5 ids: 103920 101469 145307 109789 147842
+        top5 logits: 0.166585 0.165961 0.164188 0.163087 0.160523
+```
+
+`anedvd cpu --model <hf-dir> --prompt-ids 1000,2000,3000` runs the Zig reference on
+chosen token ids and prints this summary, so the comparison is numeric rather than
+by eyeballing generated text.
+
+Not yet done: GGUF MoE (metadata is read, the 3-D expert tensors are not consumed),
+and running the experts on the ANE at all — see the arithmetic above for why that
+is the wrong target.

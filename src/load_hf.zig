@@ -271,9 +271,15 @@ pub fn loadWeights(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.C
         @memcpy(lw.qkv[q.len + k.len ..][0..v.len], v);
 
         lw.o = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
-        lw.gate = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
-        lw.up = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.up_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
-        lw.down = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.down_proj.weight", .{li}) catch unreachable, cfg.inter, cfg.hidden);
+        if (cfg.layerIsSparse(li)) {
+            // Sparse layer: the dense gate/up/down are the shared expert's, loaded
+            // separately by loadMoeLayer. Nothing dense to read here.
+            lw.moe = try loadMoeLayer(allocator, sh, cfg, li);
+        } else {
+            lw.gate = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
+            lw.up = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.up_proj.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
+            lw.down = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.down_proj.weight", .{li}) catch unreachable, cfg.inter, cfg.hidden);
+        }
 
         if (sh.find(std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}) catch unreachable) != null) {
             lw.q_norm = try norm(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.self_attn.q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
@@ -295,4 +301,47 @@ pub fn loadWeights(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.C
         }
     }
     return mw;
+}
+
+/// Load the sparse block of a MoE layer from safetensors.
+///
+/// The expert tensors are `model.layers.N.mlp.experts.{e}.{gate,up,down}_proj.weight`,
+/// one per expert. They are stacked into a single [num_experts][inter][hidden]
+/// allocation so the routing path can index an expert with a slice instead of
+/// chasing per-expert allocations through a hash map on every token.
+pub fn loadMoeLayer(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.Config, index: u32) !model.MoeWeights {
+    var moe = model.MoeWeights{
+        .num_experts = cfg.num_experts,
+        .inter = cfg.moe_inter,
+        .shared_inter = cfg.shared_inter,
+        .hidden_dim = cfg.hidden,
+    };
+    errdefer moe.deinit(allocator);
+
+    const per_gate = @as(usize, cfg.moe_inter) * cfg.hidden;
+    var buf: [192]u8 = undefined;
+    moe.router = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.gate.weight", .{index}) catch unreachable, cfg.hidden, cfg.num_experts);
+    moe.gate = try allocator.alloc(f16, per_gate * cfg.num_experts);
+    moe.up = try allocator.alloc(f16, per_gate * cfg.num_experts);
+    moe.down = try allocator.alloc(f16, per_gate * cfg.num_experts);
+
+    for (0..cfg.num_experts) |e| {
+        const ge = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.experts.{d}.gate_proj.weight", .{ index, e }) catch unreachable, cfg.hidden, cfg.moe_inter);
+        defer allocator.free(ge);
+        const ue = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.experts.{d}.up_proj.weight", .{ index, e }) catch unreachable, cfg.hidden, cfg.moe_inter);
+        defer allocator.free(ue);
+        const de = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.experts.{d}.down_proj.weight", .{ index, e }) catch unreachable, cfg.moe_inter, cfg.hidden);
+        defer allocator.free(de);
+        @memcpy(moe.gate[e * per_gate ..][0..per_gate], ge);
+        @memcpy(moe.up[e * per_gate ..][0..per_gate], ue);
+        @memcpy(moe.down[e * per_gate ..][0..per_gate], de);
+    }
+
+    if (cfg.shared_inter > 0) {
+        moe.shared_gate = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.shared_expert.gate_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+        moe.shared_up = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.shared_expert.up_proj.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+        moe.shared_down = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.shared_expert.down_proj.weight", .{index}) catch unreachable, cfg.shared_inter, cfg.hidden);
+        moe.shared_gate_lin = try linear(allocator, sh, std.fmt.bufPrint(&buf, "model.layers.{d}.mlp.shared_expert_gate.weight", .{index}) catch unreachable, cfg.hidden, 1);
+    }
+    return moe;
 }

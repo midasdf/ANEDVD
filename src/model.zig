@@ -180,9 +180,67 @@ pub const HeadSource = struct {
     }
 };
 
+/// The sparse half of a MoE layer: a router, `num_experts` SwiGLU experts, and the
+/// always-on shared expert. Kept separate from `Matrices` because it is per-layer
+/// optional and much larger than the dense path.
+///
+/// The experts are stored stacked in one allocation each ([experts][inter][hidden]
+/// for gate/up and [experts][hidden][inter] for down) so the loader does one
+/// allocation per tensor instead of one per expert, and so the GGUF case (where
+/// the expert axis is the last one) has a natural place to land.
+pub const MoeWeights = struct {
+    /// [num_experts][hidden]
+    router: []f16 = &.{},
+    /// [num_experts][moe_inter][hidden]
+    gate: []f16 = &.{},
+    up: []f16 = &.{},
+    /// [num_experts][hidden][moe_inter]
+    down: []f16 = &.{},
+    num_experts: u32 = 0,
+    inter: u32 = 0,
+    /// The dense MLP every token also passes through; widths from
+    /// `shared_inter`. Empty when the model has no shared expert.
+    shared_gate: []f16 = &.{},
+    shared_up: []f16 = &.{},
+    shared_down: []f16 = &.{},
+    /// [1][hidden] gate on the shared expert's output.
+    shared_gate_lin: []f16 = &.{},
+    shared_inter: u32 = 0,
+    /// Cached so `expertGate` and friends can stride without a Config.
+    hidden_dim: u32 = 0,
+
+    pub fn deinit(self: *MoeWeights, allocator: std.mem.Allocator) void {
+        if (self.router.len > 0) allocator.free(self.router);
+        if (self.gate.len > 0) allocator.free(self.gate);
+        if (self.up.len > 0) allocator.free(self.up);
+        if (self.down.len > 0) allocator.free(self.down);
+        if (self.shared_gate.len > 0) allocator.free(self.shared_gate);
+        if (self.shared_up.len > 0) allocator.free(self.shared_up);
+        if (self.shared_down.len > 0) allocator.free(self.shared_down);
+        if (self.shared_gate_lin.len > 0) allocator.free(self.shared_gate_lin);
+        self.* = .{};
+    }
+
+    /// One expert's gate slice, [inter][hidden].
+    pub fn expertGate(self: *const MoeWeights, e: u32) []const f16 {
+        const stride = @as(usize, self.inter) * self.hidden_dim;
+        return self.gate[@as(usize, e) * stride ..][0..stride];
+    }
+    pub fn expertUp(self: *const MoeWeights, e: u32) []const f16 {
+        const stride = @as(usize, self.inter) * self.hidden_dim;
+        return self.up[@as(usize, e) * stride ..][0..stride];
+    }
+    pub fn expertDown(self: *const MoeWeights, e: u32) []const f16 {
+        const stride = @as(usize, self.hidden_dim) * self.inter;
+        return self.down[@as(usize, e) * stride ..][0..stride];
+    }
+};
+
 pub const LayerWeights = struct {
     attn_norm: []f32 = &.{}, // [hidden]
     ffn_norm: []f32 = &.{}, // [hidden]
+    /// Present only for sparse layers of a MoE model.
+    moe: ?MoeWeights = null,
     /// Per-head Q/K normalisation (Qwen3): [head_dim] each. The engine keeps
     /// these in `Norm`, but the CPU reference walks LayerWeights, so they are
     /// loaded here too.
@@ -251,6 +309,7 @@ pub const LayerWeights = struct {
         if (self.o_bias) |b| allocator.free(b);
         if (self.q_norm) |b| allocator.free(b);
         if (self.k_norm) |b| allocator.free(b);
+        if (self.moe) |*m| m.deinit(allocator);
         self.* = .{};
     }
 };
