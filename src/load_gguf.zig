@@ -79,16 +79,43 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     cfg.rope_adjacent = ropeIsAdjacent(arch);
 
     // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /
-    // .expert_shared_feed_forward_length / .expert_shared_count).
+    // .expert_shared_count / .expert_feed_forward_length).
     cfg.num_experts = g.getU32(key(&buf, arch, "expert_count")) orelse 0;
     cfg.experts_per_tok = g.getU32(key(&buf, arch, "expert_used_count")) orelse 0;
-    cfg.moe_inter = g.getU32(key(&buf, arch, "expert_feed_forward_length")) orelse cfg.inter;
-    cfg.shared_inter = g.getU32(key(&buf, arch, "expert_shared_feed_forward_length")) orelse 0;
-    // If a model has experts but no per-expert width, the expert tensors will not
-    // load; say so rather than failing later with a shape mismatch.
-    if (cfg.num_experts > 0 and cfg.experts_per_tok == 0) {
-        sys.eprint("warning: {s} declares {d} experts but no expert_used_count; assuming 2.\n", .{ arch, cfg.num_experts });
-        cfg.experts_per_tok = 2;
+    if (cfg.num_experts > 0) {
+        if (cfg.experts_per_tok == 0) {
+            sys.eprint("warning: {s} declares {d} experts but no expert_used_count; assuming 2.\n", .{ arch, cfg.num_experts });
+            cfg.experts_per_tok = 2;
+        }
+        // The tensor shapes are authoritative, not the metadata. Qwen1.5-MoE ships
+        // no expert_feed_forward_length at all, and its feed_forward_length (5632)
+        // is the SHARED expert's width while the routed experts are 1408 — so
+        // defaulting one from the other silently sizes every expert wrong, or
+        // skips the shared expert entirely. Read the widths off the tensors the
+        // same way llama.cpp does.
+        const gate_exps = g.tensor(std.fmt.bufPrint(&buf, "blk.0.ffn_gate_exps.weight", .{}) catch unreachable);
+        if (gate_exps) |t| {
+            if (t.dims.len == 3) {
+                // {hidden, moe_inter, num_experts} with the expert axis last.
+                cfg.moe_inter = @intCast(t.dims[1]);
+                if (t.dims[2] != cfg.num_experts) {
+                    sys.eprint("warning: expert_count is {d} but ffn_gate_exps has {d} experts; trusting the tensor.\n", .{ cfg.num_experts, t.dims[2] });
+                    cfg.num_experts = @intCast(t.dims[2]);
+                }
+            }
+        } else {
+            cfg.moe_inter = g.getU32(key(&buf, arch, "expert_feed_forward_length")) orelse cfg.inter;
+        }
+        // The shared expert's width comes from its tensor when the metadata omits it
+        // (Qwen1.5-MoE does). A 0 here would silently drop the shared expert from
+        // the forward pass, which is a wrong answer rather than a slow one.
+        cfg.shared_inter = g.getU32(key(&buf, arch, "expert_shared_feed_forward_length")) orelse blk: {
+            const shexp = g.tensor(std.fmt.bufPrint(&buf, "blk.0.ffn_gate_shexp.weight", .{}) catch unreachable) orelse break :blk 0;
+            // {hidden, inter}: ggml's ne[0] is hidden and varies fastest, so the
+            // shared width is dims[1]. Reading dims[0] yields the hidden size, which
+            // is plausible enough to pass unnoticed.
+            break :blk if (shexp.dims.len >= 2) @as(u32, @intCast(shexp.dims[1])) else cfg.inter;
+        };
     }
     try cfg.validate();
 
