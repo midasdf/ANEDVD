@@ -268,6 +268,19 @@ pub const Tokenizer = struct {
     specials: []const Special = &.{},
     bos: ?u32 = null,
     eos: ?u32 = null,
+    /// True when the vocabulary is SentencePiece (`tokenizer.ggml.model =
+    /// "llama"`): pieces use U+2581 for a leading space and the vocabulary has
+    /// no `merges` list, so encoding works by longest-match rather than BPE.
+    sentencepiece: bool = false,
+    /// The GGUF `general.architecture`, when the tokenizer came from one.
+    arch: []const u8 = "",
+    /// The GGUF `tokenizer.chat_template`, when present. This is the only
+    /// reliable way to pick a template for models whose markers (<|user|> etc.)
+    /// are plain text rather than vocabulary entries.
+    chat_template: []const u8 = "",
+    /// SentencePiece scores, used to derive token classes when the file has no
+    /// `tokenizer.ggml.token_type` (TinyLlama, Llama-2 era).
+    scores: ?[]const f32 = null,
     /// `tokenizer.ggml.add_bos_token` (default true).
     add_bos: bool = true,
 
@@ -283,14 +296,12 @@ pub const Tokenizer = struct {
 
     pub fn fromGguf(allocator: Allocator, g: *const gguf.Gguf) !Tokenizer {
         last_error_detail = null;
+        var is_spm = false;
         if (g.getString("tokenizer.ggml.model")) |model| {
-            if (!std.mem.eql(u8, model, "gpt2") and !std.mem.eql(u8, model, "bpe")) {
-                // Say which vocabulary it is and what would be needed: a bare
-                // "UnsupportedTokenizerModel" sends the reader to the source.
-                last_error_detail = if (std.mem.eql(u8, model, "llama"))
-                    "this model uses a SentencePiece (\"llama\") vocabulary, and only byte-level BPE (\"gpt2\"/\"bpe\") is implemented. Most Llama-2/TinyLlama-era and Gemma GGUFs are SentencePiece; use a model with a GPT-2-style vocabulary (Llama 3, Qwen2/3, SmolLM2/3, Mistral-v0.3+) or convert the vocabulary."
-                else
-                    "only byte-level BPE vocabularies (tokenizer.ggml.model = \"gpt2\" or \"bpe\") are implemented.";
+            if (std.mem.eql(u8, model, "llama")) {
+                is_spm = true;
+            } else if (!std.mem.eql(u8, model, "gpt2") and !std.mem.eql(u8, model, "bpe")) {
+                last_error_detail = "only byte-level BPE (\"gpt2\"/\"bpe\") and SentencePiece (\"llama\") vocabularies are implemented.";
                 return error.UnsupportedTokenizerModel;
             }
         } else {
@@ -310,7 +321,18 @@ pub const Tokenizer = struct {
         errdefer t.deinit();
 
         try t.setTokens(tokens);
-        if (g.getValue("tokenizer.ggml.token_type")) |v| try t.setTokenTypes(v);
+        t.sentencepiece = is_spm;
+        if (g.arch()) |arch| t.arch = try t.arena.allocator().dupe(u8, arch);
+        if (g.getString("tokenizer.chat_template")) |tmpl| {
+            t.chat_template = try t.arena.allocator().dupe(u8, tmpl);
+        }
+        if (g.getValue("tokenizer.ggml.token_type")) |v| {
+            try t.setTokenTypes(v);
+        } else if (is_spm) {
+            // No token_type array: derive the classes from the scores, which is
+            // how llama.cpp does it for SentencePiece vocabularies.
+            try t.deriveTokenTypesFromScores(g);
+        }
         if (g.getStringArray("tokenizer.ggml.merges")) |merges| try t.addMerges(merges);
         t.bos = g.getU32("tokenizer.ggml.bos_token_id");
         t.eos = g.getU32("tokenizer.ggml.eos_token_id");
@@ -486,6 +508,121 @@ pub const Tokenizer = struct {
         return out.toOwnedSlice(a);
     }
 
+    /// Derive token classes from SentencePiece scores.
+    ///
+    /// SentencePiece vocabularies usually ship without `tokenizer.ggml.token_type`.
+    /// llama.cpp falls back to the scores: control pieces (like <s>, </s>) have
+    /// score 0, and the 256 byte pieces have the most negative scores. This
+    /// mirrors that so `decode` skips the right pieces.
+    fn deriveTokenTypesFromScores(self: *Tokenizer, g: *const gguf.Gguf) !void {
+        const scores_val = g.getValue("tokenizer.ggml.scores") orelse return;
+        if (scores_val != .array) return;
+        const raw: []const f32 = switch (scores_val.array.data) {
+            .f32 => |s| s,
+            .f64 => |s| blk: {
+                const a0 = self.arena.allocator();
+                const conv = try a0.alloc(f32, s.len);
+                for (s, 0..) |v, i| conv[i] = @floatCast(v);
+                break :blk conv;
+            },
+            else => return,
+        };
+        if (raw.len < self.tokens.len) return;
+        const a = self.arena.allocator();
+        const owned = try a.dupe(f32, raw[0..self.tokens.len]);
+        self.scores = owned;
+
+        // The 256 single-byte pieces have the lowest scores; control tokens sit
+        // at 0.0. Everything else is a normal piece.
+        var lowest: f32 = 0;
+        for (owned) |v| lowest = @min(lowest, v);
+
+        for (self.tokens, 0..) |tok, i| {
+            if (owned[i] <= lowest) {
+                self.token_types[i] = .byte;
+            } else if (owned[i] == 0 and tok.len > 1 and tok[0] == '<') {
+                self.token_types[i] = .control;
+            }
+        }
+    }
+
+    /// SentencePiece encoding: split on whitespace, prefix each word with U+2581,
+    /// then take the longest matching vocabulary piece at each position.
+    ///
+    /// Not BPE: a SentencePiece GGUF has no `merges` list, so the merge ranks the
+    /// GPT-2 path relies on do not exist. Longest-match over the pieces is what
+    /// llama.cpp's SPM path approximates.
+    fn encodeSegmentSpm(self: *const Tokenizer, a: Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+        const SEP = "\u{2581}";
+        var i: usize = 0;
+        while (i < text.len) {
+            // A literal space is encoded by the separator that prefixes the next
+            // piece, so consume it here rather than emitting a <0x20> piece (which
+            // would double the space on decode).
+            if (text[i] == ' ') {
+                i += 1;
+                continue;
+            }
+            // At a word boundary, try the piece formed with the separator first.
+            const at_boundary = blk: {
+                if (i == 0) break :blk true;
+                const prev = text[i - 1];
+                break :blk prev == ' ' or prev == '\n' or prev == '\t';
+            };
+            var best_len: usize = 0;
+            var best_id: u32 = 0;
+            // Candidate pieces: longest match starting at i, with or without the
+            // leading separator.
+            var len: usize = text.len - i;
+            while (len > 0) : (len -= 1) {
+                const piece = text[i..][0..len];
+                if (at_boundary) {
+                    var buf: [256]u8 = undefined;
+                    const with_sep = std.fmt.bufPrint(&buf, "{s}{s}", .{ SEP, piece }) catch null;
+                    if (with_sep) |ws| {
+                        if (self.index.get(ws)) |id| {
+                            if (len > best_len) {
+                                best_len = len;
+                                best_id = id;
+                            }
+                        }
+                    }
+                }
+                if (self.index.get(piece)) |id| {
+                    if (len > best_len) {
+                        best_len = len;
+                        best_id = id;
+                    }
+                }
+                if (len > 64) {
+                    // Long pieces are rare; cap the scan so a pathological input
+                    // cannot make this quadratic in the whole segment.
+                    len = 64;
+                    continue;
+                }
+            }
+            if (best_len > 0) {
+                try out.append(a, best_id);
+                i += best_len;
+                continue;
+            }
+            // No piece matched: fall back to a single byte. SentencePiece
+            // vocabularies contain all 256 byte pieces, so this should not
+            // normally happen.
+            try out.append(a, self.byteFallbackId(text[i]) orelse return error.UnencodableText);
+            i += 1;
+        }
+    }
+
+    /// The vocabulary id whose piece is the raw byte `b` (SentencePiece byte
+    /// pieces are usually `\u2581`+letter forms, so this is a best effort).
+    fn byteFallbackId(self: *const Tokenizer, b: u8) ?u32 {
+        var buf: [8]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{b}) catch return null;
+        if (self.index.get(s)) |id| return id;
+        return self.index.get(&[_]u8{b});
+    }
+
     /// Decodes token ids back to bytes.  CONTROL tokens (BOS/EOS and other
     /// specials) are skipped; unknown control-ish slots decode to nothing.
     pub fn decode(self: *const Tokenizer, allocator: Allocator, ids: []const u32) ![]u8 {
@@ -494,7 +631,11 @@ pub const Tokenizer = struct {
         for (ids) |id| {
             if (id >= self.tokens.len) return error.InvalidTokenId;
             if (self.token_types[id].isSpecial()) continue;
-            try appendDecoded(allocator, &out, self.tokens[id]);
+            if (self.sentencepiece) {
+                try appendDecodedSpm(allocator, &out, self.tokens[id]);
+            } else {
+                try appendDecoded(allocator, &out, self.tokens[id]);
+            }
         }
         return out.toOwnedSlice(allocator);
     }
@@ -504,7 +645,15 @@ pub const Tokenizer = struct {
         if (id >= self.tokens.len) return error.InvalidTokenId;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
-        if (!self.token_types[id].isSpecial()) try appendDecoded(allocator, &out, self.tokens[id]);
+        if (!self.token_types[id].isSpecial()) {
+            // The same branch `decode` takes, so streamed output and `decode`
+            // never disagree (this path emitted literal "\u2581" for a while).
+            if (self.sentencepiece) {
+                try appendDecodedSpm(allocator, &out, self.tokens[id]);
+            } else {
+                try appendDecoded(allocator, &out, self.tokens[id]);
+            }
+        }
         return out.toOwnedSlice(allocator);
     }
 
@@ -614,8 +763,10 @@ pub const Tokenizer = struct {
         return null;
     }
 
-    /// Pre-tokenizes and BPE-merges one plain-text span.
+    /// Pre-tokenizes and BPE-merges one plain-text span, or takes the
+    /// SentencePiece path for `llama`-style vocabularies.
     fn encodeSegment(self: *const Tokenizer, a: Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+        if (self.sentencepiece) return self.encodeSegmentSpm(a, text, out);
         var mapped: std.ArrayList(u8) = .empty;
         defer mapped.deinit(a);
         var symbols: std.ArrayList(Symbol) = .empty;
@@ -708,6 +859,33 @@ pub const Tokenizer = struct {
 const Symbol = struct { start: usize, len: usize };
 
 /// Appends `token`'s text with the byte-level mapping reversed.
+/// Append a SentencePiece piece in plain text form: U+2581 becomes a space and
+/// `<0xXX>` becomes the raw byte.
+pub fn appendDecodedSpm(allocator: Allocator, out: *std.ArrayList(u8), token: []const u8) !void {
+    if (token.len == 6 and token[0] == '<' and token[1] == '0' and token[2] == 'x' and token[5] == '>') {
+        const b = std.fmt.parseInt(u8, token[3..5], 16) catch {
+            try out.appendSlice(allocator, token);
+            return;
+        };
+        try out.append(allocator, b);
+        return;
+    }
+    var i: usize = 0;
+    while (i < token.len) {
+        const len = std.unicode.utf8ByteSequenceLength(token[i]) catch 1;
+        if (i + len <= token.len) {
+            const cp = std.unicode.utf8Decode(token[i..][0..len]) catch 0;
+            if (cp == 0x2581) {
+                try out.append(allocator, ' ');
+                i += len;
+                continue;
+            }
+        }
+        try out.append(allocator, token[i]);
+        i += 1;
+    }
+}
+
 fn appendDecoded(a: Allocator, out: *std.ArrayList(u8), token: []const u8) !void {
     var i: usize = 0;
     while (i < token.len) {
@@ -799,6 +977,14 @@ const KvBuilder = struct {
         try self.int(u32, 8);
         try self.int(u64, items.len);
         for (items) |s| try self.str(s);
+    }
+
+    fn kvF32Array(self: *KvBuilder, key: []const u8, items: []const f32) !void {
+        try self.str(key);
+        try self.int(u32, 9); // array
+        try self.int(u32, 6); // f32 elements
+        try self.int(u64, items.len);
+        for (items) |v| try self.int(u32, @bitCast(v));
     }
 
     fn kvI32Array(self: *KvBuilder, key: []const u8, items: []const i32) !void {
@@ -1018,16 +1204,35 @@ test "fromGguf honors add_bos_token = false" {
     try testing.expectEqualSlices(u32, &.{259}, ids);
 }
 
-test "fromGguf rejects non-BPE models and missing vocabularies" {
+test "fromGguf accepts a llama (SentencePiece) vocabulary" {
     const a = testing.allocator;
+    var b = KvBuilder{ .a = a };
+    defer b.buf.deinit(a);
+    try b.int(u32, 0x4655_4747);
+    try b.int(u32, 3);
+    try b.int(u64, 0);
+    try b.int(u64, 3);
+    try b.kvString("tokenizer.ggml.model", "llama");
+    try b.kvStringArray("tokenizer.ggml.tokens", &.{ "a", "\u{2581}b" });
+    try b.kvF32Array("tokenizer.ggml.scores", &.{ -1.0, -2.0 });
+    while (b.buf.items.len % 32 != 0) try b.buf.append(a, 0);
+    var g = try gguf.Gguf.fromBytes(a, b.buf.items);
+    defer g.deinit();
+    var tok = try Tokenizer.fromGguf(a, &g);
+    defer tok.deinit();
+    try testing.expect(tok.sentencepiece);
+    try testing.expectEqual(@as(usize, 2), tok.vocabSize());
+}
 
+test "fromGguf rejects a vocabulary type it does not implement" {
+    const a = testing.allocator;
     var b = KvBuilder{ .a = a };
     defer b.buf.deinit(a);
     try b.int(u32, 0x4655_4747);
     try b.int(u32, 3);
     try b.int(u64, 0);
     try b.int(u64, 2);
-    try b.kvString("tokenizer.ggml.model", "llama");
+    try b.kvString("tokenizer.ggml.model", "wordpiece");
     try b.kvStringArray("tokenizer.ggml.tokens", &.{"a"});
     while (b.buf.items.len % 32 != 0) try b.buf.append(a, 0);
     var g = try gguf.Gguf.fromBytes(a, b.buf.items);
@@ -1081,6 +1286,55 @@ test "fromTokenizerJson loads HF fixtures (string and array merges)" {
         defer a.free(jap_back);
         try testing.expectEqualStrings("日本語", jap_back);
     }
+}
+
+test "spm decode reverses the separator and byte pieces" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendDecodedSpm(a, &out, "\u{2581}Paris");
+    try std.testing.expectEqualStrings(" Paris", out.items);
+    out.clearRetainingCapacity();
+    try appendDecodedSpm(a, &out, "<0x0A>");
+    try std.testing.expectEqualStrings("\n", out.items);
+    out.clearRetainingCapacity();
+    // A plain piece with no separator passes through.
+    try appendDecodedSpm(a, &out, ".");
+    try std.testing.expectEqualStrings(".", out.items);
+    out.clearRetainingCapacity();
+    // A multi-byte character survives the byte walk.
+    try appendDecodedSpm(a, &out, "\u{2581}\u{65e5}\u{672c}");
+    try std.testing.expectEqualStrings(" \u{65e5}\u{672c}", out.items);
+}
+
+test "spm encode round-trips through decode" {
+    const a = testing.allocator;
+    // A miniature SentencePiece-style vocabulary built as a GGUF, so the pieces
+    // can contain a literal U+2581 without JSON escaping games.
+    var b = KvBuilder{ .a = a };
+    defer b.buf.deinit(a);
+    try b.int(u32, 0x4655_4747);
+    try b.int(u32, 3);
+    try b.int(u64, 0);
+    try b.int(u64, 3);
+    try b.kvString("tokenizer.ggml.model", "llama");
+    try b.kvStringArray("tokenizer.ggml.tokens", &.{
+        "\u{2581}the", "\u{2581}capital", "\u{2581}of", "\u{2581}France", "\u{2581}is", "\u{2581}Paris", ".",
+    });
+    try b.kvF32Array("tokenizer.ggml.scores", &.{ -1, -2, -3, -4, -5, -6, -7 });
+    while (b.buf.items.len % 32 != 0) try b.buf.append(a, 0);
+    var g = try gguf.Gguf.fromBytes(a, b.buf.items);
+    defer g.deinit();
+    var tok = try Tokenizer.fromGguf(a, &g);
+    defer tok.deinit();
+    try testing.expect(tok.sentencepiece);
+
+    const ids = try tok.encode(a, "the capital of France is Paris.", false);
+    defer a.free(ids);
+    try testing.expectEqual(@as(usize, 7), ids.len);
+    const back = try tok.decode(a, ids);
+    defer a.free(back);
+    try testing.expectEqualStrings(" the capital of France is Paris.", back);
 }
 
 test "fromTokenizerJsonSlice rejects non-BPE models" {

@@ -260,6 +260,31 @@ pub fn formatChatFor(
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     const chatml = tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null;
+    // Zephyr/TinyLlama style: <|user|>\n...<|assistant|>\n, with EOS between turns.
+    // The markers are NOT vocabulary entries in those files (only ChatML models
+    // put their markers in the vocabulary), so this is selected from the GGUF
+    // `tokenizer.chat_template` text, not by tokenId lookup.
+    const zephyr = !chatml and std.mem.indexOf(u8, tok.chat_template, "<|user|>") != null;
+
+    if (zephyr) {
+        // The template uses the EOS *piece text* as the separator; emitting the
+        // literal string keeps this independent of how EOS is spelled.
+        const eos_text = if (tok.eosId()) |e| tok.tokenText(e) else "";
+        if (default_system) |sys_text| {
+            try out.appendSlice(allocator, "<|system|>\n");
+            try out.appendSlice(allocator, sys_text);
+            try out.appendSlice(allocator, eos_text);
+        }
+        for (messages) |m| {
+            try out.appendSlice(allocator, "<|");
+            try out.appendSlice(allocator, m.role.toString());
+            try out.appendSlice(allocator, "|>\n");
+            try out.appendSlice(allocator, m.content);
+            try out.appendSlice(allocator, eos_text);
+        }
+        try out.appendSlice(allocator, "<|assistant|>\n");
+        return out.toOwnedSlice(allocator);
+    }
 
     if (chatml) {
         var wrote_system = false;
