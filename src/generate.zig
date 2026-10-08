@@ -114,6 +114,9 @@ pub const Session = struct {
 
     pub fn init(allocator: std.mem.Allocator, engine: *engine_mod.Engine, tok: *const tokenizer_mod.Tokenizer) Session {
         const candidates = allocator.alloc(cpu.Candidate, tok.vocabSize()) catch &empty_candidates;
+        // Probe buffer sized for the whole vocabulary: 151936 candidates is
+        // 1.2 MB, trivial next to the weights, and it makes the concentration
+        // measurement exact instead of capped.
         return .{
             .allocator = allocator,
             .engine = engine,
