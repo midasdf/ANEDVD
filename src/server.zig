@@ -176,6 +176,15 @@ pub const Server = struct {
             return conn.sendBody(200, "OK", "application/json", b.slice());
         }
 
+        // Prefill happens before any token is emitted, and for a long prompt it
+        // is seconds long, so hook the server into the chunk loop.
+        self.session.engine.prefill_tick = prefillTick;
+        self.session.engine.prefill_tick_ctx = self;
+        defer {
+            self.session.engine.prefill_tick = null;
+            self.session.engine.prefill_tick_ctx = null;
+        }
+
         try conn.beginStream(200, "OK", "text/event-stream");
         var sink = SseSink.init(self.allocator, conn, .openai, model_name, created);
         sink.server = self;
@@ -323,6 +332,15 @@ pub const Server = struct {
             return conn.sendBody(200, "OK", "application/json", b.slice());
         }
 
+        // Prefill happens before any token is emitted, and for a long prompt it
+        // is seconds long, so hook the server into the chunk loop.
+        self.session.engine.prefill_tick = prefillTick;
+        self.session.engine.prefill_tick_ctx = self;
+        defer {
+            self.session.engine.prefill_tick = null;
+            self.session.engine.prefill_tick_ctx = null;
+        }
+
         try conn.beginStream(200, "OK", "text/event-stream");
         var sink = SseSink.init(self.allocator, conn, .openai_legacy, model_name, created);
         sink.server = self;
@@ -383,6 +401,15 @@ pub const Server = struct {
                 anthropicStop(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens,
             });
             return conn.sendBody(200, "OK", "application/json", b.slice());
+        }
+
+        // Prefill happens before any token is emitted, and for a long prompt it
+        // is seconds long, so hook the server into the chunk loop.
+        self.session.engine.prefill_tick = prefillTick;
+        self.session.engine.prefill_tick_ctx = self;
+        defer {
+            self.session.engine.prefill_tick = null;
+            self.session.engine.prefill_tick_ctx = null;
         }
 
         try conn.beginStream(200, "OK", "text/event-stream");
@@ -763,6 +790,11 @@ const SseSink = struct {
         try js.flush();
     }
 };
+
+fn prefillTick(ctx: ?*anyopaque) void {
+    const self: *Server = @ptrCast(@alignCast(ctx orelse return));
+    self.servicePending();
+}
 
 /// 503 with Retry-After for a request that needs the busy engine.
 ///

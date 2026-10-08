@@ -136,6 +136,11 @@ pub const Engine = struct {
     stats: Stats = .{},
     /// Number of layers actually executed (all of them; see stopAfterLayer).
     active_layers: u32 = 0,
+    /// Called between prefill chunks so the server can answer cheap requests
+    /// while a long prompt is still being prefilled. A 971-token prompt is ~8
+    /// chunks and took 6.4 s, during which /health was unanswerable.
+    prefill_tick: ?*const fn (?*anyopaque) void = null,
+    prefill_tick_ctx: ?*anyopaque = null,
 
     pub fn deinit(self: *Engine) void {
         for (self.kernels) |*k| {
@@ -437,6 +442,9 @@ pub const Engine = struct {
 
         var done: usize = 0;
         while (done < ids.len) {
+            // Let the server answer /health and /v1/models while a long prompt
+            // is still being prefilled.
+            if (self.prefill_tick) |tick| tick(self.prefill_tick_ctx);
             const n = @min(ch, ids.len - done);
             const base_pos: u32 = start_pos + @as(u32, @intCast(done));
 
