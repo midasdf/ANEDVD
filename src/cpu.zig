@@ -664,6 +664,140 @@ test "attentionPrefill matches attentionDecode for a single query" {
     for (a, b) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
 }
 
+/// Brute-force attention with no SIMD and no specialisation, to compare the
+/// fast paths against. Written from the definition, not from the code under
+/// test, so agreeing with it means something.
+fn attentionDecodeReference(
+    out: []f32,
+    q: []const f32,
+    k_cache: []const f16,
+    v_cache: []const f16,
+    n_past: usize,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) void {
+    const hd: usize = head_dim;
+    const kv_dim: usize = @as(usize, n_kv_heads) * hd;
+    const group = n_heads / n_kv_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    for (0..n_heads) |h| {
+        const kvh = h / group;
+        var maxv: f32 = -std.math.inf(f32);
+        for (0..n_past) |t| {
+            var s: f32 = 0;
+            for (0..hd) |d| s += q[h * hd + d] * @as(f32, @floatCast(k_cache[t * kv_dim + kvh * hd + d]));
+            s *= scale;
+            out[n_heads * hd + t] = s; // reuse the tail of `out` as score scratch
+            maxv = @max(maxv, s);
+        }
+        var sum: f32 = 0;
+        for (0..n_past) |t| {
+            const e = std.math.exp(out[n_heads * hd + t] - maxv);
+            out[n_heads * hd + t] = e;
+            sum += e;
+        }
+        for (0..hd) |d| {
+            var acc: f32 = 0;
+            for (0..n_past) |t| acc += (out[n_heads * hd + t] / sum) * @as(f32, @floatCast(v_cache[t * kv_dim + kvh * hd + d]));
+            out[h * hd + d] = acc;
+        }
+    }
+}
+
+test "attentionDecode fast paths match a brute-force reference" {
+    // The hd == 64 branch is a hand-vectorised specialisation used by the models
+    // this project actually runs (SmolLM2, Qwen2.5-0.5B), and it had no test at
+    // all; nothing exercised a head_dim above 4.
+    const a = std.testing.allocator;
+    inline for (.{ 64, 128, 8 }) |head_dim| {
+        const heads: u32 = 4;
+        const kv_heads: u32 = 2;
+        const hd: usize = head_dim;
+        const n_past: usize = 5;
+        const kv_dim = @as(usize, kv_heads) * hd;
+
+        var prng = std.Random.DefaultPrng.init(head_dim * 7 + 1);
+        const rand = prng.random();
+
+        const q = try a.alloc(f32, @as(usize, heads) * hd);
+        defer a.free(q);
+        const k = try a.alloc(f16, n_past * kv_dim);
+        defer a.free(k);
+        const v = try a.alloc(f16, n_past * kv_dim);
+        defer a.free(v);
+        const got = try a.alloc(f32, @as(usize, heads) * hd);
+        defer a.free(got);
+        const want = try a.alloc(f32, @as(usize, heads) * hd + n_past);
+        defer a.free(want);
+        const scratch = try a.alloc(f32, n_past);
+        defer a.free(scratch);
+
+        for (q) |*x| x.* = rand.float(f32) * 2 - 1;
+        for (k) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
+        for (v) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
+
+        attentionDecode(got, q, k, v, n_past, heads, kv_heads, head_dim, scratch);
+        @memset(want, 0);
+        attentionDecodeReference(want[0 .. @as(usize, heads) * hd], q, k, v, n_past, heads, kv_heads, head_dim);
+        for (0..@as(usize, heads) * hd) |i| {
+            try std.testing.expectApproxEqAbs(want[i], got[i], 1e-3);
+        }
+    }
+}
+
+test "attentionPrefill fast paths match attentionDecode" {
+    // Same idea for the batched path at the head dimensions the real models use.
+    const a = std.testing.allocator;
+    inline for (.{ 64, 128 }) |head_dim| {
+        const heads: u32 = 4;
+        const kv_heads: u32 = 2;
+        const hd: usize = head_dim;
+        const n_past: usize = 6;
+        const n_q: usize = 3;
+        const kv_dim = @as(usize, kv_heads) * hd;
+        const q_dim = @as(usize, heads) * hd;
+
+        var prng = std.Random.DefaultPrng.init(head_dim * 13 + 3);
+        const rand = prng.random();
+
+        // Channel-major [channel * chunk + column], as the engine stores it.
+        const chunk = n_q;
+        const q = try a.alloc(f32, q_dim * chunk);
+        defer a.free(q);
+        const k = try a.alloc(f16, n_past * kv_dim);
+        defer a.free(k);
+        const v = try a.alloc(f16, n_past * kv_dim);
+        defer a.free(v);
+        const batched = try a.alloc(f32, q_dim * chunk);
+        defer a.free(batched);
+        const one = try a.alloc(f32, q_dim);
+        defer a.free(one);
+        const want = try a.alloc(f32, q_dim);
+        defer a.free(want);
+        const scores = try a.alloc(f32, n_past);
+        defer a.free(scores);
+        const qs = try a.alloc(f32, hd);
+        defer a.free(qs);
+        const os = try a.alloc(f32, hd);
+        defer a.free(os);
+
+        for (q) |*x| x.* = rand.float(f32) * 2 - 1;
+        for (k) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
+        for (v) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
+
+        attentionPrefill(batched, q, chunk, 1, k, v, n_past, n_q, 0, heads, kv_heads, head_dim, scores, qs, os);
+        // Every query must equal the single-token path at the same position.
+        for (0..n_q) |qi| {
+            for (0..q_dim) |c| one[c] = q[c * chunk + qi];
+            attentionDecode(want, one, k, v, qi + 1, heads, kv_heads, head_dim, scores);
+            for (0..q_dim) |c| {
+                try std.testing.expectApproxEqAbs(want[c], batched[c * chunk + qi], 1e-3);
+            }
+        }
+    }
+}
+
 test "attentionPrefill honours the causal mask" {
     const heads: u32 = 1;
     const kv_heads: u32 = 1;
