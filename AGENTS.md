@@ -72,6 +72,9 @@ zig fmt src build.zig
   not from probing the vocabulary, because models like TinyLlama spell their
   `<|user|>` markers as plain text in the template rather than as vocabulary
   entries.
+* **Sampling is not negligible.** At temperature 1.0 the candidate cut leaves
+  ~31k of 151936 logits, and ordering them was ~10% of decode (`sortUnstable`,
+  not `sort`, for the top-k selection). `anedvd run` prints the cost per token.
 * **Beware checks that cannot fail.** Three bugs here survived a green run: a
   test build that ran zero tests, an A/B check that compared a buffer with
   itself, and a per-kernel check blind to the hand-off between kernels. When

@@ -498,6 +498,9 @@ quantisation rather than unified memory:
   attention layout (MoE routing, MLA, sliding-window variants) needs work.
   An unrecognised `general.architecture` is accepted with a warning, since the
   GGUF tensor names are the same — but check the output.
+* Sampling with `top_p` on a 151936-token vocabulary costs ~1.2 ms/token at
+  temperature 1.0, about 10% of decode. Measured, not assumed:
+  [`docs/RESULTS.md`](docs/RESULTS.md).
 * **Decode is at the hardware's weight-bandwidth ceiling** (~20–40 GB/s of fp16
   weights measured on this ANE). int8 would be the only large win and the ANE
   rejects the MIL op for it, so decode speed is bounded, not untuned.

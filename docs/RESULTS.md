@@ -341,6 +341,30 @@ All four GGUF models on this machine:
 A relative error of ~1.5% is fp16 accumulation over ~30 layers, not a layout
 error (an actual layout error showed up as >100%).
 
+## Sampling cost
+
+Sampling looks cheap next to the ANE, but the top-k selection was doing far more
+work than it needed. The cut is `max_logit - min_keep_delta * temperature`; at
+temperature 1.0 that leaves ~31k candidates out of 151936, and the sampler then
+sorted all of them to keep 40.
+
+Measured in isolation (151936 candidates, top_k 40):
+
+| step | cost |
+|---|---|
+| `std.mem.sort` (stable block sort) over all candidates | 18.4 ms |
+| `exp()` over the same candidates | 1.1 ms |
+
+So the sort was essentially the entire cost of sampling. Switching to
+`sortUnstable` took the real number from **4.44 ms/token to 1.16 ms/token** at
+temperature 1.0 (0.89 -> 0.37 at 0.8), which is about 10% of decode time at the
+highest temperature the CLI accepts.
+
+Two hand-written partial selections were attempted first and both were wrong —
+a shifting sorted window that overwrote slots the scan had not reached yet, and
+a size-k min-heap. The comparison test described below caught both, and the code
+now uses the library rather than a third attempt.
+
 ## Server bugs found by testing two requests instead of one
 
 Every earlier test used a single request, which hid two bugs in the same code
