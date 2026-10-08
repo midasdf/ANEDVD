@@ -87,6 +87,16 @@ pub const Config = struct {
     bos_token_id: ?u32,
     eos_token_id: ?u32,
 
+    /// MoE fields; 0 for a dense model. See research/moe-design.md.
+    num_experts: u32,
+    num_experts_per_tok: u32,
+    moe_intermediate_size: u32,
+    shared_expert_intermediate_size: u32,
+    norm_topk_prob: bool,
+    decoder_sparse_step: u32,
+    /// Layer indices that stay dense even though the model has experts.
+    mlp_only_layers: u64,
+
     /// Frees `arch`. All other fields are value types.
     pub fn deinit(self: *Config, allocator: Allocator) void {
         allocator.free(self.arch);
@@ -169,6 +179,13 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
         }) orelse 0,
         .bos_token_id = getU32(obj, &.{"bos_token_id"}),
         .eos_token_id = getU32OrFirstOfArray(obj, "eos_token_id"),
+        .num_experts = getU32(obj, &.{"num_experts"}) orelse 0,
+        .num_experts_per_tok = getU32(obj, &.{"num_experts_per_tok"}) orelse 0,
+        .moe_intermediate_size = getU32(obj, &.{"moe_intermediate_size"}) orelse 0,
+        .shared_expert_intermediate_size = getU32(obj, &.{"shared_expert_intermediate_size"}) orelse 0,
+        .norm_topk_prob = getBool(obj, &.{"norm_topk_prob"}) orelse false,
+        .decoder_sparse_step = getU32(obj, &.{"decoder_sparse_step"}) orelse 1,
+        .mlp_only_layers = getLayerMask(obj, "mlp_only_layers"),
     };
 }
 
@@ -372,6 +389,24 @@ fn getU32(obj: std.json.ObjectMap, keys: []const []const u8) ?u32 {
 
 /// Some configs write a single token id, others write a list of them; the first
 /// entry wins.
+/// Read a JSON array of layer indices into a bitmask (`mlp_only_layers`).
+///
+/// Layers past bit 63 cannot be represented; they are left sparse, which matches
+/// the default for models whose sparse layers are interleaved from the bottom.
+fn getLayerMask(obj: std.json.ObjectMap, key: []const u8) u64 {
+    const value = obj.get(key) orelse return 0;
+    if (value != .array) return 0;
+    var mask: u64 = 0;
+    for (value.array.items) |item| {
+        const idx = switch (item) {
+            .integer => |i| i,
+            else => continue,
+        };
+        if (idx >= 0 and idx < 64) mask |= @as(u64, 1) << @intCast(idx);
+    }
+    return mask;
+}
+
 fn getU32OrFirstOfArray(obj: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = obj.get(key) orelse return null;
     switch (value) {

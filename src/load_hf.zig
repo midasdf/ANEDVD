@@ -87,6 +87,13 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         .tie_embeddings = c.tie_word_embeddings,
         // HF keeps the rotate_half (half-split) RoPE layout.
         .rope_adjacent = false,
+        .num_experts = c.num_experts,
+        .experts_per_tok = c.num_experts_per_tok,
+        .moe_inter = c.moe_intermediate_size,
+        .shared_inter = c.shared_expert_intermediate_size,
+        .norm_topk_prob = c.norm_topk_prob,
+        .sparse_step = c.decoder_sparse_step,
+        .mlp_only_mask = c.mlp_only_layers,
     };
 }
 

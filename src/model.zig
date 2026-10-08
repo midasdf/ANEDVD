@@ -24,6 +24,35 @@ pub const Config = struct {
     /// HF safetensors keeps the half-split layout. Set by the loader.
     rope_adjacent: bool = false,
 
+    // ------------------------------------------------------------------ MoE
+    // 0 for a dense model. See research/moe-design.md for why the experts run on
+    // the CPU: a 60-expert model would need thousands of loaded ANE kernels, and
+    // decode only reads the k selected experts per token anyway.
+    /// Routed experts per layer.
+    num_experts: u32 = 0,
+    /// How many of them a token is routed to (`num_experts_per_tok`).
+    experts_per_tok: u32 = 0,
+    /// One expert's intermediate width (`moe_intermediate_size`).
+    moe_inter: u32 = 0,
+    /// The always-on shared expert's width; 0 means the model has none.
+    shared_inter: u32 = 0,
+    /// Qwen2MoE divides the top-k weights by their sum when set.
+    norm_topk_prob: bool = false,
+    /// Sparse layers are `(layer + 1) % sparse_step == 0`, minus `mlp_only_layers`.
+    sparse_step: u32 = 1,
+    /// Bitmask by layer index: set means "this layer is dense even though the
+    /// model has experts" (`mlp_only_layers`). Layers are few, so a u64 covers
+    /// any real model; layers past bit 63 are treated as sparse.
+    mlp_only_mask: u64 = 0,
+
+    /// True when this layer runs the sparse block rather than a dense MLP.
+    pub fn layerIsSparse(self: Config, layer: u32) bool {
+        if (self.num_experts == 0) return false;
+        if (layer < 64 and (self.mlp_only_mask >> @intCast(layer)) & 1 == 1) return false;
+        const step = if (self.sparse_step == 0) 1 else self.sparse_step;
+        return (layer + 1) % step == 0;
+    }
+
     pub fn qDim(self: Config) u32 {
         return self.heads * self.head_dim;
     }
