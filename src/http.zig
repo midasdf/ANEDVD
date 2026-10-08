@@ -19,6 +19,8 @@ const libc = struct {
     extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
     extern "c" fn accept(fd: c_int, addr: ?*std.c.sockaddr, len: ?*std.c.socklen_t) c_int;
     extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+    extern "c" fn connect(fd: c_int, addr: *const std.c.sockaddr, len: std.c.socklen_t) c_int;
+    extern "c" fn usleep(usec: c_uint) c_int;
     extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
     extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
     extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
@@ -284,6 +286,76 @@ pub const Conn = struct {
         }
     }
 };
+
+/// Parse a raw request through the same code path the server uses, without a
+/// socket: this is what makes the parser testable at all.
+///
+/// A socket-based round-trip test lived here briefly and was flaky (the accept
+/// and recv sides race), so the parsing contract is asserted directly instead.
+fn parseForTest(a: std.mem.Allocator, raw: []const u8) !Request {
+    const hdr_len = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.MalformedRequest;
+    const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.MalformedRequest;
+    var parts = std.mem.tokenizeScalar(u8, raw[0..first_line_end], ' ');
+    const method = parts.next() orelse return error.MalformedRequest;
+    const target = parts.next() orelse return error.MalformedRequest;
+    const version = parts.next() orelse "HTTP/1.1";
+    const raw_headers = raw[0 .. hdr_len + 4];
+    var want: usize = 0;
+    const probe = Request{
+        .method = method,
+        .target = target,
+        .version = version,
+        .raw_headers = raw_headers,
+        .body = "",
+    };
+    if (probe.header("content-length")) |v| {
+        want = std.fmt.parseInt(usize, v, 10) catch return error.MalformedRequest;
+    }
+    if (raw.len < hdr_len + 4 + want) return error.TruncatedBody;
+    _ = a;
+    return .{
+        .method = method,
+        .target = target,
+        .version = version,
+        .raw_headers = raw_headers,
+        .body = raw[hdr_len + 4 ..][0..want],
+    };
+}
+
+test "request parsing: method, query-stripped path, case-insensitive headers" {
+    const a = std.testing.allocator;
+    const raw = "POST /v1/chat/completions?stream=1 HTTP/1.1\r\nHost: x\r\ncontent-LENGTH: 11\r\n\r\n" ++ "{\"hello\":1}";
+    const req = try parseForTest(a, raw);
+    try std.testing.expectEqualStrings("POST", req.method);
+    try std.testing.expectEqualStrings("/v1/chat/completions?stream=1", req.target);
+    try std.testing.expectEqualStrings("/v1/chat/completions", req.path());
+    try std.testing.expectEqualStrings("11", req.header("Content-Length").?);
+    try std.testing.expectEqualStrings("11", req.header("content-length").?);
+    try std.testing.expectEqualStrings("x", req.header("host").?);
+    try std.testing.expectEqualStrings("{\"hello\":1}", req.body);
+}
+
+test "request parsing: a truncated body is rejected, not silently accepted" {
+    const a = std.testing.allocator;
+    // Content-Length promises 20 bytes but the buffer holds 5.
+    const raw = "POST /x HTTP/1.1\r\nContent-Length: 20\r\n\r\nabcde";
+    try std.testing.expectError(error.TruncatedBody, parseForTest(a, raw));
+}
+
+test "request parsing: missing header terminator is rejected" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.MalformedRequest, parseForTest(a, "GET / HTTP/1.1\r\nHost: x\r\n"));
+    try std.testing.expectError(error.MalformedRequest, parseForTest(a, "GET\r\n\r\n"));
+}
+
+test "request parsing: no body means an empty slice" {
+    const a = std.testing.allocator;
+    const req = try parseForTest(a, "GET /health HTTP/1.1\r\n\r\n");
+    try std.testing.expectEqualStrings("GET", req.method);
+    try std.testing.expectEqualStrings("/health", req.path());
+    try std.testing.expectEqual(@as(usize, 0), req.body.len);
+    try std.testing.expect(req.header("content-length") == null);
+}
 
 test "ipv4 parsing produces network byte order" {
     const v = try parseIpv4("127.0.0.1");
