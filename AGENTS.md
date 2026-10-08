@@ -9,7 +9,8 @@ measurements live in `docs/RESULTS.md`.
 
 | File | Role |
 |---|---|
-| `src/main.zig` | CLI: `info`, `probe`, `bench`, `width`, `selftest`, `check`, `run`, `chat`, `cpu`, `serve` |
+| `src/main.zig` | CLI: `info`, `probe`, `bench`, `width`, `attnbench`, `selftest`, `check`, `run`, `chat`, `cpu`, `serve` |
+| `src/tests.zig` | the test root; references every module so `zig build test` is real |
 | `src/ane/shim.m` / `shim.h` | the only Objective-C + private-API code (`_ANEInMemoryModel`, IOSurfaces) |
 | `src/ane/runtime.zig` | Zig kernel wrapper, planar fp16 scatter/gather |
 | `src/ane/mil.zig` | MIL program generator (`conv`, `add`, `sigmoid`, `mul`) |
@@ -53,6 +54,10 @@ zig fmt src build.zig
 * **The ANE weight file needs a per-chunk `data_off`** (128, 240, …), not a
   constant. It only shows up in multi-tensor files (the fused FFN); single-conv
   kernels cannot catch it. `weights.zig` tests pin the fixture layout.
+* **`zig build test` needs `src/tests.zig`.** Zig only runs tests from the test
+  root and the files it references; rooting the test build at `src/main.zig`
+  executed zero tests and still reported success. Add new modules to
+  `src/tests.zig`.
 * **One sampler for everything** (`cpu.sample`, driven by `generate.Session`):
   CLI, HTTP API and WebUI all go through it, so a sampling change lands
   everywhere at once.

@@ -251,6 +251,48 @@ Kernels per layer drop from 4 to 3 (121 → 91 for SmolLM2), and the intermediat
 activation no longer round-trips through the CPU. The fused path is now the
 default; `--split` restores the old one.
 
+## Attention optimisation (measured, then fixed)
+
+`anedvd attnbench --ctx N` splits the CPU attention cost; at ctx 1024 with
+Qwen2.5-0.5B's shape (14 heads, 2 KV heads, head_dim 64) the original split was:
+
+| | per layer | share |
+|---|---|---|
+| QK dot products | 636 us | 66% |
+| softmax | 58 us | 6% |
+| value accumulation | 273 us | 28% |
+| **total** | **967 us** | |
+
+The dots were slow because `dot += a*b` cannot be reassociated by LLVM without
+fast-math, so the loop serialises on the add dependency chain (~1.4 GFLOP/s).
+Explicit 8-lane @Vector accumulators, plus keeping the value accumulation in
+registers instead of writing o_h back per position, and an fp16 KV cache:
+
+| ctx | before | after | speedup |
+|---|---|---|---|
+| 1024 | 967 us | 234 us | 4.1x |
+| 2048 | 2098 us | 483 us | 4.3x |
+
+End to end on Qwen2.5-0.5B decode (tok/s): ctx 16 19.6 -> 30.2, ctx 128
+19.2 -> 28.6, ctx 512 13.6 -> 26.8, ctx 1024 12.2 -> 19.4. The CPU share of
+decode at ctx 1024 fell from 48% to 24%.
+
+## The test suite was not running
+
+`zig build test` reported success from the first commit while executing **zero**
+tests: Zig runs `test` blocks from the test root and the files it references,
+and the build rooted the test at `src/main.zig`, which references no module's
+tests. Running the suite for real (76 tests) failed three of them immediately:
+
+* a genuine bug — `presence_penalty` was applied once per *occurrence* instead
+  of once per distinct token, so a token appearing twice in the window was
+  penalised twice;
+* two incorrect assertions in the weight-layout tests (an element-vs-byte size
+  mix-up, and reading a chunk header's magic instead of its size field).
+
+All 76 pass now, including an engine test that builds a tiny model and asserts
+the batched-prefill logits equal the per-token ones.
+
 ## Bugs found and fixed during development
 
 These are worth recording because each one produced *plausible-looking* output

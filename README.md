@@ -50,6 +50,7 @@ ANE: 6776 evals, 1293.2 ms total, 23.09 ms/token (82% of wall time)
   is ~260 tok/s, against ~25 and ~17 before batching.
 * **SmolLM2-135M-Instruct** in both formats: GGUF Q8_0 at ~47 tok/s decode, HF
   safetensors F16 at ~47 tok/s (no dequantisation), same output.
+* **Qwen3-0.6B** works too (per-head Q/K normalisation before RoPE).
 * **SmolLM2-135M-Instruct (Q8_0)**: 30 layers, 121 ANE kernels, **25.4 tok/s** decode.
 * **Qwen2.5-0.5B-Instruct (Q8_0)**: 24 layers, 97 ANE kernels, **10.1 tok/s** decode,
   GQA + QKV biases + RoPE θ=10⁶ — answers "The capital of France is Paris."
@@ -81,8 +82,8 @@ Numerical correctness is checked at two levels:
 ## Build
 
 ```sh
-zig build                  # produces zig-out/bin/anedvd
-zig build test             # unit tests (no ANE required for most of them)
+zig build                  # produces zig-out/bin/anedvd (ReleaseFast)
+zig build test             # 76 tests; the engine test skips without an ANE
 zig fmt src build.zig
 ```
 
@@ -224,6 +225,33 @@ Known limitations:
 * The chat template is ChatML when the vocabulary has `<|im_start|>` and a
   plain `User:/Assistant:` transcript otherwise; a model's own Jinja template
   from GGUF metadata is not evaluated.
+
+## Long context
+
+Two things dominate decode as the context grows, and both were measured rather
+than guessed (`anedvd attnbench` and the per-node ANE timing `run` prints):
+
+* **CPU attention.** At 1024 tokens it was 48% of decode time, and 66% of that
+  was the QK dot products: a plain `dot += a*b` reduction serialises on the add
+  dependency chain because Zig/LLVM will not reassociate floats. The kernel now
+  uses explicit 8-lane `@Vector` accumulators for the dots and keeps the value
+  accumulation in registers. 967 -> 234 us per layer at ctx 1024 (4.1x).
+* **KV cache traffic.** The cache is fp16 (llama.cpp's default), which halves
+  both the resident memory and the bytes attention reads.
+
+Decode on Qwen2.5-0.5B, fused FFN, ReleaseFast:
+
+| context | tok/s |
+|---|---|
+| 16 | 30.2 |
+| 128 | 28.6 |
+| 512 | 26.8 |
+| 1024 | 19.4 |
+
+Multi-turn chat does not re-prefill what is already cached: a transcript only
+appends, so `generate.Session` keeps the KV cache and prefills just the new
+suffix (`anedvd chat` and the server log both report how many prompt tokens were
+reused). In a two-turn example, turn 2 reported "prompt 44 (22 reused)".
 
 ## Sampling
 
