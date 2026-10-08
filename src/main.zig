@@ -1432,11 +1432,14 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const ids = try loaded.tokenizer.encode(allocator, prompt, true);
     defer allocator.free(ids);
 
-    // ANE: batched prefill over the whole prompt. Copied, because the engine
-    // returns its own buffer and the CPU pass below would otherwise be
-    // compared against it twice.
-    const ane_logits = try allocator.dupe(f32, try eng.prefill(ids, 0));
-    defer allocator.free(ane_logits);
+    // ANE prefill, and then one decode step on top of it: the two paths use
+    // different kernels (a chunk-wide pass vs a single column), so both need
+    // checking. Each result is COPIED out, because the engine returns its own
+    // logits buffer.
+    const ane_prefill = try allocator.dupe(f32, try eng.prefill(ids, 0));
+    defer allocator.free(ane_prefill);
+    const ane_decode = try allocator.dupe(f32, try eng.forward(7, @intCast(ids.len)));
+    defer allocator.free(ane_decode);
 
     // CPU reference: one token at a time, same prompt.
     var st = RefState{ .k = try allocator.alloc([]f16, layers), .v = try allocator.alloc([]f16, layers) };
@@ -1457,26 +1460,54 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         if (pos > 0) allocator.free(cpu_logits);
         cpu_logits = try refForward(allocator, &ref_mw, &st, id, @intCast(pos), layers);
     }
+    const cpu_decode: []f32 = try refForward(allocator, &ref_mw, &st, 7, @intCast(ids.len), layers);
+    defer allocator.free(cpu_decode);
     defer allocator.free(cpu_logits);
 
-    var max_d: f32 = 0;
-    var max_mag: f32 = 0;
-    var am_ane: u32 = 0;
-    var am_cpu: u32 = 0;
-    for (ane_logits, cpu_logits, 0..) |a, c, i| {
-        max_d = @max(max_d, @abs(a - c));
-        max_mag = @max(max_mag, @abs(c));
-        if (a > ane_logits[am_ane]) am_ane = @intCast(i);
-        if (c > cpu_logits[am_cpu]) am_cpu = @intCast(i);
-    }
-    const rel = if (max_mag > 0) max_d / max_mag else max_d;
-    sys.print("  max|ANE - CPU| = {e:.5}  (max|logit| {e:.3}, rel {e:.5})\n", .{ max_d, max_mag, rel });
-    sys.print("  argmax: ANE {d} \"{s}\" vs CPU {d} \"{s}\"\n", .{
-        am_ane, loaded.tokenizer.tokenText(am_ane), am_cpu, loaded.tokenizer.tokenText(am_cpu),
+    const prefill = compareLogits(ane_prefill, cpu_logits);
+    const decode = compareLogits(ane_decode, cpu_decode);
+    sys.print("  prefill: max|ANE - CPU| = {e:.5}  (max|logit| {e:.3}, rel {e:.5})  argmax {d} \"{s}\" vs {d} \"{s}\"\n", .{
+        prefill.max_abs,
+        prefill.max_mag,
+        prefill.rel,
+        prefill.argmax_a,
+        loaded.tokenizer.tokenText(prefill.argmax_a),
+        prefill.argmax_b,
+        loaded.tokenizer.tokenText(prefill.argmax_b),
     });
-    const ok = rel < 0.05 and am_ane == am_cpu;
+    sys.print("  decode:  max|ANE - CPU| = {e:.5}  (max|logit| {e:.3}, rel {e:.5})  argmax {d} \"{s}\" vs {d} \"{s}\"\n", .{
+        decode.max_abs,
+        decode.max_mag,
+        decode.rel,
+        decode.argmax_a,
+        loaded.tokenizer.tokenText(decode.argmax_a),
+        decode.argmax_b,
+        loaded.tokenizer.tokenText(decode.argmax_b),
+    });
+    const ok = prefill.rel < 0.05 and prefill.argmax_a == prefill.argmax_b and
+        decode.rel < 0.05 and decode.argmax_a == decode.argmax_b;
     sys.print("  RESULT: {s}\n", .{if (ok) "MATCH" else "MISMATCH"});
     if (!ok) std.process.exit(1);
+}
+
+const LogitDiff = struct {
+    max_abs: f32,
+    max_mag: f32,
+    rel: f32,
+    argmax_a: u32,
+    argmax_b: u32,
+};
+
+fn compareLogits(a: []const f32, b: []const f32) LogitDiff {
+    var d = LogitDiff{ .max_abs = 0, .max_mag = 0, .rel = 0, .argmax_a = 0, .argmax_b = 0 };
+    for (a, b, 0..) |x, y, i| {
+        d.max_abs = @max(d.max_abs, @abs(x - y));
+        d.max_mag = @max(d.max_mag, @abs(y));
+        if (x > a[d.argmax_a]) d.argmax_a = @intCast(i);
+        if (y > b[d.argmax_b]) d.argmax_b = @intCast(i);
+    }
+    d.rel = if (d.max_mag > 0) d.max_abs / d.max_mag else d.max_abs;
+    return d;
 }
 
 /// Open the tokenizer for a model path, whichever format it is.

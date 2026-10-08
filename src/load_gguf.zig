@@ -89,6 +89,11 @@ fn loadLinear(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u
 }
 
 /// Zero-copy view of an fp16 tensor's payload inside the mapped file.
+///
+/// The view aliases the mapping, so the caller's `Gguf` must outlive the
+/// `Runtime` that holds it. That is why `model_open.Loaded` keeps the `Gguf`
+/// alive next to the weights, and why `loadWeights` (used for the CPU
+/// reference, which outlives the file) copies through `readF16` instead.
 fn viewF16(g: *const gguf.Gguf, name: []const u8, in_dim: u32, out_dim: u32) ?[]f16 {
     const t = g.tensor(name) orelse return null;
     if (t.ttype != .f16) return null;
