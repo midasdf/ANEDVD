@@ -77,6 +77,19 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     };
     cfg.tie_embeddings = g.tensor("output.weight") == null;
     cfg.rope_adjacent = ropeIsAdjacent(arch);
+
+    // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /
+    // .expert_shared_feed_forward_length / .expert_shared_count).
+    cfg.num_experts = g.getU32(key(&buf, arch, "expert_count")) orelse 0;
+    cfg.experts_per_tok = g.getU32(key(&buf, arch, "expert_used_count")) orelse 0;
+    cfg.moe_inter = g.getU32(key(&buf, arch, "expert_feed_forward_length")) orelse cfg.inter;
+    cfg.shared_inter = g.getU32(key(&buf, arch, "expert_shared_feed_forward_length")) orelse 0;
+    // If a model has experts but no per-expert width, the expert tensors will not
+    // load; say so rather than failing later with a shape mismatch.
+    if (cfg.num_experts > 0 and cfg.experts_per_tok == 0) {
+        sys.eprint("warning: {s} declares {d} experts but no expert_used_count; assuming 2.\n", .{ arch, cfg.num_experts });
+        cfg.experts_per_tok = 2;
+    }
     try cfg.validate();
 
     // A wrong guess here is silent: the model still runs and produces fluent
@@ -206,9 +219,14 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_output.bias", .{li}) catch unreachable) != null) {
             lw.o_bias = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.bias", .{li}) catch unreachable);
         }
-        lw.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
-        lw.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
-        lw.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{li}) catch unreachable, cfg.inter, cfg.hidden);
+        if (cfg.layerIsSparse(li)) {
+            // Sparse layer: the dense ffn_gate/up/down are the shared expert's.
+            lw.moe = try loadMoeLayer(allocator, g, cfg, li);
+        } else {
+            lw.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
+            lw.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
+            lw.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{li}) catch unreachable, cfg.inter, cfg.hidden);
+        }
     }
 
     _ = hidden;
@@ -329,3 +347,102 @@ pub const GgufHead = struct {
         return loadHead(allocator, self.g, self.cfg, self.embed);
     }
 };
+
+/// Load the sparse block of a MoE layer from GGUF.
+///
+/// The expert tensors are 3-D (`blk.N.ffn_gate_exps` etc.) with the expert index
+/// as the LAST declared dimension, which in ggml's layout means experts are the
+/// slowest-varying axis and each expert's slice is contiguous. That is convenient
+/// (one read, no gather) but the two orders are not the same for every tensor, so
+/// each is checked against the expert's expected [out][in] shape rather than
+/// assumed.
+pub fn loadMoeLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, index: u32) !model.MoeWeights {
+    var buf: [128]u8 = undefined;
+    var moe = model.MoeWeights{
+        .num_experts = cfg.num_experts,
+        .inter = cfg.moe_inter,
+        .shared_inter = cfg.shared_inter,
+        .hidden_dim = cfg.hidden,
+    };
+    errdefer moe.deinit(allocator);
+
+    const per_gate = @as(usize, cfg.moe_inter) * cfg.hidden;
+    moe.router = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp.weight", .{index}) catch unreachable, cfg.hidden, cfg.num_experts);
+    moe.gate = try allocator.alloc(f16, per_gate * cfg.num_experts);
+    moe.up = try allocator.alloc(f16, per_gate * cfg.num_experts);
+    moe.down = try allocator.alloc(f16, per_gate * cfg.num_experts);
+
+    try loadExperts(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_exps.weight", .{index}) catch unreachable, moe.gate, cfg.num_experts, cfg.moe_inter, cfg.hidden);
+    try loadExperts(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_exps.weight", .{index}) catch unreachable, moe.up, cfg.num_experts, cfg.moe_inter, cfg.hidden);
+    try loadExperts(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_exps.weight", .{index}) catch unreachable, moe.down, cfg.num_experts, cfg.hidden, cfg.moe_inter);
+
+    if (cfg.shared_inter > 0) {
+        moe.shared_gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+        moe.shared_up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+        moe.shared_down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_shexp.weight", .{index}) catch unreachable, cfg.shared_inter, cfg.hidden);
+        moe.shared_gate_lin = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp_shexp.weight", .{index}) catch unreachable, cfg.hidden, 1);
+    }
+    return moe;
+}
+
+/// Split a stacked expert tensor into `dst`, which is [num_experts][out][in].
+///
+/// `out`/`in` are what the CPU path needs, one expert at a time. The file may
+/// store an expert as [out][in] or [in][out] depending on which dimension ggml
+/// put first, so the declared dims decide; guessing produces plausible garbage.
+fn loadExperts(
+    allocator: std.mem.Allocator,
+    g: *const gguf.Gguf,
+    name: []const u8,
+    dst: []f16,
+    num_experts: u32,
+    out_dim: u32,
+    in_dim: u32,
+) !void {
+    const t = g.tensor(name) orelse return Error.MissingTensor;
+    const per_expert: u64 = @as(u64, out_dim) * in_dim;
+    if (t.elemCount() != per_expert * num_experts) return Error.DimensionMismatch;
+    if (t.dims.len != 3) return Error.DimensionMismatch;
+
+    // The expert axis is whichever dimension equals num_experts.
+    var expert_axis: ?usize = null;
+    for (t.dims, 0..) |d, i| {
+        if (d == num_experts) {
+            expert_axis = i;
+            break;
+        }
+    }
+    const axis = expert_axis orelse return Error.DimensionMismatch;
+
+    // ggml's ne[0] varies fastest, so the element at (i0, i1, i2) is at
+    // i0 + ne0*(i1 + ne1*i2). Requiring the expert axis to be last keeps each
+    // expert's slice contiguous, which is the case llama.cpp writes.
+    if (axis != 2) return Error.DimensionMismatch;
+
+    const src = try g.readF16(allocator, name);
+    defer allocator.free(src);
+
+    // Within an expert the remaining dims are [d0, d1] with d0 fastest.
+    const d0 = t.dims[0];
+    const d1 = t.dims[1];
+    if (d0 == in_dim and d1 == out_dim) {
+        // [in-fastest, out] -> an expert's slice is out-major with in contiguous,
+        // i.e. exactly [out][in]. Straight copy.
+        for (0..num_experts) |e| {
+            @memcpy(dst[e * per_expert ..][0..per_expert], src[e * per_expert ..][0..per_expert]);
+        }
+    } else if (d0 == out_dim and d1 == in_dim) {
+        // [out-fastest, in] -> the slice is in-major; transpose it.
+        for (0..num_experts) |e| {
+            const slice = src[e * per_expert ..][0..per_expert];
+            const out = dst[e * per_expert ..][0..per_expert];
+            for (0..out_dim) |o| {
+                for (0..in_dim) |i| {
+                    out[o * in_dim + i] = slice[i * out_dim + o];
+                }
+            }
+        }
+    } else {
+        return Error.DimensionMismatch;
+    }
+}

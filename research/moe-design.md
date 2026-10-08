@@ -83,9 +83,13 @@ blk.N.ffn_gate_inp_shexp.weight
 Config keys: `<arch>.expert_count`, `.expert_used_count`,
 `.expert_shared_feed_forward_length`, `.expert_shared_count`.
 
-Note the GGUF expert tensors are 3-D: the expert index is the *last* axis, so an
-expert's gate slice is strided, not contiguous. That is exactly the case where a
-per-expert ANE kernel would be cheapest to build and the pool cannot hold them.
+The GGUF expert tensors are 3-D, declared `{n_embd, n_ff, n_expert}` in llama.cpp's
+`llama-model.cpp`. ggml's `ne[0]` varies fastest, so the expert axis is the
+slowest-varying one: each expert's slice is CONTIGUOUS, and within a slice the
+layout is out-major with `in` contiguous, i.e. exactly `[out][in]`. `loadExperts`
+therefore requires the expert axis to be last and copies each slice whole; it
+still checks the other two dims rather than assuming, because the wrong order
+loads fine and produces plausible garbage.
 
 ## Why not just build a kernel per needed expert
 
