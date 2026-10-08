@@ -493,6 +493,10 @@ quantisation rather than unified memory:
 
 ## Known issues
 
+* **A prompt longer than the context window is truncated from the front**, keeping
+  the newest tokens. This is now reported (a log warning, `prompt_tokens_dropped`
+  in the OpenAI `usage` object, and a status line in the WebUI) rather than
+  answered silently, but the tokens are still gone.
 * **Not all architectures are supported.** Llama, Qwen2, Qwen3, Mistral,
   SmolLM2/3 and the TinyLlama-era Llama layout. Anything with a different
   attention layout (MoE routing, MLA, sliding-window variants) needs work.

@@ -365,6 +365,18 @@ a shifting sorted window that overwrote slots the scan had not reached yet, and
 a size-k min-heap. The comparison test described below caught both, and the code
 now uses the library rather than a third attempt.
 
+## Silent prompt truncation
+
+A prompt longer than the context window is truncated from the front — the right
+choice, since the end of a conversation is what matters — but nothing said so. A
+5010-token prompt came back `HTTP 200`, `prompt_tokens: 2043`, and a confident
+answer; the only way to notice was to compare that number against what was sent.
+
+Found by sending `"word " x 5000` on purpose. It now reports itself three ways: a
+log line ("dropped 2967 leading prompt tokens (5010 sent, 2043 used) to fit the
+2048-token context"), a `prompt_tokens_dropped` field in the OpenAI `usage` object
+on both the streaming and non-streaming paths, and a status line in the WebUI.
+
 ## Server liveness during a long prefill
 
 The mid-generation hook that keeps `/health` answerable only ran between decode
