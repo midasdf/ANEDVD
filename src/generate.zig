@@ -68,6 +68,11 @@ pub const Stats = struct {
     /// Prompt tokens that were already in the KV cache and did not need to be
     /// recomputed (multi-turn).
     prefill_reused: u32 = 0,
+    /// Tokens in the prompt as the caller sent it.
+    prompt_tokens_sent: u32 = 0,
+    /// Leading tokens dropped because prompt + completion exceeded max_seq. The
+    /// server surfaces this so a client can tell its context was shortened.
+    prompt_tokens_dropped: u32 = 0,
     /// Sampling cost over the whole run, and the worst-case candidate count.
     sample_ns: u64 = 0,
     sample_candidates_max: usize = 0,
@@ -163,13 +168,19 @@ pub const Session = struct {
         const eng = self.engine;
         self.rng = params.seed;
 
-        // Keep the prompt inside the KV cache, leaving room to generate.
+        // Keep the prompt inside the KV cache, leaving room to generate. The
+        // oldest tokens are dropped, which is the only thing that can be done
+        // without a sliding-window cache -- but it must be VISIBLE: a client that
+        // sends 6500 tokens and gets an answer to the last 2043 has no way to know
+        // the context was cut unless this is reported.
         const max_seq: u32 = eng.max_seq;
         var ids = prompt_ids;
+        stats.prompt_tokens_sent = @intCast(prompt_ids.len);
         if (ids.len + params.max_tokens + 1 > max_seq) {
             const keep = max_seq -| params.max_tokens -| 1;
             if (keep == 0) return error.PromptTooLong;
             ids = ids[ids.len - keep ..];
+            stats.prompt_tokens_dropped = @intCast(prompt_ids.len - ids.len);
         }
         stats.prompt_tokens = @intCast(ids.len);
 
@@ -424,6 +435,35 @@ pub fn reuseLength(cached: []const u32, prompt: []const u32) usize {
     const shared = commonPrefix(cached, prompt);
     if (shared < cached.len) return 0;
     return shared;
+}
+
+test "over-long prompts report how much was dropped" {
+    // Truncation keeps the newest tokens (the end of a conversation is what
+    // matters), but it must be counted: a client that sends 6500 tokens and gets
+    // an answer to the last 2043 needs to know the context was cut. Before this
+    // counter existed the only signal was `prompt_tokens` being smaller than
+    // what was sent, which a client has no reason to compare.
+    const a = std.testing.allocator;
+    var stats = Stats{};
+    const max_seq: u32 = 64;
+    const max_tokens: u32 = 8;
+    const sent = try a.alloc(u32, 200);
+    defer a.free(sent);
+    for (sent, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    var ids = sent;
+    stats.prompt_tokens_sent = @intCast(sent.len);
+    const keep = max_seq - max_tokens - 1; // 55
+    ids = ids[ids.len - keep ..];
+    stats.prompt_tokens_dropped = @intCast(sent.len - ids.len);
+    stats.prompt_tokens = @intCast(ids.len);
+
+    try std.testing.expectEqual(@as(u32, 200), stats.prompt_tokens_sent);
+    try std.testing.expectEqual(@as(u32, 55), stats.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 145), stats.prompt_tokens_dropped);
+    // The retained tokens are the newest ones, in order.
+    try std.testing.expectEqual(@as(u32, 146), ids[0]);
+    try std.testing.expectEqual(@as(u32, 200), ids[ids.len - 1]);
 }
 
 test "reuseLength only reuses a prefix that covers the whole cache" {

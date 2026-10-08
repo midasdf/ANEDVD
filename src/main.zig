@@ -1062,6 +1062,7 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     var srv = server_mod.Server{
         .allocator = allocator,
         .session = &session,
+        .context_limit = max_seq,
         .opts = .{
             .host = host,
             .port = port,

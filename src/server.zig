@@ -43,6 +43,8 @@ pub const Server = struct {
     /// A connection accepted mid-generation that has not sent its request yet,
     /// kept alive between generated tokens instead of being dropped.
     pending: ?http.Conn = null,
+    /// The engine's context window, reported when a prompt has to be truncated.
+    context_limit: u32 = 0,
 
     pub fn run(self: *Server) !void {
         var srv = try http.Server.open(self.opts.host, self.opts.port);
@@ -170,8 +172,8 @@ pub const Server = struct {
             try jsonString(&b, model_name);
             try b.print("\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"", .{});
             try jsonString(&b, collector.text.items);
-            try b.print("\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}", .{
-                finishReason(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens, stats.prompt_tokens + stats.completion_tokens,
+            try b.print("\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_dropped\":{d}}}}}", .{
+                finishReason(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens, stats.prompt_tokens + stats.completion_tokens, stats.prompt_tokens_dropped,
             });
             return conn.sendBody(200, "OK", "application/json", b.slice());
         }
@@ -275,7 +277,6 @@ pub const Server = struct {
     /// One line per request so multi-turn prefix reuse is observable in the
     /// server log.
     fn logStats(self: *Server, stats: generate.Stats) void {
-        _ = self;
         sys.eprint("[req] prompt {d} ({d} reused, {d} new), +{d} tokens, prefill {d:.2} s, decode {d:.1} tok/s, {s}\n", .{
             stats.prompt_tokens,
             stats.prefill_reused,
@@ -285,6 +286,14 @@ pub const Server = struct {
             stats.decodeToksPerSec(),
             stats.stop_reason.toString(),
         });
+        if (stats.prompt_tokens_dropped > 0) {
+            sys.eprint("[req] WARNING: dropped {d} leading prompt tokens ({d} sent, {d} used) to fit the {d}-token context\n", .{
+                stats.prompt_tokens_dropped,
+                stats.prompt_tokens_sent,
+                stats.prompt_tokens,
+                self.context_limit,
+            });
+        }
     }
 
     // ------------------------------------------------------------ OpenAI legacy
@@ -326,8 +335,8 @@ pub const Server = struct {
             try jsonString(&b, model_name);
             try b.print("\",\"choices\":[{{\"text\":\"", .{});
             try jsonString(&b, collector.text.items);
-            try b.print("\",\"index\":0,\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}", .{
-                finishReason(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens, stats.prompt_tokens + stats.completion_tokens,
+            try b.print("\",\"index\":0,\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_dropped\":{d}}}}}", .{
+                finishReason(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens, stats.prompt_tokens + stats.completion_tokens, stats.prompt_tokens_dropped,
             });
             return conn.sendBody(200, "OK", "application/json", b.slice());
         }
