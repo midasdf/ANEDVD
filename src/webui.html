@@ -490,8 +490,19 @@ async function send() {
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new Error('HTTP ' + res.status + (res.statusText ? ' ' + res.statusText : '') +
-        (detail ? ' — ' + detail.slice(0, 300) : ''));
+      // The server refuses a second generation while one is running (503) with a
+      // JSON body. Show its message rather than the raw JSON.
+      let msg = '';
+      try {
+        const parsed = JSON.parse(detail);
+        msg = (parsed && parsed.error && parsed.error.message) || '';
+      } catch (e) {
+        msg = detail.slice(0, 300);
+      }
+      if (res.status === 503) {
+        msg = (msg || 'the server is busy') + ' — try again in a moment.';
+      }
+      throw new Error(msg || ('HTTP ' + res.status + (res.statusText ? ' ' + res.statusText : '')));
     }
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (res.body && contentType.indexOf('application/json') === -1) {

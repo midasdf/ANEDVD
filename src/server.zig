@@ -40,6 +40,9 @@ pub const Server = struct {
     served_during_generation: u64 = 0,
     /// Generation requests turned away with 503 because the engine was busy.
     busy_rejections: u64 = 0,
+    /// A connection accepted mid-generation that has not sent its request yet,
+    /// kept alive between generated tokens instead of being dropped.
+    pending: ?http.Conn = null,
 
     pub fn run(self: *Server) !void {
         var srv = try http.Server.open(self.opts.host, self.opts.port);
@@ -187,27 +190,45 @@ pub const Server = struct {
     /// Called between generated tokens. Answers any connection that has already
     /// sent a complete request and needs no generation (health, model list) so a
     /// long generation cannot make the server look dead. Anything heavier is
-    /// left in the queue for the main loop.
+    /// answered with 503, and a connection that has not sent its request yet is
+    /// held until it does.
+    ///
+    /// The held connection matters: a client connects at the TCP handshake and
+    /// only then writes its request. Dropping it because no bytes were ready yet
+    /// closes the socket under the client, which sees an empty reply — measured
+    /// at a 40 ms connect-to-request delay.
     pub fn servicePending(self: *Server) void {
         var srv = self.listener orelse return;
         srv.setNonBlocking(true);
         const maybe = srv.acceptIfPending();
         srv.setNonBlocking(false);
-        var conn = maybe orelse return;
-        defer conn.close();
 
-        // Only touch connections that have actually sent something. readRequest
-        // blocks for up to 30 s otherwise, which would stall the generation this
-        // hook exists to keep responsive.
-        if (!conn.hasPendingInput(0)) return;
+        // Take a newly accepted connection only if we have no other waiting one.
+        if (maybe) |fresh| {
+            if (self.pending == null) {
+                self.pending = fresh;
+            } else {
+                var extra = fresh;
+                extra.close();
+            }
+        }
+        var conn = self.pending orelse return;
+
+        // Do not wait: a poll that blocks would cost its timeout on every token
+        // (5 ms x 400 tokens was 1.2 s of added generation time). Keeping the
+        // connection in `pending` instead of dropping it is what makes the 0 ms
+        // check safe -- a real client's request arrives within a token, and the
+        // connection is still here when it does.
+        if (!conn.hasPendingInput(0)) return; // keep it for the next token
+
+        self.pending = null;
+        defer conn.close();
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
-        // A connection reaching here has already sent its request, so it can be
-        // read without waiting.
         const req = conn.readRequest(a, &buf) catch |e| {
             if (e != error.ConnectionClosed) {
                 conn.sendBody(400, "Bad Request", "application/json", "{\"error\":{\"message\":\"malformed request\"}}") catch {};
@@ -234,6 +255,12 @@ pub const Server = struct {
         // and Retry-After so a client can tell the difference and back off.
         self.busy_rejections += 1;
         tryBusyResponse(&conn, self.busy_rejections);
+    }
+
+    /// Close a connection parked between tokens, at shutdown.
+    pub fn closePending(self: *Server) void {
+        if (self.pending) |*c| c.close();
+        self.pending = null;
     }
 
     /// One line per request so multi-turn prefix reuse is observable in the
