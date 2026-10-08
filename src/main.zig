@@ -756,10 +756,18 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
             samples.items[samples.items.len - 1],
             sum / @as(f64, @floatFromInt(samples.items.len)),
         });
-        stats.completion_tokens = 0; // per-run numbers below would be misleading
     }
 
     const total_wall = t_end - t_gen0;
+    // With --repeat the per-run numbers below would describe only the last run,
+    // so print the summary and stop.
+    if (repeat > 1) {
+        sys.print("stop: {s} (last run), ANE {d:.1} ms/token\n", .{
+            stats.stop_reason.toString(),
+            if (eng.stats.tokens > 0) eng.stats.aneMs() / @as(f64, @floatFromInt(eng.stats.tokens)) else 0,
+        });
+        return;
+    }
     sys.print("stop: {s}\n", .{stats.stop_reason.toString()});
     sys.print("prefill: {d} tokens in {d:.2} s ({d:.1} tok/s; ANE {d:.2} s, CPU {d:.2} s)\n", .{
         stats.prompt_tokens,
