@@ -48,7 +48,7 @@ zig fmt src build.zig
 * **Zig's bundled clang crashes on the ARC Objective-C shim**, so `build.zig`
   compiles `src/ane/shim.m` with `/usr/bin/clang` and links the object file.
 * **Kernels are compiled for a fixed activation width** (`Options.chunk`, default
-  64): decode fills column 0, prefill fills a whole chunk. The ANE costs the
+  128): decode fills column 0, prefill fills a whole chunk. The ANE costs the
   same either way (weights are read once), so do not "fix" this by building
   width-1 kernels — that just makes prefill 10x slower.
 * **The ANE weight file needs a per-chunk `data_off`** (128, 240, …), not a
