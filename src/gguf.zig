@@ -510,7 +510,7 @@ pub const Gguf = struct {
         while (done < out.len) {
             const m = @min(buf.len, out.len - done);
             try dequantizeRange(t.ttype, src, done, buf[0..m]);
-            for (buf[0..m], 0..) |v, k| out[done + k] = @floatCast(v);
+            f32ToF16Slice(buf[0..m], out[done..][0..m]);
             done += m;
         }
     }
@@ -535,7 +535,7 @@ pub const Gguf = struct {
         while (done < out.len) {
             const m = @min(buf.len, out.len - done);
             try dequantizeRange(t.ttype, src, done, buf[0..m]);
-            for (buf[0..m], 0..) |v, k| out[done + k] = @floatCast(v);
+            f32ToF16Slice(buf[0..m], out[done..][0..m]);
             done += m;
         }
         return out;
@@ -634,6 +634,27 @@ pub fn dequantizeBytes(ttype: GgmlType, src: []const u8, out: []f32) !void {
 /// Like `dequantizeBytes`, but starts at element `elem_offset` (which must be
 /// a multiple of the type's block size).  Used to convert wide types into f16
 /// in bounded chunks.
+/// Convert f32 to fp16 a vector at a time.
+///
+/// The scalar `@floatCast` loop this replaces was the gap between the raw
+/// dequantiser (733 M elements/s) and the streaming reader (286 M elements/s): the
+/// dequantise itself was never the wall, the trailing conversion pass was.
+///
+/// `@floatCast` on a vector does the same round-to-nearest conversion the scalar
+/// form does, so results are unchanged — unlike a bit-truncation, which is faster
+/// still and silently wrong in the last bit.
+pub fn f32ToF16Slice(src: []const f32, dst: []f16) void {
+    std.debug.assert(src.len == dst.len);
+    const L = 8;
+    var i: usize = 0;
+    while (i + L <= src.len) : (i += L) {
+        const v: @Vector(L, f32) = src[i..][0..L].*;
+        const h: @Vector(L, f16) = @floatCast(v);
+        dst[i..][0..L].* = @bitCast(h);
+    }
+    while (i < src.len) : (i += 1) dst[i] = @floatCast(src[i]);
+}
+
 pub fn dequantizeRange(ttype: GgmlType, src: []const u8, elem_offset: u64, out: []f32) !void {
     const epb = ttype.blockElems() orelse return error.UnsupportedType;
     const bpb = ttype.blockBytes() orelse return error.UnsupportedType;

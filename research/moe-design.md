@@ -140,16 +140,26 @@ time.
 That made the full model impractical as written: ~1.66 GB of fp16 expert output
 per token across 24 layers, at ~220 MB/s, is **7.6 s/token**.
 
-Vectorising the two hottest dequantisers (Q4_K, which every gate_exps and up_exps
-uses, and Q8_0, which is every down_exps on half the layers) moved the streaming
-rate from 219 to **406 MB/s**, 1.85x, with the fixtures still bit-exact against
-compiled ggml. Measured end to end on the real file, dequantising one token's worth
-of experts (4 experts x 3 tensors x 24 layers) still costs **4.6 s/token** — an
-upper bound of 0.22 tok/s before a single matmul runs.
+Three passes brought the streaming rate to **668 MB/s** (219 -> 406 -> 573 -> 668),
+each step bit-exact against compiled ggml, and one token's experts now cost
+**3.5 s/token**:
 
-So: correct, and still not usable on this machine. The remaining cost is not
-bandwidth (the same rate cold and warm proves that) but the sheer volume of
-bit-twiddling per token. The three fixes below are ordered by that measurement.
+| change | fp16 output rate |
+|---|---|
+| scalar everywhere | 219 MB/s |
+| Q4_K + Q8_0 vectorised | 406 MB/s |
+| f32 -> f16 conversion vectorised | 573-668 MB/s |
+
+**An intermediate diagnosis was wrong and is worth recording.** After the first
+pass the streaming rate was 219 MB/s while a raw in-RAM Q4_K dequantise measured
+**2931 MB/s**, a 13x gap — so the dequantiser was not the wall. Benchmarking the
+same four experts repeatedly (573 MB/s, flat across rounds) ruled out page faults
+too, since repeated reads of resident pages cost the same as the first. The gap was
+the scalar `@floatCast` conversion pass after each chunk, which the third change
+removes.
+
+The honest ceiling now: 0.29 tok/s before a single matmul runs, so large-MoE decode
+on this machine needs the algorithmic levers below rather than faster loops.
 
 What would change it, in the order the numbers suggest:
 
