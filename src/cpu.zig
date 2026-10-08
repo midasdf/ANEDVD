@@ -962,3 +962,260 @@ test "penalties push repeated tokens down" {
     applyPenalties(&logits3, .{ .repetition_penalty = 2.0 }, &.{1});
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), logits3[0], 1e-6);
 }
+
+// ---------------------------------------------------------------------- MoE
+
+/// One expert's SwiGLU MLP over a single token:
+/// `down(silu(gate(h)) * up(h))`, accumulated into `out` scaled by `weight`.
+///
+/// `gate`/`up` are [inter][hidden] and `down` is [hidden][inter], matching the
+/// storage order the loaders already use for dense layers. The expert weights are
+/// fp16 in the mapped file; converting the row on the fly costs one multiply per
+/// element and avoids materialising a decoded copy for an expert that is used a
+/// handful of times.
+pub fn moeExpertAccum(
+    out: []f32,
+    hidden_scratch: []f32,
+    inter_scratch: []f32,
+    h: []const f32,
+    gate: []const f16,
+    up: []const f16,
+    down: []const f16,
+    inter: usize,
+    hidden: usize,
+    weight: f32,
+) void {
+    std.debug.assert(out.len >= hidden and hidden_scratch.len >= inter);
+    matmulF16(hidden_scratch[0..inter], gate, h, inter, hidden);
+    var i: usize = 0;
+    while (i < inter) : (i += 1) {
+        const g = hidden_scratch[i];
+        var acc: f32 = 0;
+        const row = up[i * hidden ..][0..hidden];
+        for (row, h) |w, x| acc += @as(f32, @floatCast(w)) * x;
+        const s = g / (1.0 + @exp(-g));
+        inter_scratch[i] = s * acc;
+    }
+    // out += weight * (down @ inter)
+    var o: usize = 0;
+    while (o < hidden) : (o += 1) {
+        var acc: f32 = 0;
+        const row = down[o * inter ..][0..inter];
+        for (row, inter_scratch[0..inter]) |w, x| acc += @as(f32, @floatCast(w)) * x;
+        out[o] += weight * acc;
+    }
+}
+
+/// A dense SwiGLU MLP, used for the always-on shared expert (and by the dense
+/// layers). `out` is overwritten.
+pub fn mlpForward(
+    out: []f32,
+    gate_scratch: []f32,
+    h: []const f32,
+    gate: []const f16,
+    up: []const f16,
+    down: []const f16,
+    inter: usize,
+    hidden: usize,
+) void {
+    matmulF16(gate_scratch[0..inter], gate, h, inter, hidden);
+    var i: usize = 0;
+    while (i < inter) : (i += 1) {
+        const g = gate_scratch[i];
+        var acc: f32 = 0;
+        const row = up[i * hidden ..][0..hidden];
+        for (row, h) |w, x| acc += @as(f32, @floatCast(w)) * x;
+        const s = g / (1.0 + @exp(-g));
+        gate_scratch[i] = s * acc;
+    }
+    var o: usize = 0;
+    while (o < hidden) : (o += 1) {
+        var acc: f32 = 0;
+        const row = down[o * inter ..][0..inter];
+        for (row, gate_scratch[0..inter]) |w, x| acc += @as(f32, @floatCast(w)) * x;
+        out[o] = acc;
+    }
+}
+
+/// `sigmoid(x)` computed so that large negative/positive inputs saturate instead
+/// of overflowing: `1/(1+exp(-x))` is fine in f32 for |x| up to ~88, and beyond
+/// that exp() overflows to inf and the division yields 0, which is the correct
+/// limit, but std.math.exp in debug builds panics on overflow. Clamp instead.
+pub fn sigmoid(x: f32) f32 {
+    if (x >= 0) {
+        const e = @exp(-@min(x, 80.0));
+        return 1.0 / (1.0 + e);
+    }
+    const e = @exp(@max(x, -80.0));
+    return e / (1.0 + e);
+}
+
+/// Route one token: softmax over the router logits, take the top `k`, and (when
+/// `norm_topk_prob`) renormalise the selected weights to sum to one.
+///
+/// Mirrors Qwen2MoeTopKRouter. `probs` and `idx` must hold at least `k` entries.
+pub fn moeRoute(
+    logits: []const f32,
+    k: usize,
+    norm_topk_prob: bool,
+    probs: []f32,
+    idx: []u32,
+) void {
+    std.debug.assert(probs.len >= k and idx.len >= k and k <= logits.len);
+    // Softmax is only needed to rank and weight the top k; computing it over all
+    // experts keeps the weights identical to the reference, which matters because
+    // the unnormalised top-k weights are used as-is when norm_topk_prob is false.
+    var max_v: f32 = -std.math.inf(f32);
+    for (logits) |v| max_v = @max(max_v, v);
+    var sum: f32 = 0;
+    for (logits) |v| sum += @exp(v - max_v);
+    const inv_sum = if (sum > 0) 1.0 / sum else 0.0;
+
+    for (0..k) |slot| {
+        var best: usize = std.math.maxInt(usize);
+        var best_p: f32 = -1.0;
+        for (logits, 0..) |v, e| {
+            // Skip experts already chosen: top-k is over distinct experts.
+            var taken = false;
+            for (idx[0..slot]) |prev| {
+                if (prev == e) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (taken) continue;
+            const p = @exp(v - max_v) * inv_sum;
+            if (p > best_p) {
+                best_p = p;
+                best = e;
+            }
+        }
+        if (best == std.math.maxInt(usize)) {
+            probs[slot] = 0;
+            idx[slot] = 0;
+        } else {
+            probs[slot] = best_p;
+            idx[slot] = @intCast(best);
+        }
+    }
+
+    if (norm_topk_prob) {
+        var s: f32 = 0;
+        for (probs[0..k]) |p| s += p;
+        if (s > 0) {
+            for (probs[0..k]) |*p| p.* /= s;
+        }
+    }
+}
+
+test "moeRoute picks the top k distinct experts and weights them like softmax" {
+    const a = std.testing.allocator;
+    const n_experts = 8;
+    const logits = try a.alloc(f32, n_experts);
+    defer a.free(logits);
+    const probs = try a.alloc(f32, 4);
+    defer a.free(probs);
+    const idx = try a.alloc(u32, 4);
+    defer a.free(idx);
+
+    // A clear ranking: expert 3 highest, then 7, 0, 5.
+    const vals = [_]f32{ 1.0, -2.0, -3.0, 5.0, -4.0, 0.5, -5.0, 3.0 };
+    @memcpy(logits, &vals);
+
+    // Reference softmax, computed from the definition.
+    var max_v: f32 = -std.math.inf(f32);
+    for (vals) |v| max_v = @max(max_v, v);
+    var sum: f32 = 0;
+    for (vals) |v| sum += @exp(v - max_v);
+    const expect_p = [_]f32{
+        @exp(5.0 - max_v) / sum,
+        @exp(3.0 - max_v) / sum,
+        @exp(1.0 - max_v) / sum,
+        @exp(0.5 - max_v) / sum,
+    };
+
+    moeRoute(logits, 4, false, probs, idx);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 0, 5 }, idx);
+    for (expect_p, probs) |e, got| try std.testing.expectApproxEqAbs(e, got, 1e-6);
+
+    // With norm_topk_prob the four weights sum to one.
+    moeRoute(logits, 4, true, probs, idx);
+    var total: f32 = 0;
+    for (probs) |p| total += p;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), total, 1e-6);
+
+    // k = 1 keeps only the argmax, and no expert appears twice even when the
+    // weights are tied.
+    moeRoute(logits, 1, false, probs, idx);
+    try std.testing.expectEqual(@as(u32, 3), idx[0]);
+
+    const tied = [_]f32{ 2.0, 2.0, 2.0, 2.0 };
+    moeRoute(&tied, 4, false, probs, idx);
+    for (idx, 0..) |v, i| {
+        for (idx[0..i]) |prev| try std.testing.expect(prev != v);
+    }
+}
+
+test "moeExpertAccum matches a hand-computed SwiGLU expert" {
+    const hidden: usize = 4;
+    const inter: usize = 3;
+
+    const h = [_]f32{ 0.5, -0.25, 1.0, 0.0 };
+    // gate/up are [inter][hidden], down is [hidden][inter].
+    var gate: [inter * hidden]f16 = undefined;
+    var up: [inter * hidden]f16 = undefined;
+    var down: [hidden * inter]f16 = undefined;
+    var seed: u32 = 99;
+    for (&gate) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
+    }
+    for (&up) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
+    }
+    for (&down) |*x| {
+        seed = seed *% 1664525 +% 1013904223;
+        x.* = @floatCast(@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0);
+    }
+
+    // Independent reference, written from the definition.
+    var act: [inter]f32 = undefined;
+    for (0..inter) |i| {
+        var g: f32 = 0;
+        var u: f32 = 0;
+        for (0..hidden) |d| {
+            g += @as(f32, @floatCast(gate[i * hidden + d])) * h[d];
+            u += @as(f32, @floatCast(up[i * hidden + d])) * h[d];
+        }
+        act[i] = (g / (1.0 + @exp(-g))) * u;
+    }
+    var want: [hidden]f32 = undefined;
+    for (0..hidden) |o| {
+        var acc: f32 = 0;
+        for (0..inter) |i| acc += @as(f32, @floatCast(down[o * inter + i])) * act[i];
+        want[o] = acc;
+    }
+
+    var out = [_]f32{ 0, 0, 0, 0 };
+    var gs: [inter]f32 = undefined;
+    var is: [inter]f32 = undefined;
+    moeExpertAccum(&out, &gs, &is, &h, &gate, &up, &down, inter, hidden, 1.0);
+    for (want, out) |w, got| try std.testing.expectApproxEqAbs(w, got, 1e-5);
+
+    // The weight scales the contribution, and a second call accumulates.
+    moeExpertAccum(&out, &gs, &is, &h, &gate, &up, &down, inter, hidden, 2.0);
+    for (want, out) |w, got| try std.testing.expectApproxEqAbs(3.0 * w, got, 1e-5);
+}
+
+test "sigmoid saturates instead of overflowing" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), sigmoid(0.0), 1e-6);
+    try std.testing.expect(sigmoid(100.0) > 0.999);
+    try std.testing.expect(sigmoid(-100.0) < 0.001);
+    // Saturation, not overflow: the clamp keeps exp() in range so a debug build
+    // does not panic, and the result is the limit either way. At -1000 the answer
+    // is exp(-80)/(1+exp(-80)) ~ 1.8e-35, which is f32's way of saying zero.
+    try std.testing.expectEqual(@as(f32, 1.0), sigmoid(1000.0));
+    try std.testing.expect(sigmoid(-1000.0) >= 0.0);
+    try std.testing.expect(sigmoid(-1000.0) < 1e-30);
+}
