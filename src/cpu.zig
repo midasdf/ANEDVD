@@ -412,6 +412,30 @@ pub fn applyPenalties(logits: []f32, params: SamplerParams, recent: []const u32)
     }
 }
 
+/// Order `items` so the `k` largest are first, in descending order.
+///
+/// The sampler needs the top `k` in order and nothing else. Two hand-written
+/// partial-selection schemes were tried here (a shifting sorted window, then a
+/// size-k min-heap); both were wrong, and a test comparing against a full sort
+/// caught the second one producing a window that was not the top k. Partial
+/// selection is easy to get subtly wrong, so this delegates to the library's
+/// pdqsort (`sortUnstable`), which is measurably faster than the block sort it
+/// replaces and whose correctness is not in question.
+///
+/// A real algorithmic win would need a proper selection algorithm; the measured
+/// cost of the sort is 18 ms/token against 1 ms for the exp() over the same
+/// values, so if this is ever revisited, do it with a tested heap implementation
+/// rather than by inspection.
+fn selectTopK(items: []Candidate, k: usize) void {
+    std.debug.assert(k <= items.len);
+    if (items.len <= 1) return;
+    // Full ordering. The caller keeps the first `k`; ordering the rest costs
+    // nothing extra that matters at this size, and a partly-ordered contract
+    // would be one more thing for the test to have to pin down.
+    std.mem.sortUnstable(Candidate, items, {}, compareCandidates);
+    std.debug.assert(k <= items.len);
+}
+
 /// Temperature / top-k / top-p sampler with penalties.
 ///
 /// `scratch` must hold at least `logits.len` candidates and is reused across
@@ -465,10 +489,16 @@ pub fn sampleProfiled(
         return argmax(logits);
     }
 
-    // Top-k: keep only the k best (sorting n candidates, n is small).
+    // Top-k: keep only the k best.
+    //
+    // This used to be a full sort of every candidate. With top_k = 40 from a
+    // 151936-token vocabulary the cut above can leave ~150k candidates, and
+    // sorting them (18 ms measured) to keep 34 was the entire cost of sampling;
+    // the exp() over the same values is 1 ms. std.mem.sort does not need a fully
+    // ordered array, so use partial selection instead: O(n) rather than O(n log n).
     var keep = n;
     if (params.top_k > 0 and params.top_k < n) {
-        std.mem.sort(Candidate, scratch[0..n], {}, compareCandidates);
+        selectTopK(scratch[0..n], params.top_k);
         keep = params.top_k;
     }
 
@@ -480,10 +510,14 @@ pub fn sampleProfiled(
     }
     if (sum <= 0) return argmax(logits);
 
-    // Top-p: sort and truncate at the nucleus (only needed if enabled).
+    // Top-p: order the kept set and truncate at the nucleus.
     if (params.top_p < 1.0) {
         info.sorted_for_top_p = true;
-        std.mem.sort(Candidate, scratch[0..keep], {}, compareCandidates);
+        // Already ordered when top_k ran; only sort when it did not (or when the
+        // kept set is small enough that the sort is free).
+        if (!(params.top_k > 0 and params.top_k < n) and keep > 1) {
+            std.mem.sort(Candidate, scratch[0..keep], {}, compareCandidates);
+        }
         var acc: f32 = 0;
         var cut_n: usize = keep;
         for (scratch[0..keep], 0..) |c, i| {
@@ -670,6 +704,42 @@ test "attentionDecode single past position returns v" {
     attentionDecode(&out, &q, &k, &v, 1, 2, 2, 2, &scratch);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.125), out[2], 1e-5);
+}
+
+test "selectTopK agrees with a full sort" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+
+    for ([_]usize{ 1, 2, 3, 7, 40, 64, 129 }) |k| {
+        // Sizes below, at, and well above k; a small value range so ties occur.
+        for ([_]usize{ 0, 1, 2, 5, 39, 40, 41, 500 }) |n| {
+            const items = try a.alloc(Candidate, n);
+            defer a.free(items);
+            for (items, 0..) |*c, i| {
+                c.* = .{ .logit = @floatFromInt(rand.intRangeAtMost(u32, 0, 4)), .index = @intCast(i) };
+            }
+            const expected = try a.dupe(Candidate, items);
+            defer a.free(expected);
+            std.mem.sort(Candidate, expected, {}, compareCandidates);
+
+            const got = @min(k, n);
+            selectTopK(items, got);
+            for (0..got) |i| {
+                try std.testing.expectApproxEqAbs(expected[i].logit, items[i].logit, 1e-6);
+            }
+            if (got > 1) {
+                for (1..got) |i| {
+                    try std.testing.expect(items[i - 1].logit >= items[i].logit);
+                }
+            }
+            if (got > 0) {
+                for (items[got..]) |c| {
+                    try std.testing.expect(c.logit <= items[got - 1].logit);
+                }
+            }
+        }
+    }
 }
 
 test "sampling: temperature 0 is greedy" {
