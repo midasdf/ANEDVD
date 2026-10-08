@@ -193,6 +193,12 @@ pub const Engine = struct {
         try cfg.validate();
 
         var self: Engine = undefined;
+        // A field with a default value is NOT covered by `undefined`: it holds
+        // 0xaaaa. `prefill_tick` is called as a function pointer between prefill
+        // chunks, so without this it jumps to 0xaaaaaaaa. This is a real crash, not a
+        // hypothetical: it is why `verify` bus-errored on a dense model.
+        self.prefill_tick = null;
+        self.prefill_tick_ctx = null;
         self.allocator = allocator;
         self.config = cfg;
         self.opts = opts;
