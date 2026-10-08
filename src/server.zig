@@ -193,6 +193,11 @@ pub const Server = struct {
         var conn = maybe orelse return;
         defer conn.close();
 
+        // Only touch connections that have actually sent something. readRequest
+        // blocks for up to 30 s otherwise, which would stall the generation this
+        // hook exists to keep responsive.
+        if (!conn.hasPendingInput(0)) return;
+
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();

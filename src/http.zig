@@ -20,6 +20,8 @@ const libc = struct {
     extern "c" fn accept(fd: c_int, addr: ?*std.c.sockaddr, len: ?*std.c.socklen_t) c_int;
     extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
     extern "c" fn connect(fd: c_int, addr: *const std.c.sockaddr, len: std.c.socklen_t) c_int;
+    extern "c" fn poll(fds: [*]std.c.pollfd, n: std.c.nfds_t, timeout_ms: c_int) c_int;
+    extern "c" fn socketpair(domain: c_int, typ: c_int, protocol: c_int, sv: *[2]std.c.fd_t) c_int;
     extern "c" fn usleep(usec: c_uint) c_int;
     extern "c" fn recv(fd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
     extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
@@ -42,6 +44,7 @@ const SIGPIPE: c_int = 13;
 const SIG_IGN: usize = 1;
 /// A stalled client must not wedge the single-threaded server.
 const RECV_TIMEOUT_S: c_long = 30;
+const POLLIN: c_short = 0x0001;
 const SEND_TIMEOUT_S: c_long = 60;
 
 pub const Error = error{
@@ -278,6 +281,19 @@ pub const Conn = struct {
         try self.write(body);
     }
 
+    /// True when at least one byte is ready to read, without blocking.
+    ///
+    /// Used by the server's mid-generation hook: a client that connects and then
+    /// sends nothing must not stall the generation it is sharing the process
+    /// with. Measured before the fix: a silent client holding a connection for
+    /// 6 s added exactly 6 s to a concurrent generation's wall time.
+    pub fn hasPendingInput(self: *const Conn, timeout_ms: c_int) bool {
+        var fds = [_]std.c.pollfd{.{ .fd = self.fd, .events = POLLIN, .revents = 0 }};
+        const n = libc.poll(&fds, 1, timeout_ms);
+        if (n <= 0) return false;
+        return (fds[0].revents & POLLIN) != 0;
+    }
+
     pub fn close(self: *Conn) void {
         if (self.fd >= 0) {
             _ = libc.shutdown(self.fd, SHUT_WR);
@@ -355,6 +371,26 @@ test "request parsing: no body means an empty slice" {
     try std.testing.expectEqualStrings("/health", req.path());
     try std.testing.expectEqual(@as(usize, 0), req.body.len);
     try std.testing.expect(req.header("content-length") == null);
+}
+
+test "hasPendingInput reports readiness without blocking" {
+    // A socketpair gives us a connected pair without the network stack.
+    var sv: [2]std.c.fd_t = undefined;
+    const AF_UNIX: c_int = 1;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) != 0) return error.SkipZigTest;
+    defer _ = std.c.close(sv[0]);
+    defer _ = std.c.close(sv[1]);
+    var conn = Conn{ .fd = sv[0] };
+
+    // Nothing sent: must return immediately, not wait for the timeout. A 0 ms
+    // poll is inherently non-blocking, so this asserts the contract rather than
+    // the clock, which is what the caller depends on.
+    try std.testing.expect(!conn.hasPendingInput(0));
+
+    // One byte makes it readable.
+    const b = "x";
+    _ = libc.send(sv[1], b.ptr, b.len, 0);
+    try std.testing.expect(conn.hasPendingInput(500));
 }
 
 test "ipv4 parsing produces network byte order" {
