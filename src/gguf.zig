@@ -772,10 +772,13 @@ fn dequantQ8_0(b: []const u8, out: []f32) void {
     for (0..out.len / qk) |i| {
         const blk = b[i * 34 ..][0..34];
         const d = f16ToF32(readU16(blk, 0));
-        for (0..qk) |j| {
-            const q: f32 = @floatFromInt(readI8(blk, 2 + j));
-            out[i * qk + j] = q * d;
-        }
+        // Vectorised: 32 contiguous i8 -> f32 -> scale. Q8_0 is a third of the
+        // real Qwen1.5-MoE's expert traffic (every down_exps tensor), so it is
+        // worth the same treatment as Q4_K. Identical arithmetic, pinned by the
+        // dequant fixtures.
+        const raw: @Vector(32, i8) = @bitCast(blk[2..][0..32].*);
+        const q: @Vector(32, f32) = @floatFromInt(raw);
+        out[i * qk ..][0..32].* = @as(@Vector(32, f32), @splat(d)) * q;
     }
 }
 
@@ -916,14 +919,19 @@ fn dequantQ4K(b: []const u8, out: []f32) void {
             const d2 = d * @as(f32, @floatFromInt(s1.d));
             const m2 = min * @as(f32, @floatFromInt(s1.m));
             const y = ib * qk + (is / 2) * 64;
-            for (0..32) |l| {
-                const v: f32 = @floatFromInt(blk[q + l] & 0x0F);
-                out[y + l] = d1 * v - m1;
-            }
-            for (0..32) |l| {
-                const v: f32 = @floatFromInt(blk[q + l] >> 4);
-                out[y + 32 + l] = d2 * v - m2;
-            }
+            // Vectorised: 32 contiguous bytes become 32 f32 in two steps. The
+            // arithmetic is identical to the scalar form, so the dequant fixtures
+            // still pin it bit-for-bit; what changes is that the compiler emits one
+            // convert and one multiply-add per 32 elements instead of scalar ops.
+            //
+            // This inner loop is the measured wall on the MoE streaming path
+            // (219 MB/s, cold and warm alike), and it also runs once per layer for
+            // every dense GGUF load.
+            const raw: @Vector(32, u8) = blk[q..][0..32].*;
+            const lo: @Vector(32, f32) = @floatFromInt(raw & @as(@Vector(32, u8), @splat(0x0F)));
+            const hi: @Vector(32, f32) = @floatFromInt(raw >> @as(@Vector(32, u3), @splat(4)));
+            out[y..][0..32].* = @as(@Vector(32, f32), @splat(d1)) * lo - @as(@Vector(32, f32), @splat(m1));
+            out[y + 32 ..][0..32].* = @as(@Vector(32, f32), @splat(d2)) * hi - @as(@Vector(32, f32), @splat(m2));
             q += 32;
             is += 2;
         }

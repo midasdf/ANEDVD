@@ -137,9 +137,19 @@ faults or disk: it is the scalar dequantiser. The GGUF dequantisers are bit-exac
 against ggml (verified by the fixture cross-check) but they process one value at a
 time.
 
-That makes the full model impractical as written: ~1.66 GB of fp16 expert output
-per token across 24 layers, at ~220 MB/s, is **7.6 s/token**. Correct, and far from
-useful.
+That made the full model impractical as written: ~1.66 GB of fp16 expert output
+per token across 24 layers, at ~220 MB/s, is **7.6 s/token**.
+
+Vectorising the two hottest dequantisers (Q4_K, which every gate_exps and up_exps
+uses, and Q8_0, which is every down_exps on half the layers) moved the streaming
+rate from 219 to **406 MB/s**, 1.85x, with the fixtures still bit-exact against
+compiled ggml. Measured end to end on the real file, dequantising one token's worth
+of experts (4 experts x 3 tensors x 24 layers) still costs **4.6 s/token** — an
+upper bound of 0.22 tok/s before a single matmul runs.
+
+So: correct, and still not usable on this machine. The remaining cost is not
+bandwidth (the same rate cold and warm proves that) but the sheer volume of
+bit-twiddling per token. The three fixes below are ordered by that measurement.
 
 What would change it, in the order the numbers suggest:
 
