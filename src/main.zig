@@ -638,10 +638,17 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         std.process.exit(1);
     }
 
-    sys.print("  per-kernel check (layer 0, token 1):\n", .{});
+    // Diagnose a REAL prompt token rather than the hardcoded id 1. A token that never
+    // appears in the prompt can sit in a region of the embedding where the kernels happen
+    // to agree, which is how gemma-2-2b passed this check while `verify` disagreed on
+    // actual prompts.
+    const diag_ids = try loaded.tokenizer.encode(allocator, "The capital of France is", false);
+    defer allocator.free(diag_ids);
+    const diag_token: u32 = if (diag_ids.len > 0) diag_ids[diag_ids.len - 1] else 1;
+    sys.print("  per-kernel check (layer 0, token {d}):\n", .{diag_token});
     var m0 = try loaded.layers.load(allocator, 0);
     defer m0.deinit(allocator);
-    try eng.diagnose(1, &m0);
+    try eng.diagnose(diag_token, &m0);
 
     try predictNextTokens(allocator, &loaded.tokenizer, &eng, "The capital of France is");
     try predictNextTokens(allocator, &loaded.tokenizer, &eng, "2 + 2 =");
