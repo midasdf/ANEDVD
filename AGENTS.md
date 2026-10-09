@@ -188,13 +188,13 @@ with each other on the tiny Gemma 2 but not on the real one, so the divergence i
 size-dependent: `head_dim` 256 against 32, `q_dim` 2048 against `hidden` 2304, and a
 4096 sliding window that neither prompt actually reaches.
 
-**Important:** `anedvd cpu` — the reference the engine is normally checked against —
-ALSO produces wrong text for gemma-2-2b, so there is a bug the two paths share. That
-rules out the engine-specific machinery (ANE kernels, chunking, surface layouts) and
-points at the shared model code: the norm application, the attention maths, or the
-residual wiring. It also means the engine/reference agreement on the tiny Gemma 2 is not
-evidence that either is right — they can be wrong together, which is exactly the trap
-documented under "beware checks that cannot fail".
+**Correction to an earlier claim in this file.** I wrote that `anedvd cpu` also produced
+wrong text, making the bug shared. That conclusion came from a hand-built prompt containing
+a literal `<bos>` string, which is not a fair test of the reference. On a plain prompt the
+reference gives `603 476 575 573 919` — " is a to in", a plausible continuation — while the
+engine gives `235269 235265 ...` — ", ." — which is not. So the reference looks right and
+the engine wrong, and the bug is engine-side after all. The lesson is the same one this
+file keeps recording: check what a test actually exercises before concluding from it.
 
 Established by measurement, so they can be skipped:
 
