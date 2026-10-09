@@ -98,6 +98,14 @@ zig fmt src build.zig
   strides come back from `modelAttributes` — never assume them.
 * **RoPE convention is per-architecture** (llama = adjacent, qwen2 = half-split).
   The wrong one produces fluent repetition, not garbage.
+* **A readiness check must mean "the whole request arrived", not "some bytes did".** The
+  server used `hasPendingInput` (poll for POLLIN) before handing a connection to
+  `readRequest`, whose body loop is a blocking `recv` bounded only by `SO_RCVTIMEO`
+  (30 s). A client that sent headers claiming `Content-Length: 5000` and then 40 bytes
+  therefore blocked the single service path and made `/health` time out for **every**
+  other client until the timeout expired. `hasCompleteRequest` (FIONREAD + MSG_PEEK) now
+  gates it, and there are four parking slots rather than one. Probe this class of bug with
+  a raw socket: claim more than you send, then check that other clients still get answers.
 * **Test the server with two requests, not one.** Both server bugs found so
   far were invisible to single-request tests: a stale-KV bug that returned
   zero tokens on the second identical request, and a request silently
