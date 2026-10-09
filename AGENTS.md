@@ -196,6 +196,15 @@ engine gives `235269 235265 ...` — ", ." — which is not. So the reference lo
 the engine wrong, and the bug is engine-side after all. The lesson is the same one this
 file keeps recording: check what a test actually exercises before concluding from it.
 
+**Where the bug is, narrowed to one subsystem.** `check`/`diagnose` never apply RoPE
+or attention — it runs embed -> attn_norm -> qkv -> o -> ffn_norm -> ffn -> head and
+nothing else. Yet `verify --layers 1` on the one-token prompt "The" already disagrees with
+the reference (`9` against `714`). Since every projection kernel passes while the chain
+fails, and the only things the chain adds are RoPE, the KV cache and attention, the defect
+is in one of those three. That is a much smaller surface than the whole model, and
+gemma-2's rotate_half RoPE and half-split convention both check out on inspection, so
+attention itself is the first place to look.
+
 Established by measurement, so they can be skipped:
 
 * `head_dim` is 256 for gemma-2 and 32 for the tiny model. The prefill/decode attention
