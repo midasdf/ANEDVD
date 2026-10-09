@@ -608,3 +608,24 @@ rather than an error:
     for the token that completes it, exactly as stop sequences already do; the final flush
     and the non-streaming route replace what cannot be completed with U+FFFD. Verified both
     routes: `VALID UTF-8`, content `こんにち<U+FFFD>`, and ASCII output unchanged.
+19. **One stalled client made the whole server unresponsive.** Sending
+
+        POST /v1/chat/completions HTTP/1.1
+        Content-Length: 5000
+
+        {"messages":[...]}          <- 40 bytes, then stop
+
+    left `/health` timing out for **every** other client (3/3 attempts) for as long as the
+    connection stayed open. No generation was running and no CPU was consumed; a malformed
+    request was enough.
+
+    Two causes. `readRequest`'s body loop is a blocking `recv` bounded only by `SO_RCVTIMEO`
+    (30 s), and it sits on the server's single service path; the readiness check before it
+    was `hasPendingInput`, which only means *some* bytes arrived — true here, because the
+    headers had. And the connection-parking slot was singular, so `servicePending` closed
+    newly accepted connections while it was occupied, blocking the accept path too.
+
+    Fixed by requiring the whole request (`FIONREAD` + `MSG_PEEK` in `hasCompleteRequest`)
+    before a connection is handed to `readRequest`, and by using four parking slots with a
+    stalled connection — never a fresh arrival — evicted when they are full. Verified with
+    three stalled connections parked: `/health` answered 4/4 instead of 3/3 timeouts.
