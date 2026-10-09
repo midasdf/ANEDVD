@@ -152,86 +152,74 @@ layer, so overrides here win; new plugins need an `insert:` patch entry (a bare
 `- id:` only overrides an existing row); changes reach newly created
 agents/sessions only.
 
-## Gemma support: implemented, still producing wrong text
+## Gemma 2 works (rounds 8-10)
 
-All of the pieces below are implemented and committed (stages 1-3). What is NOT
-working is the generated text: gemma-2-2b-it loads, checks OK and its prompt encodes
-correctly (`<bos><start_of_turn>user\n...`), but generation emits a run of "." instead
-of an answer. Treat the model as unsupported until that is fixed.
+Verified end to end: "The capital of France is **Paris**", "2 + 2 = 4", "The sun rises in
+the **morning**", and the chat template answers correctly too.
 
-Implemented and verified to the extent stated:
+What it needed, all implemented and committed:
 
-* `Config.norm_unit_offset` — Gemma's RMSNorm is `(1 + w)`. Confirmed against
-  `GemmaRMSNorm.forward`; baked into the weights in `loadNormFor` so no compute path
-  changed. A test pins the equivalence.
-* `Config.embed_scale` — `sqrt(hidden_size)`, applied at both embedding reads. The GGUF
-  stores UNSCALED weights (measured mean|w| ~ 1e-5 against an HF std of ~0.01), so
-  llama.cpp does not pre-apply it.
-* `Config.attn_logit_softcap` / `final_logit_softcap` — `softcap * tanh(x / softcap)`,
-  read from the file (50.0 and 30.0).
-* `Config.sliding_window` / `layerIsSliding` — alternating global/windowed attention,
-  read from the file (4096).
-* `Norm.post_attn` / `Norm.post_ffw` — the sandwich norms, applied at all four residual
-  points (decode and prefill, attention and FFN).
-* A `<start_of_turn>` chat template selected from `tokenizer.chat_template`, and Gemma
-  added to the HF architecture list.
+* `Config.norm_unit_offset` — Gemma's RMSNorm is `(1 + w)`. **Per-file, not
+  per-architecture**: an HF checkpoint stores the raw parameter (mean ~0.19 on
+  gemma-2-2b) and needs the offset added; the GGUF converter has already applied it
+  (measured mean 1.1927 on `blk.0.attn_norm.weight`, the effective factor). Applying it
+  twice turns "Paris" into a run of dots. `load_hf` sets it, `load_gguf` clears it.
+* `Config.embed_scale` — `sqrt(hidden_size)`, applied at all three embedding reads.
+* `Config.use_gelu` — Gemma's FFN is `gelu_pytorch_tanh`, not SiLU. At x = -3 the two
+  differ 40x.
+* `Config.attn_logit_softcap` / `final_logit_softcap` — `softcap * tanh(x / softcap)`.
+* `Config.attn_scale` — `1/sqrt(n_embd/n_head)`, NOT `1/sqrt(head_dim)`: 1/sqrt(288)
+  against 1/sqrt(256) for gemma-2-2b, a 6% difference (llama.cpp's gemma2 graph).
+* `Config.sliding_window` / `layerIsSliding` — the reference builds `layer_types` as
+  `sliding if (i + 1) % 2`, so **layer 0 slides**.
+* `Norm.post_attn` / `Norm.post_ffw` — the sandwich norms, in the engine AND the CPU
+  reference (which was missing them entirely).
+* A `<start_of_turn>` chat template, and Gemma in the HF architecture list.
 
-**Where it stands now.** The `WrongShape` is fixed (prefill was reading the whole
-vocabulary from one head chunk). All four of gemma-2-2b's kernels check OK against the CPU
-reference (qkv 2.0e-4, o 4.2e-4, ffn 4.1e-3, lm_head 2.1e-4), its prompt encodes correctly,
-and the tiny-random Gemma 2 checks OK.
+Two lessons worth keeping:
 
-`anedvd run` on gemma-2-2b still emits a run of "." rather than an answer. The defect is
-**reachable in a single layer**:
+* **A wrong reference is worse than no reference.** `verify` reported MISMATCH for a
+  working model twice over: the CPU path skipped the sandwich norms, and the comparison
+  ran on soft-capped logits where tanh saturation hides everything. `Engine.pre_softcap`
+  now gives `verify` the pre-cap values, where the numbers mean something.
+* **Measure the file, do not infer the convention.** Four rounds went into reading
+  transformers, llama.cpp's graph builder and the converter (whose model classes are not
+  in the file that script downloads). One measurement — the stored norm mean is 1.19, not
+  0.19 — settled it in a minute.
 
-    anedvd verify models/gemma-2-2b-it-q4_k_m.gguf --layers 1
-      prefill: max|ANE - CPU| = 4.26e1  argmax 2 "<bos>" vs 603 "▁is"   MISMATCH
+Gemma does not yet pass `verify` (rel 0.45 prefill / 0.61 decode against a 10% bar), so a
+numerical difference between the two paths remains, but it is measured on a metric that
+can be trusted and against a reference that implements the whole architecture.
 
-so it is not something that accumulates over 26 layers, and `--layers 1` is a
-two-minute reproduction rather than a full run. Note the engine and `anedvd cpu` agree
-with each other on the tiny Gemma 2 but not on the real one, so the divergence is
-size-dependent: `head_dim` 256 against 32, `q_dim` 2048 against `hidden` 2304, and a
-4096 sliding window that neither prompt actually reaches.
+## Toolchain
 
-**Correction to an earlier claim in this file.** I wrote that `anedvd cpu` also produced
-wrong text, making the bug shared. That conclusion came from a hand-built prompt containing
-a literal `<bos>` string, which is not a fair test of the reference. On a plain prompt the
-reference gives `603 476 575 573 919` — " is a to in", a plausible continuation — while the
-engine gives `235269 235265 ...` — ", ." — which is not. So the reference looks right and
-the engine wrong, and the bug is engine-side after all. The lesson is the same one this
-file keeps recording: check what a test actually exercises before concluding from it.
+| Tool | Version / path |
+|---|---|
+| Zig | 0.17.0, `/opt/homebrew/bin/zig` |
+| zls | 0.17.0-dev, `/opt/homebrew/bin/zls` |
+| clang | 21.0.0, `/usr/bin/clang` (CommandLineTools) |
+| python3 | 3.9.6 (fixture generators, cross-checks) |
 
-**Where the bug is, narrowed to one subsystem.** `check`/`diagnose` never apply RoPE
-or attention — it runs embed -> attn_norm -> qkv -> o -> ffn_norm -> ffn -> head and
-nothing else. Yet `verify --layers 1` on the one-token prompt "The" already disagrees with
-the reference (`9` against `714`). Since every projection kernel passes while the chain
-fails, and the only things the chain adds are RoPE, the KV cache and attention, the defect
-is in one of those three. That is a much smaller surface than the whole model, and
-gemma-2's rotate_half RoPE and half-split convention both check out on inspection, so
-attention itself is the first place to look.
+## DSH dev environment
 
-Established by measurement, so they can be skipped:
+`~/.dsh/profiles/desktop/cordis.patch.yml` adds one `insert:` block with six
+rows: `dev-lsp`, `dev-lsp-stdio`, `dev-tool-lsp`, `dev-terminal`,
+`dev-terminal-bash`, `dev-tool-terminal`. The four packages behind them
+(`@deepseek-ai/dsh-lsp`, `-lsp-stdio`, `-tool-lsp`, `-tool-terminal`, all
+`0.2.0-rc.2`) live in `~/.dsh/profiles/desktop/node_modules`.
 
-* `head_dim` is 256 for gemma-2 and 32 for the tiny model. The prefill/decode attention
-  equivalence tests now cover 256 and pass, so attention is consistent at that size.
-* Disabling the sliding window changes nothing (neither prompt reaches 4096).
-* The o projection is built `cin = qDim (2048) -> cout = hidden (2304)`, correct for a
-  model whose q_dim is smaller than its hidden.
-* Every Gemma flag loads: sandwich, unit-offset norm, gelu, both soft-caps, the window,
-  and layer 0's four norms all arrive at hidden = 2304.
-* Q6_K, the type of Gemma's embedding tensor, is bit-exact against llama.cpp.
+* `lsp` — read-only `goToDefinition` / `findReferences` / `goToImplementation` /
+  `hover`, one-based line and UTF-16 column, workspace files only. `.zig`/`.zon`
+  → zls, `.c/.h/.cc/.cpp/.hpp/.m` → clangd, `.rs` → rust-analyzer, `.go` →
+  gopls, `.py/.pyi` → pyright, `.ts/.tsx/.js/.jsx/.mjs/.cjs` → tsserver.
+* `terminal_open/send/read/signal/close/list` — a real PTY that survives across
+  calls (`run_in_background` for long commands).
+* `plugin_manager` — list/install/remove plugins and bundles for this profile;
+  every action needs `danger-full-access`. The profile patch carries a
+  last-write `disabled: false` override for `tool-plugin-manager`.
 
-Open questions for whoever picks this up, in the order worth trying:
-
-0. The `WrongShape` above. It is confined to `runHead`'s chunk loop: the kernels all
-   check OK, so it is the read, not the arithmetic.
-1. `query_pre_attn_scalar` is 256 for gemma-2-2b, equal to `head_dim`, so the existing
-   `head_dim**-0.5` scaling matches. Check this for other Gemma sizes.
-2. `q_dim` (8 x 256 = 2048) is smaller than `hidden` (2304). Nothing has been verified
-   about the `o_proj` shape beyond it loading.
-3. The "sandwich" ordering was applied as `norm(attn_out) + residual`, which is what the
-   reference does, but it has never been checked numerically against a reference
-   implementation for this model — `anedvd cpu` and the engine share the code, so they
-   agree with each other and cannot validate it.
-4. Prefill attention masks the window only within the chunk; whether a chunk boundary
-   needs care when `pos` wraps the window has not been tested.
+Caveats: `dev-lsp-stdio` resolves every configured `command` at load, so one
+missing executable stops the whole provider; the profile patch is the last
+layer, so overrides here win; new plugins need an `insert:` patch entry (a bare
+`- id:` only overrides an existing row); changes reach newly created
+agents/sessions only.
