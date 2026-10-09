@@ -172,6 +172,26 @@ agrees with the CPU reference rank for rank (220, 151645, 151643, 264, 1147).
 Decode cannot use this: it processes one token at a time, so there is nothing to share
 an expert read with. That is why decode stays at ~2.5 s/token while prefill improved.
 
+## Expert cache: measured, rejected
+
+The obvious next lever for decode is caching hot experts, since 84% of the per-token MoE
+cost is reading and dequantising them from the mapping. Measured with `anedvd route` on a
+32-token generation (24 layers x 4 experts per token):
+
+    distinct experts per layer: min 35, max 57, mean 42.5 of 60
+    a 4-slot LRU per layer hit 55% of selections
+
+So the hit rate is real. A 4-slot cache across 24 layers costs 4 x 24 x 23.1 MB = **2.2 GB
+resident** (one expert is hidden 2048 x moe_inter 5632 x 2 bytes x 3 tensors).
+
+It would save 55% of the ~120 ms read per selection: 4 selections x 66 ms = **264 ms of
+~2500 ms/token, about 11%**.
+
+Rejected: 11% for 2.2 GB on an 8 GB machine, where an earlier eager-materialisation
+mistake already cost 30 s/token through swap thrashing. The memory is worth more than the
+11% here. If the machine had 32 GB the answer would be different, and with a much longer
+context the hit rate would rise too — the figure above is for only 32 generated tokens.
+
 ## Status and verification
 
 Implemented and verified for safetensors Qwen2MoE, against
@@ -288,6 +308,26 @@ agrees with the CPU reference rank for rank (220, 151645, 151643, 264, 1147).
 
 Decode cannot use this: it processes one token at a time, so there is nothing to share
 an expert read with. That is why decode stays at ~2.5 s/token while prefill improved.
+
+## Expert cache: measured, rejected
+
+The obvious next lever for decode is caching hot experts, since 84% of the per-token MoE
+cost is reading and dequantising them from the mapping. Measured with `anedvd route` on a
+32-token generation (24 layers x 4 experts per token):
+
+    distinct experts per layer: min 35, max 57, mean 42.5 of 60
+    a 4-slot LRU per layer hit 55% of selections
+
+So the hit rate is real. A 4-slot cache across 24 layers costs 4 x 24 x 23.1 MB = **2.2 GB
+resident** (one expert is hidden 2048 x moe_inter 5632 x 2 bytes x 3 tensors).
+
+It would save 55% of the ~120 ms read per selection: 4 selections x 66 ms = **264 ms of
+~2500 ms/token, about 11%**.
+
+Rejected: 11% for 2.2 GB on an 8 GB machine, where an earlier eager-materialisation
+mistake already cost 30 s/token through swap thrashing. The memory is worth more than the
+11% here. If the machine had 32 GB the answer would be different, and with a much longer
+context the hit rate would rise too — the figure above is for only 32 generated tokens.
 
 ## Status
 
