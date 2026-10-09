@@ -36,6 +36,10 @@ pub const Server = struct {
     /// mid-write, and is small enough that a stalled peer cannot consume much.
     pub const max_pending: usize = 4;
 
+    /// How long a connection may sit parked without completing its request. Parking does
+    /// not read, so `SO_RCVTIMEO` does not apply to it and this is the only bound.
+    pub const park_deadline_ns: i128 = 10 * std.time.ns_per_s;
+
     allocator: std.mem.Allocator,
     session: *generate.Session,
     opts: Options,
@@ -47,6 +51,8 @@ pub const Server = struct {
     busy_rejections: u64 = 0,
     /// SSE keep-alive comments written while a long prefill produced no tokens.
     keep_alives: u64 = 0,
+    /// Parked connections dropped because their request never completed.
+    pending_timeouts: u64 = 0,
     /// Nanoseconds since the last byte written to the client on the active stream.
     /// Drives the keep-alive decision; see `streamKeepAlive`.
     last_write_ns: i128 = 0,
@@ -64,6 +70,11 @@ pub const Server = struct {
     /// other client** for that whole window (measured). Several slots mean a stalled
     /// connection can only occupy its own.
     pending: [max_pending]?http.Conn = @splat(null),
+    /// When each slot was filled, so a connection that never finishes its request can be
+    /// dropped. Parking does not read from the socket, so `SO_RCVTIMEO` never fires for a
+    /// parked connection: without a deadline here, a client that claimed a 4 MiB body and
+    /// then sent nothing would hold its slot for as long as it liked.
+    pending_since: [max_pending]i128 = @splat(0),
     /// The engine's context window, reported when a prompt has to be truncated.
     context_limit: u32 = 0,
 
@@ -92,9 +103,17 @@ pub const Server = struct {
             // `readRequest`, which would block this loop in `recv` for the whole receive
             // timeout and lock out every other client.
             var served = false;
-            for (&self.pending) |*slot| {
+            for (&self.pending, 0..) |*slot, si| {
                 var conn = slot.* orelse continue;
-                if (!conn.hasCompleteRequest()) continue;
+                if (!conn.hasCompleteRequest()) {
+                    // Give up on a request that never completes; see pending_since.
+                    if (sys.nowNs() - self.pending_since[si] > park_deadline_ns) {
+                        slot.* = null;
+                        conn.close();
+                        self.pending_timeouts += 1;
+                    }
+                    continue;
+                }
                 slot.* = null;
                 self.handle(&conn) catch |e| {
                     if (e != error.WriteFailed and e != error.ConnectionClosed) {
@@ -125,6 +144,12 @@ pub const Server = struct {
             return;
         };
         slot.* = fresh.*;
+        // Record which slot this is so the deadline can be applied to it.
+        self.pending_since[self.slotIndex(slot)] = sys.nowNs();
+    }
+
+    fn slotIndex(self: *Server, slot: *?http.Conn) usize {
+        return (@intFromPtr(slot) - @intFromPtr(&self.pending[0])) / @sizeOf(?http.Conn);
     }
 
     fn handle(self: *Server, conn: *http.Conn) !void {
@@ -312,17 +337,29 @@ pub const Server = struct {
         var accepted: usize = 0;
         while (accepted < max_pending) : (accepted += 1) {
             const slot = self.freePendingSlot() orelse break;
-            slot.* = srv.acceptIfPending() orelse break;
+            const fresh = srv.acceptIfPending() orelse break;
+            slot.* = fresh;
+            // Stamp the slot. Without this it keeps the 0 it was initialised with, and
+            // `now - 0` always exceeds the deadline, so a connection accepted here would be
+            // dropped on the next tick instead of being given time to send its request.
+            self.pending_since[self.slotIndex(slot)] = sys.nowNs();
         }
         srv.setNonBlocking(false);
 
         // Service every slot that already has a complete request. Slots that do not are
         // left alone for the next tick, which is what keeps the 0 ms poll cheap.
-        for (&self.pending) |*slot| {
+        for (&self.pending, 0..) |*slot, si| {
             var conn = slot.* orelse continue;
             // Wait for the WHOLE request, not merely the first bytes: see
             // `hasCompleteRequest` for the denial of service that distinction caused.
-            if (!conn.hasCompleteRequest()) continue;
+            if (!conn.hasCompleteRequest()) {
+                if (sys.nowNs() - self.pending_since[si] > park_deadline_ns) {
+                    slot.* = null;
+                    conn.close();
+                    self.pending_timeouts += 1;
+                }
+                continue;
+            }
             slot.* = null;
             self.handlePendingRequest(&conn);
             conn.close();

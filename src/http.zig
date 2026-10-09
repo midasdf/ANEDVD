@@ -326,7 +326,12 @@ pub const Conn = struct {
         };
         var want: usize = 0;
         if (findHeaderIn(got[0 .. hdr_end + 4], "content-length")) |v| {
-            want = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return false;
+            // A length that cannot be honoured must NOT be reported as "not ready yet":
+            // that parks the connection forever and the client gets no reply at all, where
+            // it used to get a proper 400. Returning true hands it to `readRequest`, which
+            // rejects it with `MalformedRequest` or `RequestTooLarge`.
+            want = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return true;
+            if (want > 4 * 1024 * 1024) return true;
         }
         return got.len >= hdr_end + 4 + want;
     }
@@ -494,4 +499,41 @@ test "header lookup is case-insensitive" {
     try std.testing.expectEqualStrings("application/json", req.header("CONTENT-TYPE").?);
     try std.testing.expect(req.header("x-missing") == null);
     try std.testing.expectEqualStrings("/v1/chat/completions", req.path());
+}
+
+test "an unhonourable Content-Length is reported ready, not parked forever" {
+    // A length that can never be satisfied must not be treated as "not ready yet". Doing so
+    // parks the connection indefinitely and the client gets no reply at all, where it used
+    // to get a 400 — measured against a live server: `Content-Length: -5`, an overflowing
+    // value and a 5 MB claim all hung until this was fixed, then all returned 400.
+    var sv: [2]std.c.fd_t = undefined;
+    const AF_UNIX: c_int = 1;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) != 0) return error.SkipZigTest;
+    defer _ = std.c.close(sv[0]);
+    defer _ = std.c.close(sv[1]);
+    var conn = Conn{ .fd = sv[0] };
+
+    const bad = "POST /x HTTP/1.1\r\nContent-Length: -5\r\n\r\n";
+    _ = libc.send(sv[1], bad.ptr, bad.len, 0);
+    try std.testing.expect(conn.hasCompleteRequest());
+
+    var sv2: [2]std.c.fd_t = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv2) != 0) return error.SkipZigTest;
+    defer _ = std.c.close(sv2[0]);
+    defer _ = std.c.close(sv2[1]);
+    var over = Conn{ .fd = sv2[0] };
+    const too_big = "POST /x HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n";
+    _ = libc.send(sv2[1], too_big.ptr, too_big.len, 0);
+    try std.testing.expect(over.hasCompleteRequest());
+
+    // A length that IS honest but has not arrived stays "not ready", which is what lets a
+    // legitimate slow client send its body in more than one write.
+    var sv3: [2]std.c.fd_t = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv3) != 0) return error.SkipZigTest;
+    defer _ = std.c.close(sv3[0]);
+    defer _ = std.c.close(sv3[1]);
+    var slow = Conn{ .fd = sv3[0] };
+    const partial = "POST /x HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc";
+    _ = libc.send(sv3[1], partial.ptr, partial.len, 0);
+    try std.testing.expect(!slow.hasCompleteRequest());
 }
