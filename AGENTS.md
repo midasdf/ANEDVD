@@ -209,36 +209,3 @@ attempt does not repeat the search:
   what differs between `diagnose` and `Engine.prefill` for the last column.
 * The tiny Gemma 2 (hidden 8) passes the same comparison at rel 4.1e-3, so whatever it is
   scales with model size.
-
-## Toolchain
-
-| Tool | Version / path |
-|---|---|
-| Zig | 0.17.0, `/opt/homebrew/bin/zig` |
-| zls | 0.17.0-dev, `/opt/homebrew/bin/zls` |
-| clang | 21.0.0, `/usr/bin/clang` (CommandLineTools) |
-| python3 | 3.9.6 (fixture generators, cross-checks) |
-
-## DSH dev environment
-
-`~/.dsh/profiles/desktop/cordis.patch.yml` adds one `insert:` block with six
-rows: `dev-lsp`, `dev-lsp-stdio`, `dev-tool-lsp`, `dev-terminal`,
-`dev-terminal-bash`, `dev-tool-terminal`. The four packages behind them
-(`@deepseek-ai/dsh-lsp`, `-lsp-stdio`, `-tool-lsp`, `-tool-terminal`, all
-`0.2.0-rc.2`) live in `~/.dsh/profiles/desktop/node_modules`.
-
-* `lsp` — read-only `goToDefinition` / `findReferences` / `goToImplementation` /
-  `hover`, one-based line and UTF-16 column, workspace files only. `.zig`/`.zon`
-  → zls, `.c/.h/.cc/.cpp/.hpp/.m` → clangd, `.rs` → rust-analyzer, `.go` →
-  gopls, `.py/.pyi` → pyright, `.ts/.tsx/.js/.jsx/.mjs/.cjs` → tsserver.
-* `terminal_open/send/read/signal/close/list` — a real PTY that survives across
-  calls (`run_in_background` for long commands).
-* `plugin_manager` — list/install/remove plugins and bundles for this profile;
-  every action needs `danger-full-access`. The profile patch carries a
-  last-write `disabled: false` override for `tool-plugin-manager`.
-
-Caveats: `dev-lsp-stdio` resolves every configured `command` at load, so one
-missing executable stops the whole provider; the profile patch is the last
-layer, so overrides here win; new plugins need an `insert:` patch entry (a bare
-`- id:` only overrides an existing row); changes reach newly created
-agents/sessions only.
