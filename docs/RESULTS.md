@@ -957,3 +957,15 @@ rather than an error:
       not the reading of the key, and deleting the plumbing failed nothing — a check that could
       not fail, in the round after writing about them. The test now goes through
       `toModelConfig`, and removing the plumbing fails it (126 -> 125 passed).
+43. **The README's sampling section had drifted twice over.** It said the sampler "sorts that
+    much smaller set" and "a single pass over the vocabulary plus a small sort". Both were true
+    when written and neither is now: there are two passes, the cut leaves ~45 000 candidates at
+    temperature 1.0 rather than something small, and the selection stopped sorting them in
+    round 34. Replaced with the measured picture — 0.13 ms for the two walks, 1.33 -> 0.47 ms
+    for the candidate processing, and the cost tracking the candidate count rather than the
+    vocabulary.
+
+    This is the fifth documentation correction in five rounds, all of the same kind: a change
+    lands and the prose describing the old behaviour stays. The pattern is worth naming —
+    **code and the sentences about it need to be changed in the same commit**, because the
+    sentence is what a reader trusts and it fails silently.
