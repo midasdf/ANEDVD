@@ -135,13 +135,13 @@ larger models need a machine with more unified memory.
 | `anedvd bench` | matmul throughput sweep (128 … 4096) |
 | `anedvd selftest` | tiny transformer: ANE engine vs CPU reference |
 | `anedvd check <model.gguf> [--split]` | load a real GGUF, compile every kernel, per-kernel diff, sample predictions |
-| `anedvd verify <model.gguf>` | whole-model check: every layer on the ANE vs the pure-CPU reference |
+| `anedvd verify <model.gguf> [--layers N]` | whole-model check: every layer on the ANE vs the pure-CPU reference |
 | `anedvd layers <model.gguf> --upto N` | run only the first N layers (bisect a model that produces garbage) |
 | `anedvd kernels <model.gguf>` | per-kernel timing and achieved weight bandwidth |
-| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--top-p P] [--repeat-penalty R] [--chunk N] [--ab]` | generate text on the ANE |
-| `anedvd chat --model <m.gguf\|hf-dir> [--system "…"]` | interactive multi-turn chat in the terminal (`/help`, `/reset`, `/temp`, `/topp`, `/rep`) |
+| `anedvd run --model <m.gguf\|hf-dir> --prompt "…" [--max-tokens N] [--temp T] [--top-k K] [--top-p P] [--repeat-penalty R] [--chunk N] [--max-seq N] [--ab]` | generate text on the ANE |
+| `anedvd chat --model <m.gguf\|hf-dir> [--system "…"] [--max-seq N]` | interactive multi-turn chat in the terminal (`/help`, `/reset`, `/temp`, `/topp`, `/rep`) |
 | `anedvd cpu --model <m.gguf> --prompt "…" [--chat]` | pure-CPU reference generation (validates model handling without the ANE) |
-| `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
+| `anedvd serve --model <m.gguf> [--host 127.0.0.1] [--port 8080] [--max-seq N]` | HTTP server: OpenAI + Anthropic compatible API and a built-in WebUI |
 
 `--model` accepts either a `.gguf` file or a HuggingFace model directory
 (`model.safetensors` + `config.json` + `tokenizer.json`, multi-shard aware).
@@ -271,6 +271,13 @@ Multi-turn chat does not re-prefill what is already cached: a transcript only
 appends, so `generate.Session` keeps the KV cache and prefills just the new
 suffix (`anedvd chat` and the server log both report how many prompt tokens were
 reused). In a two-turn example, turn 2 reported "prompt 44 (22 reused)".
+
+**`--max-seq N` sets the context** (default 2048) on `run`, `chat`, `serve`, `verify` and
+`layers`, and it is the flag every truncation message tells you to raise. A prompt longer than
+the context is cut from the front — the newest tokens are kept — and that is reported rather
+than silent: `usage.prompt_tokens_dropped` and a log line on the server, and a note from `chat`
+and `run`. The KV cache is sized to `max_seq` rows, so raising it costs memory in both the
+engine and the CPU reference.
 
 ## Sampling
 
