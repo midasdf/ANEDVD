@@ -1098,8 +1098,18 @@ fn streamError(conn: *http.Conn, style: Style, message: []const u8) void {
 }
 
 fn clampMaxTokens(requested: u32, prompt_len: usize, max_seq: u32) u32 {
-    const prompt: u32 = @intCast(@min(prompt_len, max_seq));
-    const room: u32 = if (prompt + 1 < max_seq) max_seq - prompt - 1 else 1;
+    // A prompt that already fits keeps its whole place, so the remainder of the context goes
+    // to generation.
+    //
+    // A prompt that does NOT fit is going to be truncated by `generate` regardless, so there
+    // is no reason to also starve the completion: honour the request as far as the context
+    // allows and let that truncation report the drop. Clamping to 1 instead made a 154-token
+    // prompt asking for 20 tokens return **1** (measured), which reads as a failure rather
+    // than as a truncated prompt.
+    const room: u32 = if (prompt_len + 1 < max_seq)
+        max_seq - @as(u32, @intCast(prompt_len)) - 1
+    else
+        max_seq -| 2; // keeps at least one prompt token after truncation
     return @max(1, @min(requested, room));
 }
 
@@ -1313,4 +1323,12 @@ test "clampMaxTokens always leaves a servable request" {
     try std.testing.expectEqual(@as(u32, 2035), clampMaxTokens(100000, 12, seq));
     // A request that already fits is passed through unchanged.
     try std.testing.expectEqual(@as(u32, 10), clampMaxTokens(10, 12, seq));
+
+    // A prompt that does not fit is truncated by `generate` anyway, so the completion must
+    // still get what it asked for. Measured against a live server before this: a 154-token
+    // prompt with max_seq 128 asking for 20 tokens returned **1**.
+    try std.testing.expectEqual(@as(u32, 20), clampMaxTokens(20, 154, 128));
+    try std.testing.expectEqual(@as(u32, 6), clampMaxTokens(6, 154, 128));
+    // Bounded so that `generate` can still keep one prompt token.
+    try std.testing.expectEqual(@as(u32, 126), clampMaxTokens(100000, 154, 128));
 }
