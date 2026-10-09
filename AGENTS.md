@@ -106,6 +106,11 @@ zig fmt src build.zig
 * The HTTP server handles **one request at a time** on purpose: one ANE engine,
   one KV cache. Do not add a thread pool without giving each thread its own
   engine.
+* **A `anedvd cpu` run on a 2B model costs ~850 MB of swap while it runs.** A long
+  reference run started in the background and then abandoned held that much for a long
+  time. `anedvd cpu` is scalar and takes many minutes at that size, so put a timeout on
+  it and check for leftover processes (`pgrep -fl anedvd`) before blaming the machine for
+  pressure.
 * **The ANE program pool is machine-wide**, so only one process can hold a full
   model's kernels. Killing a stale `anedvd serve` is usually what fixes a
   sudden "no ANE resources" failure.
