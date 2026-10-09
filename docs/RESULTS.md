@@ -761,3 +761,14 @@ rather than an error:
         after:   completion=20, dropped=47     (what the client asked for)
 
     The drop is still reported in `usage.prompt_tokens_dropped` and in the server log.
+28. **The CLI truncated prompts silently.** The server reports a cut prompt in
+    `usage.prompt_tokens_dropped` and logs a warning; `chat` and `run` said nothing. Growing a
+    conversation past `--max-seq 96` in `chat` showed the prompt capping at 87 tokens with
+    `reused from cache` falling to **0** and nothing explaining either. Two consequences the
+    user could not diagnose: the conversation silently forgot its opening turns, and every
+    later turn re-prefilled the whole prompt (the truncated prompt is a suffix, so
+    `reuseLength` correctly returns 0 and the prefix benefit is lost).
+
+    Both now print a note naming the context size and the number of tokens dropped, only when
+    something was dropped. `chat` also suggests `--max-seq N` or `/reset`, and `/reset` was
+    checked to exist and to recover (the next prompt returns to 12 tokens from 87).
