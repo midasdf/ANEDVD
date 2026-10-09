@@ -258,7 +258,12 @@ pub const Kernel = struct {
     /// Read fp16 values from output `idx` back into row-major order.
     pub fn readOutputF16(self: *const Kernel, idx: usize, out: []f16) !void {
         const info = self.out_info[idx];
-        if (out.len != info.elemCount()) return Error.WrongShape;
+        if (out.len != info.elemCount()) {
+            sys.eprint("ane: readOutputF16 got {d} values, kernel expects {d} (C={d} W={d}); \n  a chunked head kernel must be read with its own row count, not the model's vocabulary\n", .{
+                out.len, info.elemCount(), info.channels, info.width,
+            });
+            return Error.WrongShape;
+        }
         if (ane_shim_output_lock(self.handle, @intCast(idx)) == 0) return Error.SurfaceLockFailed;
         defer _ = ane_shim_output_unlock(self.handle, @intCast(idx));
         const base = ane_shim_output_base(self.handle, @intCast(idx)) orelse return Error.SurfaceUnavailable;

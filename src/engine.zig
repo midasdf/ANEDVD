@@ -732,6 +732,9 @@ pub const Engine = struct {
         try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
         const t0 = sys.nowNs();
         try self.head_kernel.eval();
+        // The FIRST kernel's row count, not the whole vocabulary: `head_out` is
+        // vocab-sized, and readOutputF16 requires exactly the kernel's elemCount.
+        // Reading `[0..vocab]` here is what produced "got 256000, kernel expects 116508".
         const first_rows: usize = @min(chunk, cfg.vocab);
         try self.head_kernel.readOutputF16(0, self.head_out[0..first_rows]);
         for (0..self.head_extra_built) |i| {
@@ -1076,20 +1079,9 @@ pub const Engine = struct {
             const last = n - 1;
             for (0..hidden) |c| self.h[c * ch] = self.x[c * ch + last];
             rmsnormColumn(self.head_in[0..hidden], self.h, self.final_norm, cfg.eps, ch);
-            try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
-            const th = sys.nowNs();
-            try self.head_kernel.eval();
-            self.stats.ane_eval_ns += sys.nowNs() - th;
-            self.stats.ane_evals += 1;
-            try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
-            for (self.logits, 0..) |*l, i| {
-                const v: f32 = @floatCast(self.head_out[i]);
-                // Gemma 2 caps the final logits too.
-                l.* = if (cfg.final_logit_softcap > 0)
-                    cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
-                else
-                    v;
-            }
+            // Same chunked path as decode. Reading `head_out[0..vocab]` here asked a
+            // single chunk kernel for the whole vocabulary and got WrongShape.
+            try self.runHead();
 
             done += n;
             self.stats.tokens += 1;
@@ -1114,7 +1106,13 @@ pub const Engine = struct {
         const q_dim: usize = cfg.qDim();
         const inter: usize = cfg.inter;
 
-        for (0..hidden) |c| self.x[c * ch] = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+        // Apply the architecture's embedding scale, as both real forward paths do;
+        // without it the per-kernel check would validate a different input than the
+        // model actually uses.
+        for (0..hidden) |c| {
+            const e: f32 = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+            self.x[c * ch] = e * cfg.embed_scale;
+        }
         rmsnormColumn(self.dec_in[0..hidden], self.x, self.norms[0].attn, cfg.eps, ch);
 
         const ref = try self.allocator.alloc(f32, cfg.vocab);
