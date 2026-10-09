@@ -874,3 +874,19 @@ rather than an error:
     here — the semantics need care, `top_k = 0` bypasses the selection entirely and must keep
     its current behaviour, and this project's two previous attempts at hand-rolled partial
     selection were both wrong and had to be reverted.
+37. **The top-k selection no longer sorts everything: 1.33 -> 0.47 ms/token.** `selectTopK`
+    called `sortUnstable` on the whole candidate array to keep the first 40, and at
+    temperature 1.0 that array holds ~45k of 151,936 logits. Nothing below the top `k` is ever
+    read, so the rest does not need ordering. Keeping the k largest in `items[0..k]` and
+    leaving the tail alone:
+
+        temperature 1.0   1.33 -> 0.47 ms/token   (2.8x, candidates unchanged at 45,226)
+        temperature 0.3   0.13 -> 0.13 ms/token   (nothing to gain, 33 candidates)
+
+    `top_k = 0` and `k >= items.len` keep the old path.
+
+    The existing test `selectTopK agrees with a full sort` caught two bugs in my first two
+    attempts, each of which would have silently dropped candidates — writing past the element
+    just read while still filling, and leaving the inserted value in the array twice when it
+    came from the tail. AGENTS.md warns that two earlier hand-rolled partial selections were
+    wrong and had to be reverted; this time the test that made it safe was already there.

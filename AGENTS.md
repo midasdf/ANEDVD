@@ -86,9 +86,14 @@ zig fmt src build.zig
   decode (208.4 against 220.3 us) and identical on prefill (267.90 against 268.67 us/query):
   grouping shrinks the cache being re-read (262 KB against 1.8 MB), so the redundancy is
   served from a resident cache while the ungrouped case streams seven times more data.
-* **Sampling is not negligible.** At temperature 1.0 the candidate cut leaves
-  ~31k of 151936 logits, and ordering them was ~10% of decode (`sortUnstable`,
-  not `sort`, for the top-k selection). `anedvd run` prints the cost per token.
+* **Sampling is not negligible, and the cost tracks the CANDIDATE count, not the vocabulary.**
+  At temperature 1.0 the cut leaves ~45k of 151936 logits and sampling was 1.33 ms/token,
+  against 0.13 ms when it leaves 33 — so the fixed two-pass walk over the vocabulary is 0.13 ms
+  and everything else was candidate processing. `selectTopK` used to `sortUnstable` the whole
+  candidate array to keep 40; it now keeps the k largest in `items[0..k]` and leaves the rest
+  unordered, which is 0.47 ms/token. `anedvd run` prints the cost per token. **When changing
+  this, run `selectTopK agrees with a full sort` — it caught two candidate-dropping bugs in the
+  first two attempts at the bounded selection.**
 * **Never `git checkout <path>` with uncommitted work you want to keep.** A bare
   `git checkout src` during this session silently destroyed ~2 hours of Gemma support
   (sandwich norms, logit soft-capping, sliding-window attention, chat template) that had
