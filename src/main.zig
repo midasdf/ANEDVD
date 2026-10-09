@@ -109,21 +109,52 @@ fn argValue(argv: []const [:0]const u8, name: []const u8, default: u32) u32 {
 /// Without this the failure surfaces far from its cause: `--chunk 0` compiled a width-zero
 /// kernel and reported `AneCompileFailed`, and `--max-seq 0` reported `PromptTooLong`.
 /// Neither names the flag the user got wrong.
+/// The rule behind `argValueAtLeast`, split out so it can be tested: that function exits
+/// the process on a bad value, which a unit test cannot observe.
+const ArgError = error{ NotANumber, BelowMinimum };
+
+fn parseAtLeast(raw: []const u8, min: u32) ArgError!u32 {
+    const v = std.fmt.parseInt(u32, raw, 10) catch return error.NotANumber;
+    if (v < min) return error.BelowMinimum;
+    return v;
+}
+
 fn argValueAtLeast(argv: []const [:0]const u8, name: []const u8, default: u32, min: u32) u32 {
     for (argv, 0..) |a, i| {
         if (std.mem.eql(u8, a, name) and i + 1 < argv.len) {
-            const v = std.fmt.parseInt(u32, argv[i + 1], 10) catch {
-                sys.eprint("{s} expects a number, got \"{s}\"\n", .{ name, argv[i + 1] });
+            return parseAtLeast(argv[i + 1], min) catch |e| {
+                switch (e) {
+                    error.NotANumber => sys.eprint("{s} expects a number, got \"{s}\"\n", .{ name, argv[i + 1] }),
+                    error.BelowMinimum => sys.eprint("{s} must be at least {d}, got \"{s}\"\n", .{ name, min, argv[i + 1] }),
+                }
                 std.process.exit(2);
             };
-            if (v < min) {
-                sys.eprint("{s} must be at least {d}, got {d}\n", .{ name, min, v });
-                std.process.exit(2);
-            }
-            return v;
         }
     }
     return default;
+}
+
+test "argument minimums reject a bad value and pass a good one" {
+    // `--chunk 0` used to reach the ANE as a width-zero kernel and `--max-seq 0` as
+    // PromptTooLong; neither named the flag. The rule is what keeps the message honest, and
+    // it is checked here because the reporting function exits the process.
+    try std.testing.expectEqual(@as(u32, 1), try parseAtLeast("1", 1));
+    try std.testing.expectEqual(@as(u32, 128), try parseAtLeast("128", 1));
+    try std.testing.expectEqual(@as(u32, 4), try parseAtLeast("4", 4));
+    try std.testing.expectError(error.BelowMinimum, parseAtLeast("0", 1));
+    try std.testing.expectError(error.BelowMinimum, parseAtLeast("3", 4));
+    try std.testing.expectError(error.NotANumber, parseAtLeast("abc", 1));
+    try std.testing.expectError(error.NotANumber, parseAtLeast("", 1));
+    try std.testing.expectError(error.NotANumber, parseAtLeast("-1", 1));
+    try std.testing.expectError(error.NotANumber, parseAtLeast("12x", 1));
+
+    // Reads from an argv-shaped list, and a missing flag falls back to the default.
+    const argv = [_][:0]const u8{ "anedvd", "run", "--chunk", "8" };
+    try std.testing.expectEqual(@as(u32, 8), argValueAtLeast(&argv, "--chunk", 128, 1));
+    try std.testing.expectEqual(@as(u32, 128), argValueAtLeast(&argv, "--other", 128, 1));
+    // A flag with no value after it is treated as absent rather than as a crash.
+    const dangling = [_][:0]const u8{ "anedvd", "run", "--chunk" };
+    try std.testing.expectEqual(@as(u32, 128), argValueAtLeast(&dangling, "--chunk", 128, 1));
 }
 
 fn cmdInfo() !void {

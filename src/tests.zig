@@ -21,6 +21,7 @@ test {
     _ = @import("model_open.zig");
     _ = @import("http.zig");
     _ = @import("server.zig");
+    _ = @import("main.zig");
     _ = @import("ane/mil.zig");
     _ = @import("ane/runtime.zig");
     _ = @import("ane/weights.zig");
