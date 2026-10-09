@@ -911,3 +911,21 @@ rather than an error:
 
     Streaming and the top_k path are the two that matter here: the first goes through the SSE
     holdback, and the second is the code the bounded selection replaced.
+40. **The sampler's candidate-array writes are cheaper than they look — tried, measured, and
+    reverted.** Pass 2 materialises ~45k candidates (~360 KB) so `selectTopK` can pick 40, and
+    maintaining the top-k during that walk instead is provably equivalent (the kept set is
+    `{v >= cut}` intersected with the top k, which is order-independent). Implemented, it
+    passes all 125 tests and leaves greedy output unchanged, but:
+
+        before   0.47 ms/token
+        after    0.40, 0.43, 0.43, 0.43 ms/token      (four runs)
+
+    About 0.05 ms — 0.2% of decode. Streaming writes to a 360 KB array are much cheaper than
+    the write count suggests. The interleaved A/B that would have confirmed it never ran: my
+    shell chain used `zig build | grep -c "error:" && ...`, and `grep -c` exits 1 when the
+    count is zero, so everything after the first build was skipped. **A pipeline whose exit
+    status drives `&&` must not be `grep -c`.** The tree was left holding the older source by
+    that same break, which is how the mistake was noticed.
+
+    Reverted: 0.2% does not pay for an extra branch, a second comparator and an order-restoring
+    sort. The design stays in AGENTS.md in case a future change makes those writes matter.

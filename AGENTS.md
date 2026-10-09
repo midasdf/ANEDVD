@@ -110,6 +110,13 @@ zig fmt src build.zig
   3. Ties: `selectTopK` orders equal logits by its insertion rules. Equal logits have equal
      probability, so the distribution is unaffected, but a fixed-seed A/B will differ. Compare
      distributions, not token ids, when validating this.
+  **Tried and reverted (round 38).** The implementation above passes all 125 tests and leaves
+  greedy output unchanged, but the gain is only 0.47 -> 0.40-0.43 ms/token across four runs —
+  about 0.05 ms, 0.2% of decode. The 45k writes were cheaper than I assumed; streaming stores
+  do not cost what a counted array write suggests. The interleaved A/B that would have
+  confirmed it failed to run (my shell chain broke on `grep -c` returning 1 for zero matches),
+  so the gain is measured but not confirmed to this project's standard, and 0.2% does not buy
+  the extra branch, comparator and order-restoring sort.
 * **Never `git checkout <path>` with uncommitted work you want to keep.** A bare
   `git checkout src` during this session silently destroyed ~2 hours of Gemma support
   (sandwich norms, logit soft-capping, sliding-window attention, chat template) that had
