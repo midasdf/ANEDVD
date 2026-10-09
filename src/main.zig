@@ -880,12 +880,23 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         // survived an "A/B bit-identical" claim.
         var seq_logits: []f32 = undefined;
         for (ids, 0..) |id, pos| {
-            const l = try eng.forward(id, @intCast(pos));
+            // `--ab` runs the raw prompt, unlike generation which truncates it, so a prompt
+            // longer than the context lands here. Name the flag rather than surfacing a bare
+            // `error: ContextOverflow`.
+            const l = eng.forward(id, @intCast(pos)) catch |e| {
+                if (e == error.ContextOverflow) {
+                    sys.eprint("prompt is {d} tokens but the context is {d}; raise it with --max-seq N\n", .{ ids.len, eng.max_seq });
+                    std.process.exit(2);
+                }
+                return e;
+            };
             if (pos + 1 == ids.len) {
                 seq_logits = try allocator.dupe(f32, l);
             }
         }
         defer allocator.free(seq_logits);
+        // The sequential loop above already reported an over-long prompt, so this cannot
+        // overflow here.
         const batch_logits = try eng.prefill(ids, 0);
         var max_d: f32 = 0;
         var argmax_seq: u32 = 0;
