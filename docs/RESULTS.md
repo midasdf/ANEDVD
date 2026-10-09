@@ -979,3 +979,10 @@ rather than an error:
 
     Checked while doing it that a small context does not break generation: `--max-seq 64` with a
     6-token prompt still prefills and decodes 4 tokens, the same as the 2048 default.
+45. **Note for whoever looks next: `run` prefills more tokens than the prompt contains.** For
+    "The capital of France is" it reports **14** tokens, while `anedvd cpu` and `anedvd layers`
+    report **5** for the same text. The difference is that `run` applies the model's chat
+    template (SmolLM2's adds ~9 tokens of `<|im_start|>` framing), so the counts are of
+    different things — not a tokenizer disagreement. Recorded because the two numbers sitting in
+    the same project look like a bug and I did not have the room to confirm the framing token by
+    token; a `run --raw`-style path or a printed template would settle it in one command.
