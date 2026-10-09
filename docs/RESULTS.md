@@ -509,3 +509,37 @@ rather than an error:
    attention, dequantisation) is ~8× slower unoptimised: the same 33-token
    prefill took 0.59 s in Debug and 0.12 s in ReleaseFast. `zig build` now
    defaults to ReleaseFast.
+12. **Gemma 2 emitted a run of "." because the `(1 + w)` norm offset was applied
+    twice.** `GemmaRMSNorm` computes `x * (1 + w)` from the raw parameter, so an HF
+    checkpoint needs the offset added — but the GGUF converter has already applied it.
+    Measured on gemma-2-2b's `blk.0.attn_norm.weight`: mean **1.1927**, which is the
+    effective factor for a converged model, where the raw HF parameter would be ~0.19.
+    The flag is now set per source (`load_hf` yes, `load_gguf` no). With that one change,
+    gemma-2-2b answers "The capital of France is **Paris**", "2 + 2 = 4" and "The sun
+    rises in the **morning**".
+
+    Four rounds of source-reading (transformers, llama.cpp's graph builder, the
+    converter, whose model classes are not in the file the top-level script downloads)
+    failed to settle it. One measurement of the stored norm values did.
+
+    Along the way, Gemma also needed the tanh-GELU FFN (not SiLU — the two differ 40× at
+    x = -3), the `sqrt(hidden)` embedding scale, both logit soft-caps, alternating
+    sliding-window attention with **layer 0 sliding**, and `1/sqrt(n_embd/n_head)` as the
+    attention scale (1/√288, not 1/√256 — 6% apart).
+
+13. **`verify` reported MISMATCH for a model that was answering correctly.** Two causes,
+    both in the checking code rather than the engine:
+    * `refForward` never applied Gemma 2's sandwich norms (`post_attention_norm`,
+      `post_ffw_norm`), so it was compared against a model two norms per layer short.
+    * The comparison ran on **soft-capped** logits. With `softcap = 30` every value is
+      compressed into [-30, 30] and tanh saturation destroys the ordering, so `rel` could
+      not distinguish a working model from a broken one. `Engine.pre_softcap` now lets
+      `verify` compare pre-cap logits, where the range is 146–292 rather than a flat 30.
+
+    Same lesson as (10): a reference that implements less than the engine produces
+    mismatches that look like engine bugs.
+
+14. **`check` printed `RESULT: OK` regardless of what it found.** It listed
+    `lm_head ... rel = 9.45e-1 -> BROKEN` and then contradicted it two lines later, so a
+    script reading only the summary saw success. `reportKernel` now records failures and
+    `check` prints FAIL and exits 1.
