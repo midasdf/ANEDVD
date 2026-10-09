@@ -145,6 +145,10 @@ pub const Engine = struct {
     dec_out: []f16,
     /// Width-1 staging for the lm-head kernel.
     head_in: []f16,
+    /// The head kernel's output: [vocab], read back once per prefill and per token.
+    /// Separate from `out16` because that is sized `stage * chunk` for activations and
+    /// multiplying the vocabulary into it wasted 78 MB.
+    head_out: []f16 = &.{},
     /// Contiguous scratch for one column's q/k/v/attention vectors.
     sq: []f32,
     sk: []f32,
@@ -213,6 +217,7 @@ pub const Engine = struct {
         self.allocator.free(self.dec_in);
         self.allocator.free(self.dec_out);
         self.allocator.free(self.head_in);
+        if (self.head_out.len > 0) self.allocator.free(self.head_out);
         self.allocator.free(self.sq);
         self.allocator.free(self.sk);
         self.allocator.free(self.sv);
@@ -322,17 +327,21 @@ pub const Engine = struct {
         self.act = try allocator.alloc(f32, @as(usize, cfg.inter) * ch);
         self.logits = try allocator.alloc(f32, cfg.vocab);
         self.scores = try allocator.alloc(f32, opts.max_seq);
-        // `stage` sizes the per-layer staging buffers. Prefill ends by reading the
-        // whole vocabulary out of `out16`, so it has to cover `vocab` too: a model
-        // whose vocabulary is larger than every activation (the tiny MoE test
-        // checkpoint: vocab 151936 against hidden 4) indexed past the end and aborted
-        // with "index out of bounds: index 151936, len 1024".
-        const stage = @max(@max(cfg.hidden, cfg.qkvDim()), @max(cfg.qDim(), @max(2 * cfg.inter, @max(cfg.inter, cfg.vocab))));
+        // `stage` sizes the per-layer staging buffers, which hold activations.
+        //
+        // Prefill ends by reading the whole vocabulary out of the head kernel, which a
+        // vocab-sized `stage` would cover — but `stage` is multiplied by `chunk`, so
+        // folding `vocab` into it allocated 39 MB for `in16` and 39 MB for `out16` on a
+        // 151936-token vocabulary (78 MB, and it showed up as swap). The head read gets
+        // its own `vocab`-sized buffer instead; that is the only place the vocabulary
+        // needs to fit.
+        const stage = @max(@max(cfg.hidden, cfg.qkvDim()), @max(cfg.qDim(), @max(2 * cfg.inter, cfg.inter)));
         self.in16 = try allocator.alloc(f16, @as(usize, stage) * ch);
         self.out16 = try allocator.alloc(f16, @as(usize, stage) * ch);
         self.dec_in = try allocator.alloc(f16, stage);
         self.dec_out = try allocator.alloc(f16, stage);
         self.head_in = try allocator.alloc(f16, cfg.hidden);
+        self.head_out = try allocator.alloc(f16, cfg.vocab);
         const vec = @max(cfg.qDim(), @max(cfg.kvDim(), cfg.inter));
         self.sq = try allocator.alloc(f32, vec);
         self.sk = try allocator.alloc(f32, vec);
@@ -547,8 +556,8 @@ pub const Engine = struct {
         self.stats.ane_evals += 1;
         self.stats.node_ns[@backingInt(Node.head)] += dt_head;
         self.stats.node_evals[@backingInt(Node.head)] += 1;
-        try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
-        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
+        try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
+        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.head_out[i]);
 
         self.stats.total_ns += sys.nowNs() - t_start;
         self.stats.tokens += 1;
@@ -798,8 +807,8 @@ pub const Engine = struct {
             try self.head_kernel.eval();
             self.stats.ane_eval_ns += sys.nowNs() - th;
             self.stats.ane_evals += 1;
-            try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
-            for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
+            try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
+            for (self.logits, 0..) |*l, i| l.* = @floatCast(self.head_out[i]);
 
             done += n;
             self.stats.tokens += 1;
@@ -886,9 +895,9 @@ pub const Engine = struct {
         rmsnormColumn(self.head_in[0..hidden], self.x, self.final_norm, cfg.eps, ch);
         try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
         try self.head_kernel.eval();
-        try self.head_kernel.readOutputF16(0, self.out16[0..cfg.vocab]);
+        try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
         for (0..hidden) |c| h32[c] = @floatCast(self.head_in[c]);
-        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.out16[i]);
+        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.head_out[i]);
         cpu.matmulF16(ref, self.head, h32[0..hidden], cfg.vocab, hidden);
         reportKernel("lm_head", self.logits, ref);
     }
