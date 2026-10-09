@@ -60,8 +60,10 @@ pub const Config = struct {
     final_logit_softcap: f32 = 0,
     /// Sliding-window size for the layers that use it; 0 disables windowing.
     sliding_window: u32 = 0,
-    /// Gemma 2 alternates: even layers attend globally, odd layers only within the
-    /// window (llama.cpp's gemma2 pattern).
+    /// Gemma 2 alternates full and sliding attention. The rule, from the reference:
+    /// `sliding_attention if (layer + 1) % 2 else full_attention` — so layer 0 SLIDES
+    /// and layer 1 is global. Getting this backwards produces real words in the wrong
+    /// order rather than obvious garbage.
     swa_pattern: u32 = 2,
     /// True when the model "sandwiches" each sublayer between two more norms
     /// (Gemma 2): the attention output and the MLP output are both normalised before
@@ -69,9 +71,13 @@ pub const Config = struct {
     sandwich_norms: bool = false,
 
     /// True when this layer attends within the sliding window rather than globally.
+    ///
+    /// The reference builds `layer_types` as
+    /// `"sliding_attention" if (i + 1) % 2 else "full_attention"`, i.e. layer 0 slides.
+    /// Writing this as `layer % 2 != 0` inverts every layer.
     pub fn layerIsSliding(self: Config, layer: u32) bool {
         if (self.sliding_window == 0 or self.swa_pattern == 0) return false;
-        return layer % self.swa_pattern != 0;
+        return (layer + 1) % self.swa_pattern != 0;
     }
 
     /// True when this layer runs the sparse block rather than a dense MLP.
@@ -598,4 +604,24 @@ test "config dims" {
     try std.testing.expectEqual(@as(u32, 128), c.kvDim());
     try std.testing.expectEqual(@as(u32, 1152), c.qkvDim());
     try c.validate();
+}
+
+test "Gemma 2's sliding layers start at layer 0" {
+    // The reference builds `layer_types` as
+    //   "sliding_attention" if (i + 1) % 2 else "full_attention"
+    // so layer 0 slides and layer 1 is global. Writing it as `layer % 2 != 0` inverts
+    // every layer, which produces real words in the wrong order rather than garbage.
+    const gemma2 = Config{ .sliding_window = 4096, .swa_pattern = 2 };
+    try std.testing.expect(gemma2.layerIsSliding(0));
+    try std.testing.expect(!gemma2.layerIsSliding(1));
+    try std.testing.expect(gemma2.layerIsSliding(2));
+    try std.testing.expect(!gemma2.layerIsSliding(3));
+
+    // No window (or no pattern) means every layer is global, which is the case for
+    // every non-Gemma model and for Gemma 1.
+    const plain = Config{};
+    try std.testing.expect(!plain.layerIsSliding(0));
+    try std.testing.expect(!plain.layerIsSliding(1));
+    const gemma1 = Config{ .sliding_window = 0, .swa_pattern = 2 };
+    try std.testing.expect(!gemma1.layerIsSliding(0));
 }
