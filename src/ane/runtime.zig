@@ -13,6 +13,7 @@
 //     never from guesses.
 
 const std = @import("std");
+const sys = @import("../sys.zig");
 
 pub const Dtype = enum(c_int) { fp16 = 0, fp32 = 1, unknown = 2 };
 
@@ -242,7 +243,12 @@ pub const Kernel = struct {
     /// honouring the ANE's planar layout. Unused padding is left as-is.
     pub fn writeInputF16(self: *const Kernel, idx: usize, values: []const f16) !void {
         const info = self.in_info[idx];
-        if (values.len != info.elemCount()) return Error.WrongShape;
+        if (values.len != info.elemCount()) {
+            sys.eprint("ane: writeInputF16 got {d} values, kernel expects {d} (C={d} W={d})\n", .{
+                values.len, info.elemCount(), info.channels, info.width,
+            });
+            return Error.WrongShape;
+        }
         if (ane_shim_input_lock(self.handle, @intCast(idx)) == 0) return Error.SurfaceLockFailed;
         defer _ = ane_shim_input_unlock(self.handle, @intCast(idx));
         const base = ane_shim_input_base(self.handle, @intCast(idx)) orelse return Error.SurfaceUnavailable;

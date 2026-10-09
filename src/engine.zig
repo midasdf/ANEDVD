@@ -124,6 +124,19 @@ pub const Engine = struct {
 
     kernels: []LayerKernels,
     head_kernel: ane.Kernel,
+    /// The head is split into this many vocabulary rows per kernel, so its weight blob
+    /// stays bounded. One kernel for a 256000-row vocabulary is a 1.18 GB blob, which
+    /// the ANE accepts and then computes wrongly (gemma-2-2b: relative error 0.95
+    /// against a CPU matmul, i.e. unrelated to the right answer).
+    head_chunk: u32 = 0,
+    /// Number of chunk kernels the head was split into (1 = not split).
+    head_kernels: u32 = 1,
+    /// The remaining chunk kernels (the first lives in `head_kernel`).
+    head_extra: []ane.Kernel = &.{},
+    /// How many entries of `head_extra` are initialised, for errdefer-safe cleanup.
+    head_extra_built: u32 = 0,
+    /// Vocabulary rows each extra chunk kernel covers (the last may be short).
+    head_extra_rows: []u32 = &.{},
 
     /// fp16 KV cache: halves both the resident memory and the attention
     /// traffic, at the cost of ~5e-4 relative error per stored value (the same
@@ -207,6 +220,9 @@ pub const Engine = struct {
             if (k.moe) |*m| m.deinit(self.allocator);
         }
         self.head_kernel.deinit();
+        for (self.head_extra[0..self.head_extra_built]) |*k| k.deinit();
+        if (self.head_extra.len > 0) self.allocator.free(self.head_extra);
+        if (self.head_extra_rows.len > 0) self.allocator.free(self.head_extra_rows);
         self.allocator.free(self.kernels);
         self.rt.deinit();
         for (self.k_cache) |c| self.allocator.free(c);
@@ -279,6 +295,9 @@ pub const Engine = struct {
         self.sandwich = &.{};
         self.moe_chunk_idx = &.{};
         self.moe_expert_scratch_f32_alt = &.{};
+        self.head_extra = &.{};
+        self.head_extra_rows = &.{};
+        self.head_extra_built = 0;
         self.moe_chunk_probs = &.{};
         self.moe_expert_cols = &.{};
         self.moe_col_out = &.{};
@@ -325,7 +344,38 @@ pub const Engine = struct {
         defer if (hw.owned) allocator.free(hw.data);
         self.head = hw.data;
         // The head stays width 1: a [vocab][chunk] output surface would be tens of MB.
-        self.head_kernel = try makeConvKernel(allocator, cfg.hidden, cfg.vocab, hw.data, "lm_head", 1);
+        //
+        // Large vocabularies are split: one kernel for 256000 rows is a 1.18 GB weight
+        // blob, which the ANE compiles, runs, and gets wrong. Splitting also lowers peak
+        // memory, which matters on an 8 GB machine.
+        self.head_chunk = headChunkFor(cfg.hidden, cfg.vocab);
+        self.head_kernels = (cfg.vocab + self.head_chunk - 1) / self.head_chunk;
+        self.head_extra = try allocator.alloc(ane.Kernel, self.head_kernels - 1);
+        self.head_extra_rows = try allocator.alloc(u32, self.head_kernels - 1);
+        self.head_extra_built = 0;
+        for (0..self.head_kernels - 1) |i| {
+            const first_row = (i + 1) * self.head_chunk;
+            const off = @as(usize, first_row) * cfg.hidden;
+            // The final chunk is short when the vocabulary does not divide evenly.
+            const rows = @min(self.head_chunk, cfg.vocab - @as(u32, @intCast(first_row)));
+            self.head_extra[i] = makeConvKernel(allocator, cfg.hidden, rows, hw.data[off..], "lm_head", 1) catch |e| {
+                sys.eprint("lm head chunk {d}/{d} ({d} rows) failed: {s}: {s}\n", .{
+                    i + 1, self.head_kernels - 1, rows, @errorName(e), ane.lastError(),
+                });
+                return e;
+            };
+            // The chunk's row count is needed again at eval time.
+            self.head_extra_rows[i] = rows;
+            self.head_extra_built += 1;
+        }
+        self.head_kernel = makeConvKernel(allocator, cfg.hidden, self.head_chunk, hw.data, "lm_head", 1) catch |e| {
+            // Say why: a bare AneCompileFailed gives no clue whether the blob is too
+            // large, the program pool is full, or the MIL is malformed.
+            sys.eprint("lm head kernel ({d} -> {d}, chunk {d}) failed: {s}: {s}\n", .{
+                cfg.hidden, cfg.vocab, self.head_chunk, @errorName(e), ane.lastError(),
+            });
+            return e;
+        };
 
         const kv_dim: usize = cfg.kvDim();
         self.k_cache = try allocator.alloc([]f16, L);
@@ -621,25 +671,9 @@ pub const Engine = struct {
             }
         }
 
-        // ---- final norm + lm head (width-1 kernel) ----
+        // ---- final norm + lm head ----
         rmsnormColumn(self.head_in[0..hidden], self.x, self.final_norm, cfg.eps, ch);
-        try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
-        const t4 = sys.nowNs();
-        try self.head_kernel.eval();
-        const dt_head = sys.nowNs() - t4;
-        self.stats.ane_eval_ns += dt_head;
-        self.stats.ane_evals += 1;
-        self.stats.node_ns[@backingInt(Node.head)] += dt_head;
-        self.stats.node_evals[@backingInt(Node.head)] += 1;
-        try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
-        for (self.logits, 0..) |*l, i| {
-            const v: f32 = @floatCast(self.head_out[i]);
-            // Gemma 2 caps the final logits too.
-            l.* = if (cfg.final_logit_softcap > 0)
-                cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
-            else
-                v;
-        }
+        try self.runHead();
 
         self.stats.total_ns += sys.nowNs() - t_start;
         self.stats.tokens += 1;
@@ -664,6 +698,15 @@ pub const Engine = struct {
         return 0;
     }
 
+    /// Vocabulary rows per head kernel. 64k rows keeps the fp16 blob at 64k * hidden * 2
+    /// bytes: 300 MB for a 2304-wide model, 128 MB for a 1024-wide one.
+    fn headChunkFor(hidden: u32, vocab: u32) u32 {
+        const target: u64 = 512 * 1024 * 1024;
+        const per_row: u64 = @as(u64, hidden) * 2;
+        const rows: u64 = @max(1, target / per_row);
+        return @intCast(@min(rows, vocab));
+    }
+
     /// RMSNorm over a flat f32 vector, in place. Used for Gemma 2's sandwich norms, where
     /// the value to normalise is a plain activation column rather than a strided chunk.
     fn rmsnormFlat(v: []f32, weight: []const f32, eps: f32) void {
@@ -673,6 +716,46 @@ pub const Engine = struct {
         for (v[0..n]) |x| acc += x * x;
         const inv = 1.0 / @sqrt(acc / @as(f32, @floatFromInt(n)) + eps);
         for (v[0..n], weight) |*x, w| x.* = x.* * inv * w;
+    }
+
+    /// Run the lm head over the whole vocabulary, split across chunks as needed, and
+    /// write the (optionally soft-capped) logits into `self.logits`.
+    ///
+    /// Chunking exists because a single kernel for a 256000-row vocabulary is a 1.18 GB
+    /// weight blob, which the ANE accepts and then computes wrongly: gemma-2-2b's
+    /// lm_head came back with a relative error of 0.95 against a CPU matmul.
+    fn runHead(self: *Engine) !void {
+        const cfg = self.config;
+        const hidden: usize = cfg.hidden;
+        const chunk: usize = self.head_chunk;
+
+        try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
+        const t0 = sys.nowNs();
+        try self.head_kernel.eval();
+        const first_rows: usize = @min(chunk, cfg.vocab);
+        try self.head_kernel.readOutputF16(0, self.head_out[0..first_rows]);
+        for (0..self.head_extra_built) |i| {
+            const k = &self.head_extra[i];
+            const off = (i + 1) * chunk;
+            const rows: usize = @min(chunk, cfg.vocab - off);
+            try k.writeInputF16(0, self.head_in[0..hidden]);
+            try k.eval();
+            try k.readOutputF16(0, self.head_out[off..][0..rows]);
+        }
+        const dt = sys.nowNs() - t0;
+        self.stats.ane_eval_ns += dt;
+        self.stats.ane_evals += 1 + self.head_extra_built;
+        self.stats.node_ns[@backingInt(Node.head)] += dt;
+        self.stats.node_evals[@backingInt(Node.head)] += 1 + self.head_extra_built;
+
+        for (self.logits, 0..) |*l, i| {
+            const v: f32 = @floatCast(self.head_out[i]);
+            // Gemma 2 caps the final logits too.
+            l.* = if (cfg.final_logit_softcap > 0)
+                cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
+            else
+                v;
+        }
     }
 
     /// RMSNorm applied per attention head (Qwen3's q_norm/k_norm), before RoPE.
@@ -1091,19 +1174,18 @@ pub const Engine = struct {
 
         // --- lm head ---
         rmsnormColumn(self.head_in[0..hidden], self.x, self.final_norm, cfg.eps, ch);
-        try self.head_kernel.writeInputF16(0, self.head_in[0..hidden]);
-        try self.head_kernel.eval();
-        try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
+        // Use the same chunked path the engine really runs, so this reports on the code
+        // that produces the logits rather than on a single-kernel version of it.
+        try self.runHead();
         for (0..hidden) |c| h32[c] = @floatCast(self.head_in[c]);
-        for (self.logits, 0..) |*l, i| {
-            const v: f32 = @floatCast(self.head_out[i]);
-            // Gemma 2 caps the final logits too.
-            l.* = if (cfg.final_logit_softcap > 0)
-                cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
-            else
-                v;
-        }
         cpu.matmulF16(ref, self.head, h32[0..hidden], cfg.vocab, hidden);
+        // `self.logits` has the architecture's final soft-cap applied; the reference must
+        // get the same treatment or the comparison is meaningless. Without this,
+        // gemma-2-2b (cap 30, raw logits ~548) reported a relative error of 0.95 for a
+        // perfectly good kernel — the check was wrong, not the kernel.
+        if (cfg.final_logit_softcap > 0) {
+            for (ref) |*v| v.* = cfg.final_logit_softcap * std.math.tanh(v.* / cfg.final_logit_softcap);
+        }
         reportKernel("lm_head", self.logits, ref);
     }
 
@@ -1146,7 +1228,11 @@ fn reportKernel(name: []const u8, got: []const f32, ref: []const f32) void {
         if (@abs(b) > max_mag) max_mag = @abs(b);
     }
     const rel = if (max_mag > 0) max_err / max_mag else max_err;
-    const ok = rel < 0.02 and nan == 0;
+    // fp16 has ~3 decimal digits, so a relative bar alone flags fp16 rounding on a tiny
+    // model as a failure: the ffn of a hidden-8 test checkpoint differs by 1.2e-4
+    // absolute, which is quantisation noise, not a bug. Require the error to also be
+    // material in absolute terms.
+    const ok = nan == 0 and (rel < 0.02 or max_err < 1e-2);
     if (!ok) kernel_check_failed = true;
     sys.print("    {s:<12} max|ANE-CPU| = {e:.5}  rel = {e:.5}  nan = {d}  -> {s}\n", .{
         name, max_err, rel, nan, if (ok) "ok" else "BROKEN",
@@ -1194,7 +1280,12 @@ fn f32ToF16Chunk(out: []f16, x: []const f32, ch: usize, cols: usize) void {
 /// Create a single-conv kernel: cin -> cout, weights already in ANE layout.
 fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const f16, label: []const u8, width: u32) !ane.Kernel {
     _ = label;
-    std.debug.assert(w.len == @as(usize, cin) * cout);
+    // Use exactly the chunk's weights. Passing a longer slice (which the head-chunk
+    // loop does for every chunk after the first) made the ANE compiler reject the
+    // kernel with "Could not retrieve data from weight file": the blob header declared
+    // cin*cout elements while the file held more.
+    std.debug.assert(w.len >= @as(usize, cin) * cout);
+    const w_chunk = w[0 .. @as(usize, cin) * cout];
     var sym_buf: [64]u8 = undefined;
     const sym = try weights.symbol(&sym_buf);
     const program = try mil.build(allocator, .{
@@ -1214,7 +1305,7 @@ fn makeConvKernel(allocator: std.mem.Allocator, cin: u32, cout: u32, w: []const 
     defer allocator.free(program);
     return ane.Kernel.create(allocator, program, &.{.{
         .name = sym,
-        .chunks = &.{std.mem.sliceAsBytes(w)},
+        .chunks = &.{std.mem.sliceAsBytes(w_chunk)},
     }});
 }
 
