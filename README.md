@@ -504,11 +504,22 @@ quantisation rather than unified memory:
   token reads its experts out of the mapping and multiplies them in scalar code.
   [`research/moe-design.md`](research/moe-design.md) has the arithmetic, the measured
   ceilings and the levers that would move it.
-* **Not all architectures are supported.** Verified end to end: Llama,
-  Qwen2, Qwen3, Mistral, SmolLM2/3, the TinyLlama-era Llama layout, Qwen2-MoE
-  and **Gemma 2** (which needs its `(1 + w)` RMSNorm, `sqrt(hidden)` embedding
-  scale, tanh-GELU FFN, both logit soft-caps, alternating sliding-window
-  attention and the "sandwich" norms — all of them implemented).
+* **Not all architectures are supported, and the two lists below are different.**
+  *Run on a real model here* (whole-model ANE-vs-CPU comparison passing, and
+  coherent text): Llama (SmolLM2 in both GGUF and HF form, TinyLlama), Qwen2
+  (0.5B, 1.5B), Qwen3-0.6B, Qwen2-MoE (Qwen1.5-MoE-A2.7B and a tiny MoE) and
+  **Gemma 2** (which needs its `(1 + w)` RMSNorm, `sqrt(hidden)` embedding scale,
+  tanh-GELU FFN, both logit soft-caps, alternating sliding-window attention and
+  the "sandwich" norms — all of them implemented).
+
+  *Recognised but not run here*: Mistral and SmolLM3. Their configuration is
+  parsed and unit-tested — Mistral's sliding window is applied to every layer,
+  which differs from Gemma 2's alternating rule — but no Mistral or SmolLM3
+  checkpoint was available on this machine to run end to end, so treat their
+  status as "implemented, unproven". (This list said "verified end to end" until
+  a review: Mistral's window had in fact been ignored entirely, and the config
+  tests that now cover it are the fix.)
+
   Anything with a different attention layout (MLA, other sliding-window
   variants) needs work. An unrecognised `general.architecture` is accepted
   with a warning, since the GGUF tensor names are the same — but check the
