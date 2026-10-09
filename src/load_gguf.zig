@@ -726,3 +726,50 @@ fn putU32Kv(buf: *std.ArrayList(u8), a: std.mem.Allocator, k: []const u8, value:
     try putInt(buf, a, u32, 4); // u32
     try putInt(buf, a, u32, value);
 }
+
+/// Write a tensor-info entry: name, rank-`n` dims, type, offset. Needed by the MoE tests
+/// below, which must present a `ffn_gate_exps.weight` for the config to read widths from.
+fn putTensor(buf: *std.ArrayList(u8), a: std.mem.Allocator, name: []const u8, dims: []const u64, ty: u32, offset: u64) !void {
+    try putInt(buf, a, u64, name.len);
+    try buf.appendSlice(a, name);
+    try putInt(buf, a, u32, @intCast(dims.len));
+    for (dims) |d| try putInt(buf, a, u64, d);
+    try putInt(buf, a, u32, ty);
+    try putInt(buf, a, u64, offset);
+}
+
+test "MoE widths come from the tensor shapes, not the metadata" {
+    // The subtlety that matters: Qwen1.5-MoE ships no `expert_feed_forward_length`, and its
+    // `feed_forward_length` (5632) is the SHARED expert's width while the routed experts are
+    // 1408. Defaulting one from the other sizes every expert wrong or drops the shared
+    // expert entirely, which is a wrong answer rather than a slow one. The tensor shapes win.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 1); // one tensor
+    try putInt(&bytes, a, u64, 8); // eight kv pairs
+    try putStr(&bytes, a, "general.architecture", "qwen2moe");
+    try putU32Kv(&bytes, a, "qwen2moe.embedding_length", 2048);
+    try putU32Kv(&bytes, a, "qwen2moe.block_count", 1);
+    try putU32Kv(&bytes, a, "qwen2moe.attention.head_count", 16);
+    try putU32Kv(&bytes, a, "qwen2moe.feed_forward_length", 5632);
+    try putU32Kv(&bytes, a, "qwen2moe.vocab_size", 1024);
+    try putU32Kv(&bytes, a, "qwen2moe.expert_count", 60);
+    try putU32Kv(&bytes, a, "qwen2moe.expert_used_count", 4);
+    // The tensor disagrees with the declared expert count on purpose: 64 against 60, and
+    // its middle dimension is the routed width (1408), not the shared width (5632).
+    try putTensor(&bytes, a, "blk.0.ffn_gate_exps.weight", &.{ 2048, 1408, 64 }, 2, 0);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expectEqual(@as(u32, 1408), cfg.moe_inter); // from dims[1]
+    try std.testing.expectEqual(@as(u32, 64), cfg.num_experts); // from dims[2], not the kv
+    try std.testing.expectEqual(@as(u32, 4), cfg.experts_per_tok);
+    // feed_forward_length stays the SHARED width; it is a different number.
+    try std.testing.expectEqual(@as(u32, 5632), cfg.inter);
+}
