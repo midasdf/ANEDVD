@@ -147,28 +147,39 @@ layer, so overrides here win; new plugins need an `insert:` patch entry (a bare
 `- id:` only overrides an existing row); changes reach newly created
 agents/sessions only.
 
-## Lost work (record it, then redo it)
+## Gemma support: implemented, still producing wrong text
 
-Gemma support was implemented, measured working on a real model, and then destroyed
-by a `git checkout src` before it was committed. What it consisted of, so it can be
-rebuilt without re-deriving it:
+All of the pieces below are implemented and committed (stages 1-3). What is NOT
+working is the generated text: gemma-2-2b-it loads, checks OK and its prompt encodes
+correctly (`<bos><start_of_turn>user\n...`), but generation emits a run of "." instead
+of an answer. Treat the model as unsupported until that is fixed.
 
-* `Config.norm_unit_offset` — Gemma's RMSNorm is `(1 + w)`, not `w`. Confirmed against
-  `GemmaRMSNorm.forward` in transformers. Best applied by baking `1 + w` into the
-  weights at load, which leaves every compute path untouched.
-* `Config.embed_scale` — Gemma scales the embedding by `sqrt(hidden_size)`
-  (`GemmaTextScaledWordEmbedding`, `embed_scale=self.config.hidden_size**0.5`).
-* `Config.attn_logit_softcap` / `final_logit_softcap` — Gemma 2 caps logits as
-  `softcap * tanh(x / softcap)`, before the softmax and on the final logits. The GGUF
-  carries `gemma2.attn_logit_softcapping = 50.0` and `final_logit_softcapping = 30.0`.
-* `Config.sliding_window` + `layerIsSliding` — Gemma 2 alternates global and
-  sliding-window attention (even layers global). The GGUF carries
-  `gemma2.attention.sliding_window = 4096`.
-* `Norm.post_attn` / `post_ffw` — Gemma 2's "sandwich" norms: the attention output is
-  normalised before it joins the residual, and so is the MLP output. The tensors are
-  `blk.N.post_attention_norm.weight` and `blk.N.post_ffw_norm.weight`. Ignoring them
-  yields real words in the wrong order, not obvious garbage.
-* A `<start_of_turn>user ... <end_of_turn>` chat template, selected from the GGUF
-  `tokenizer.chat_template` metadata exactly as the Zephyr and ChatML paths are.
-* Gemma 2's `q_dim` (8 x 256 = 2048) is smaller than `hidden` (2304), so the `o_proj`
-  is `[2304][2048]`, not square.
+Implemented and verified to the extent stated:
+
+* `Config.norm_unit_offset` — Gemma's RMSNorm is `(1 + w)`. Confirmed against
+  `GemmaRMSNorm.forward`; baked into the weights in `loadNormFor` so no compute path
+  changed. A test pins the equivalence.
+* `Config.embed_scale` — `sqrt(hidden_size)`, applied at both embedding reads. The GGUF
+  stores UNSCALED weights (measured mean|w| ~ 1e-5 against an HF std of ~0.01), so
+  llama.cpp does not pre-apply it.
+* `Config.attn_logit_softcap` / `final_logit_softcap` — `softcap * tanh(x / softcap)`,
+  read from the file (50.0 and 30.0).
+* `Config.sliding_window` / `layerIsSliding` — alternating global/windowed attention,
+  read from the file (4096).
+* `Norm.post_attn` / `Norm.post_ffw` — the sandwich norms, applied at all four residual
+  points (decode and prefill, attention and FFN).
+* A `<start_of_turn>` chat template selected from `tokenizer.chat_template`, and Gemma
+  added to the HF architecture list.
+
+Open questions for whoever picks this up, in the order worth trying:
+
+1. `query_pre_attn_scalar` is 256 for gemma-2-2b, equal to `head_dim`, so the existing
+   `head_dim**-0.5` scaling matches. Check this for other Gemma sizes.
+2. `q_dim` (8 x 256 = 2048) is smaller than `hidden` (2304). Nothing has been verified
+   about the `o_proj` shape beyond it loading.
+3. The "sandwich" ordering was applied as `norm(attn_out) + residual`, which is what the
+   reference does, but it has never been checked numerically against a reference
+   implementation for this model — `anedvd cpu` and the engine share the code, so they
+   agree with each other and cannot validate it.
+4. Prefill attention masks the window only within the chunk; whether a chunk boundary
+   needs care when `pos` wraps the window has not been tested.
