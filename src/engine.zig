@@ -129,6 +129,11 @@ pub const Engine = struct {
     /// the ANE accepts and then computes wrongly (gemma-2-2b: relative error 0.95
     /// against a CPU matmul, i.e. unrelated to the right answer).
     head_chunk: u32 = 0,
+    /// When set, `runHead` leaves the final logit soft-cap off. `verify` needs the
+    /// pre-cap values: tanh saturates, so comparing capped logits cannot distinguish a
+    /// real disagreement from compression — gemma-2-2b reported MISMATCH while producing
+    /// exactly the right text.
+    pre_softcap: bool = false,
     /// Number of chunk kernels the head was split into (1 = not split).
     head_kernels: u32 = 1,
     /// The remaining chunk kernels (the first lives in `head_kernel`).
@@ -759,7 +764,7 @@ pub const Engine = struct {
         for (self.logits, 0..) |*l, i| {
             const v: f32 = @floatCast(self.head_out[i]);
             // Gemma 2 caps the final logits too.
-            l.* = if (cfg.final_logit_softcap > 0)
+            l.* = if (cfg.final_logit_softcap > 0 and !self.pre_softcap)
                 cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
             else
                 v;

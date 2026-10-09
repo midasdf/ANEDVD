@@ -285,6 +285,9 @@ fn refForward(
     token: u32,
     pos: u32,
     layers: usize,
+    /// Skip the final logit soft-cap. `verify` needs the pre-cap values: tanh saturates,
+    /// so comparing capped logits cannot tell a real disagreement from compression.
+    pre_softcap: bool,
 ) ![]f32 {
     const cfg = mw.config;
     const hidden: usize = cfg.hidden;
@@ -369,6 +372,10 @@ fn refForward(
         });
         matmulF16(proj, lw.o, attn, hidden, q_dim);
         if (lw.o_bias) |b| cpu.addInPlace(proj, b);
+        // Gemma 2 normalises the attention output before it joins the residual. This was
+        // missing here entirely, so `verify` compared the engine against a model with two
+        // norms per layer fewer and reported MISMATCH for a model that answers correctly.
+        if (lw.post_attn_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
         cpu.addInPlace(x, proj);
 
         cpu.rmsnorm(h, x, lw.ffn_norm, cfg.eps);
@@ -402,12 +409,14 @@ fn refForward(
                 const scale = cpu.sigmoid(g);
                 for (proj, shared_out) |*o, s2| o.* += scale * s2;
             }
+            if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
             cpu.addInPlace(x, proj);
         } else {
             matmulF16(gate, lw.gate, h, inter, hidden);
             matmulF16(up, lw.up, h, inter, hidden);
             cpu.gateMul(act, gate, up, cfg.use_gelu);
             matmulF16(proj, lw.down, act, hidden, inter);
+            if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
             cpu.addInPlace(x, proj);
         }
     }
@@ -415,7 +424,7 @@ fn refForward(
     cpu.rmsnorm(h, x, mw.final_norm, cfg.eps);
     const logits = try allocator.alloc(f32, cfg.vocab);
     matmulF16(logits, mw.headWeights(), h, cfg.vocab, hidden);
-    if (cfg.final_logit_softcap > 0) {
+    if (cfg.final_logit_softcap > 0 and !pre_softcap) {
         for (logits) |*l| {
             l.* = cfg.final_logit_softcap * std.math.tanh(l.* / cfg.final_logit_softcap);
         }
@@ -524,7 +533,7 @@ fn cmdSelftestOpt(allocator: std.mem.Allocator, fuse: bool) !void {
     var max_ref: f32 = 0;
     for (tokens, 0..) |tok, pos| {
         const got = try engine.forward(tok, @intCast(pos));
-        const ref = try refForward(allocator, &ref_mw, &st, tok, @intCast(pos), cfg.layers);
+        const ref = try refForward(allocator, &ref_mw, &st, tok, @intCast(pos), cfg.layers, false);
         defer allocator.free(ref);
         var step_max: f32 = 0;
         for (got, ref) |a, b| {
@@ -1100,7 +1109,7 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     defer if (prompt_logits) |p2| allocator.free(p2);
     for (ids, 0..) |id, pos| {
         if (pos > 0) allocator.free(logits);
-        logits = try refForward(allocator, &mw, &st, id, @intCast(pos), cfg.layers);
+        logits = try refForward(allocator, &mw, &st, id, @intCast(pos), cfg.layers, false);
         if (pos + 1 == ids.len) {
             if (prompt_logits) |p2| allocator.free(p2);
             prompt_logits = try allocator.dupe(f32, logits);
@@ -1119,7 +1128,7 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         defer allocator.free(bytes);
         sys.writeAll(1, bytes);
         if (pos > 0) allocator.free(logits);
-        logits = try refForward(allocator, &mw, &st, next, pos, cfg.layers);
+        logits = try refForward(allocator, &mw, &st, next, pos, cfg.layers, false);
         pos += 1;
     }
     const t2 = sys.nowNs();
@@ -1664,6 +1673,10 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     });
     defer eng.deinit();
     if (layers < cfg.layers) eng.stopAfterLayer(@intCast(layers));
+    // Compare PRE-cap logits. With the cap on, every value is compressed into
+    // [-softcap, softcap] and `rel` stops being able to distinguish a correct model from
+    // a broken one: gemma-2-2b answered "Paris" correctly while verify reported MISMATCH.
+    eng.pre_softcap = true;
 
     const ids = try loaded.tokenizer.encode(allocator, prompt, true);
     defer allocator.free(ids);
@@ -1694,9 +1707,9 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     var cpu_logits: []f32 = undefined;
     for (ids, 0..) |id, pos| {
         if (pos > 0) allocator.free(cpu_logits);
-        cpu_logits = try refForward(allocator, &ref_mw, &st, id, @intCast(pos), layers);
+        cpu_logits = try refForward(allocator, &ref_mw, &st, id, @intCast(pos), layers, true);
     }
-    const cpu_decode: []f32 = try refForward(allocator, &ref_mw, &st, 7, @intCast(ids.len), layers);
+    const cpu_decode: []f32 = try refForward(allocator, &ref_mw, &st, 7, @intCast(ids.len), layers, true);
     defer allocator.free(cpu_decode);
     defer allocator.free(cpu_logits);
 
