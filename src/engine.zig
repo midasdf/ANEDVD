@@ -780,6 +780,12 @@ pub const Engine = struct {
                             self.moe_idx[0..cfg.experts_per_tok],
                         );
                         @memset(self.moe_out[0..hd], 0);
+                        if (self.route_counts) |counts| {
+                            self.route_tokens += 1;
+                            for (self.moe_idx[0..cfg.experts_per_tok]) |e| {
+                                counts[@as(usize, li) * cfg.num_experts + e] += 1;
+                            }
+                        }
                         for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p2| {
                             // Same accessor as decode: reads from the mapping when the
                             // layer streams. Calling expertGate() directly here indexed
