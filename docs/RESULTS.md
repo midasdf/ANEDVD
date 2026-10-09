@@ -711,3 +711,19 @@ rather than an error:
     the dot and A·V steps — not the 7x the redundancy suggests. Left unimplemented rather
     than changed on an estimate; the numbers above are what a real attempt should be judged
     against.
+25. **The MoE batching now has the test the dense path always had.** The prefill-vs-decode
+    equivalence test used a dense model, so the MoE expert batching — the code with the
+    `moe_col_out[j..]` versus `[j * hd + c]` mis-indexing — was unverified. A two-layer,
+    four-expert, top-2 MoE is now built in process and run through both paths on 16 prompt
+    tokens, asserting the argmax matches and the numeric difference is bounded.
+
+    Measured, which is where the thresholds come from:
+
+        correct code   1.68e-1
+        off-by-index   9.96e-1     (argmax differs too)
+
+    The numeric bound is 4e-1, a 2.4x margin over the rounding and 2.5x under the bug —
+    looser than ideal, and looser than the dense test's 1e-3 because the two paths sum the
+    experts in a different order in fp16. The argmax assertion is the check that actually
+    pins the behaviour. Worth noting for anyone reading a future measurement here: my first
+    figure of 0.0078 was the *first element outside tolerance*, not the worst difference.
