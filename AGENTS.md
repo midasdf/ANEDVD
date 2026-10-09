@@ -79,6 +79,11 @@ zig fmt src build.zig
 * **Sampling is not negligible.** At temperature 1.0 the candidate cut leaves
   ~31k of 151936 logits, and ordering them was ~10% of decode (`sortUnstable`,
   not `sort`, for the top-k selection). `anedvd run` prints the cost per token.
+* **Never `git checkout <path>` with uncommitted work you want to keep.** A bare
+  `git checkout src` during this session silently destroyed ~2 hours of Gemma support
+  (sandwich norms, logit soft-capping, sliding-window attention, chat template) that had
+  been measured working on a real 2B model. Commit or stash first; there is no undo for
+  an uncommitted revert.
 * **Beware checks that cannot fail.** Three bugs here survived a green run: a
   test build that ran zero tests, an A/B check that compared a buffer with
   itself, and a per-kernel check blind to the hand-off between kernels. When
@@ -141,3 +146,29 @@ missing executable stops the whole provider; the profile patch is the last
 layer, so overrides here win; new plugins need an `insert:` patch entry (a bare
 `- id:` only overrides an existing row); changes reach newly created
 agents/sessions only.
+
+## Lost work (record it, then redo it)
+
+Gemma support was implemented, measured working on a real model, and then destroyed
+by a `git checkout src` before it was committed. What it consisted of, so it can be
+rebuilt without re-deriving it:
+
+* `Config.norm_unit_offset` — Gemma's RMSNorm is `(1 + w)`, not `w`. Confirmed against
+  `GemmaRMSNorm.forward` in transformers. Best applied by baking `1 + w` into the
+  weights at load, which leaves every compute path untouched.
+* `Config.embed_scale` — Gemma scales the embedding by `sqrt(hidden_size)`
+  (`GemmaTextScaledWordEmbedding`, `embed_scale=self.config.hidden_size**0.5`).
+* `Config.attn_logit_softcap` / `final_logit_softcap` — Gemma 2 caps logits as
+  `softcap * tanh(x / softcap)`, before the softmax and on the final logits. The GGUF
+  carries `gemma2.attn_logit_softcapping = 50.0` and `final_logit_softcapping = 30.0`.
+* `Config.sliding_window` + `layerIsSliding` — Gemma 2 alternates global and
+  sliding-window attention (even layers global). The GGUF carries
+  `gemma2.attention.sliding_window = 4096`.
+* `Norm.post_attn` / `post_ffw` — Gemma 2's "sandwich" norms: the attention output is
+  normalised before it joins the residual, and so is the MLP output. The tensors are
+  `blk.N.post_attention_norm.weight` and `blk.N.post_ffw_norm.weight`. Ignoring them
+  yields real words in the wrong order, not obvious garbage.
+* A `<start_of_turn>user ... <end_of_turn>` chat template, selected from the GGUF
+  `tokenizer.chat_template` metadata exactly as the Zephyr and ChatML paths are.
+* Gemma 2's `q_dim` (8 x 256 = 2048) is smaller than `hidden` (2304), so the `o_proj`
+  is `[2304][2048]`, not square.
