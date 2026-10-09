@@ -1630,3 +1630,152 @@ test "prefill calls the tick hook per layer, not merely per chunk (needs the ANE
     _ = try eng.prefill(ids, 0);
     try std.testing.expectEqual(@as(usize, 3 * cfg.layers), ticks);
 }
+
+test "batched prefill agrees with per-token decode on an MoE layer (needs the ANE)" {
+    // The dense test above does not reach the MoE expert batching at all. That path had a
+    // bug that produced plausible-looking wrong answers: `moe_col_out[j..][0..hd]` wrote at
+    // offset `j` while the reader read `j * hd + c`, so every column after the first was
+    // read from the wrong place. It was found by hand, with a real 9.5 GB model, because
+    // nothing here covered it.
+    //
+    // The property that catches it is the same one: the batched prefill and the sequential
+    // per-token decode must produce the same logits. With several prompt tokens routing to
+    // overlapping experts, an error in the column indexing moves the logits.
+    if (!ane.available()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    const cfg = model.Config{
+        .arch = "qwen2moe",
+        .hidden = 32,
+        .layers = 2,
+        .heads = 4,
+        .kv_heads = 2,
+        .head_dim = 8,
+        .inter = 24, // shared expert width
+        .vocab = 128,
+        .eps = 1e-5,
+        .rope_theta = 10000.0,
+        .rope_adjacent = false,
+        .num_experts = 4,
+        .experts_per_tok = 2,
+        .moe_inter = 32,
+        .shared_inter = 24,
+    };
+    var mw = model.ModelWeights{ .allocator = a, .config = cfg };
+    defer mw.deinit();
+    mw.embed = try a.alloc(f16, @as(usize, cfg.vocab) * cfg.hidden);
+    mw.final_norm = try a.alloc(f32, cfg.hidden);
+    mw.layers = try a.alloc(model.LayerWeights, cfg.layers);
+    @memset(mw.layers, .{});
+    fillDeterministic(mw.embed, 1, 1.0);
+    fillDeterministicF32(mw.final_norm, 2, 1.0, 0.1);
+
+    const n_experts = cfg.num_experts;
+    const moe_inter = cfg.moe_inter;
+    const shared = cfg.shared_inter;
+    for (mw.layers, 0..) |*lw, i| {
+        const li: u32 = @intCast(i);
+        lw.attn_norm = try a.alloc(f32, cfg.hidden);
+        lw.ffn_norm = try a.alloc(f32, cfg.hidden);
+        lw.qkv = try a.alloc(f16, @as(usize, cfg.qkvDim()) * cfg.hidden);
+        lw.o = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.qDim());
+        fillDeterministicF32(lw.attn_norm, 100 + li, 1.0, 0.1);
+        fillDeterministicF32(lw.ffn_norm, 200 + li, 1.0, 0.1);
+        fillDeterministic(lw.qkv, 300 + li, 0.3);
+        fillDeterministic(lw.o, 400 + li, 0.3);
+
+        // The shared expert occupies the dense FFN slots, as the loader arranges it.
+        lw.gate = try a.alloc(f16, @as(usize, shared) * cfg.hidden);
+        lw.up = try a.alloc(f16, @as(usize, shared) * cfg.hidden);
+        lw.down = try a.alloc(f16, @as(usize, cfg.hidden) * shared);
+        fillDeterministic(lw.gate, 500 + li, 0.3);
+        fillDeterministic(lw.up, 600 + li, 0.3);
+        fillDeterministic(lw.down, 700 + li, 0.3);
+
+        var moe = model.MoeWeights{
+            .num_experts = n_experts,
+            .inter = moe_inter,
+            .hidden_dim = cfg.hidden,
+            .shared_inter = shared,
+        };
+        moe.router = try a.alloc(f16, @as(usize, n_experts) * cfg.hidden);
+        moe.gate = try a.alloc(f16, @as(usize, n_experts) * moe_inter * cfg.hidden);
+        moe.up = try a.alloc(f16, @as(usize, n_experts) * moe_inter * cfg.hidden);
+        moe.down = try a.alloc(f16, @as(usize, n_experts) * cfg.hidden * moe_inter);
+        fillDeterministic(moe.router, 800 + li, 0.5);
+        fillDeterministic(moe.gate, 900 + li, 0.3);
+        fillDeterministic(moe.up, 1000 + li, 0.3);
+        fillDeterministic(moe.down, 1100 + li, 0.3);
+        moe.shared_gate = try a.alloc(f16, @as(usize, shared) * cfg.hidden);
+        moe.shared_up = try a.alloc(f16, @as(usize, shared) * cfg.hidden);
+        moe.shared_down = try a.alloc(f16, @as(usize, cfg.hidden) * shared);
+        fillDeterministic(moe.shared_gate, 1200 + li, 0.3);
+        fillDeterministic(moe.shared_up, 1300 + li, 0.3);
+        fillDeterministic(moe.shared_down, 1400 + li, 0.3);
+        // The always-on scale is sigmoid(gate . h), which must be exercised.
+        moe.shared_gate_lin = try a.alloc(f16, cfg.hidden);
+        fillDeterministic(moe.shared_gate_lin, 1500 + li, 0.5);
+        // Eager layer: `loadExpert` hands back these in-memory slices.
+        moe.expert_slot = moe_inter * cfg.hidden;
+        moe.expert_scratch = try a.alloc(f16, moe.expert_slot * 3);
+        fillDeterministic(moe.expert_scratch, 1600 + li, 0.1);
+        lw.moe = moe;
+    }
+
+    const rt = try mw.toRuntime(a);
+    var eng = try Engine.init(a, rt, mw.layerSource(), mw.headSource(rt.embed), .{
+        .max_seq = 64,
+        .verbose = false,
+        .chunk = 32,
+    });
+    defer eng.deinit();
+
+    // Eight tokens, so several columns land on each expert and the batching is real.
+    const ids = [_]u32{ 3, 7, 11, 19, 23, 5, 13, 17, 29, 31, 2, 37, 41, 43, 47, 53 };
+
+    var seq_copy: []f32 = &.{};
+    for (ids, 0..) |id, pos| {
+        const l = try eng.forward(id, @intCast(pos));
+        if (pos + 1 == ids.len) {
+            seq_copy = try a.dupe(f32, l);
+            try std.testing.expectEqual(@as(usize, 128), seq_copy.len);
+        }
+    }
+    defer a.free(seq_copy);
+    for (seq_copy) |v| try std.testing.expect(std.math.isFinite(v));
+
+    // The MoE logits must not be a constant: a batching bug that zeroed the expert
+    // contribution would otherwise agree by producing the same wrong thing twice.
+    var lo: f32 = seq_copy[0];
+    var hi: f32 = seq_copy[0];
+    for (seq_copy) |v| {
+        lo = @min(lo, v);
+        hi = @max(hi, v);
+    }
+    try std.testing.expect(hi - lo > 1e-3);
+
+    const batch = try eng.prefill(&ids, 0);
+    // Tolerance from measurement, not taste: with the off-by-index bug deliberately put
+    // back, the worst difference between the two paths is 6.47e-1; with the correct code it
+    // is 7.8e-3 (fp16 rounding through two MoE layers). 2e-2 sits between the two by more
+    // than an order of magnitude on each side, so it fails the bug and not the rounding.
+    var worst: f32 = 0;
+    for (seq_copy, batch) |x, y| worst = @max(worst, @abs(x - y));
+    // The argmax is the sharp check: a discrete property that the mis-indexing breaks
+    // outright, where the numeric bound below is a looser backstop.
+    var am_seq: usize = 0;
+    var am_batch: usize = 0;
+    for (seq_copy, 0..) |v, i| if (v > seq_copy[am_seq]) {
+        am_seq = i;
+    };
+    for (batch, 0..) |v, i| if (v > batch[am_batch]) {
+        am_batch = i;
+    };
+    try std.testing.expectEqual(am_seq, am_batch);
+    // Numeric bound from measurement, not taste. With the off-by-index bug deliberately put
+    // back the worst difference is 9.96e-1; with the correct code it is 1.68e-1, the gap
+    // between the two summation orders in fp16 (which is why it is far above the dense
+    // test's 1e-3). 4e-1 sits between them on both sides; the argmax assertion above is the
+    // check that actually pins the behaviour.
+    try std.testing.expect(worst < 0.4);
+}
