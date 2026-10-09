@@ -994,3 +994,40 @@ rather than an error:
     `prefill:` line I was reading. I had the answer on screen and grepped past it twice, then
     wrote it up as an open question. When two numbers in one project disagree, read the output
     around them before theorising about which is wrong.
+46. **Gemma 4 E2B/E4B: what it actually needs, read from the official GGUF header.** Asked about
+    running them, so rather than guess I fetched the first 8 MB of
+    `google/gemma-4-E2B-it-qat-q4_0-gguf/gemma-4-E2B_q4_0-it.gguf` with a Range request and
+    parsed the metadata directly. The architecture is `gemma4`, 35 layers, and it differs from
+    Gemma 2/3 in five ways that cannot be guessed:
+
+        gemma4.attention.key_length = 512        key_length_swa = 256
+        gemma4.attention.value_length = 512      value_length_swa = 256
+        gemma4.attention.sliding_window_pattern = [true x4, false, true x4, false, ...]
+        gemma4.attention.shared_kv_layers = 20
+        gemma4.embedding_length_per_layer_input = 256
+        gemma4.feed_forward_length = [6144 x15, 12288 x20, ...]
+        gemma4.rope.freq_base = 1e6              freq_base_swa = 1e4
+        tokenizer.ggml.tokens = 262144 entries
+
+    So: two head dimensions (512 on global layers, 256 on sliding), a per-layer sliding/full
+    **list** rather than a modulo, per-layer FFN widths, K/V shared by the last 20 layers, and
+    per-layer input embeddings (PLE). `head_count_kv = 1`, so it is MQA.
+
+    Consequences for this codebase: `Config.head_dim` is a single number and the KV cache is
+    allocated uniformly as `max_seq * kvDim`; the ANE kernel set is built per layer but the
+    engine assumes one activation width and one KV width throughout; and the whole forward pass
+    is text-only while the checkpoint is `Gemma4ForConditionalGeneration` (audio + vision +
+    text, with the text config nested under `text_config`). This is a new architecture, not a
+    flag.
+
+    What was done now: `gemma4` is **refused with a message naming those five things** instead of
+    falling through to the "treat it like llama" path, which would have run and produced fluent
+    nonsense. A crafted Gemma 4 GGUF must return `error.UnsupportedArchitecture`, and the test
+    also checks that `gemma2` still loads normally, so it cannot pass by refusing everything
+    beginning with "gemma". The misleading "see src/hf.zig for the list" on a GGUF is fixed too.
+
+    Not done, in order of least to most work: per-layer `layer_types` (the `swa_pattern` field is
+    a modulo — an explicit list is a small change), per-layer FFN widths (kernels are already
+    built per layer), per-layer head dims (touches the KV allocation), KV sharing (touches the
+    attention path), PLE (a new embedding table plus a projection per layer), and the
+    multimodal wrapper.

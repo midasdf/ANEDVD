@@ -41,6 +41,33 @@ pub fn isKnownArchitecture(arch: []const u8) bool {
     return false;
 }
 
+/// Architectures whose GGUF this loader recognises but cannot load correctly yet. These are
+/// refused rather than warned about, because "treat it like llama" is guaranteed wrong for
+/// them: the output is fluent nonsense, which costs a user hours before they conclude the
+/// model is broken. Each entry names what is missing so the work is scoped, not guessed.
+///
+/// The Gemma 4 metadata below is not inferred — it is read from the official
+/// `google/gemma-4-E2B-it-qat-q4_0-gguf` header:
+///
+///   gemma4.block_count = 35
+///   gemma4.attention.key_length = 512        gemma4.attention.key_length_swa = 256
+///   gemma4.attention.value_length = 512      gemma4.attention.value_length_swa = 256
+///   gemma4.attention.sliding_window = 512
+///   gemma4.attention.sliding_window_pattern = [true x4, false, ...]   (per layer, not a modulo)
+///   gemma4.attention.shared_kv_layers = 20
+///   gemma4.embedding_length_per_layer_input = 256
+///   gemma4.feed_forward_length = [6144 x15, 12288 x20, ...]           (per layer)
+///   gemma4.rope.freq_base = 1e6              gemma4.rope.freq_base_swa = 1e4
+///   tokenizer.ggml.tokens = 262144 entries
+pub const unsupported_architectures = [_]struct { name: []const u8, why: []const u8 }{
+    .{
+        .name = "gemma4",
+        .why = "per-layer head dims (512 global, 256 sliding), per-layer FFN widths, an explicit " ++
+            "per-layer sliding/full list, KV sharing across 20 layers, and per-layer input " ++
+            "embeddings (PLE)",
+    },
+};
+
 /// Architectures whose HF implementation uses `rotate_half` (half-split RoPE).
 /// llama.cpp selects `LLAMA_ROPE_TYPE_NEOX` for these; everything else uses the
 /// adjacent-pair layout, which is also the layout `convert_hf_to_gguf.py`
@@ -68,6 +95,18 @@ fn key(buf: []u8, arch: []const u8, suffix: []const u8) []const u8 {
 pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     var buf: [128]u8 = undefined;
     const arch = g.arch() orelse "llama";
+
+    // Refuse before any key is looked up: these architectures are missing dimensions the
+    // loader itself assumes, so the lookup would fail on a missing key with a message about
+    // the key rather than about the architecture.
+    for (unsupported_architectures) |u| {
+        if (std.mem.eql(u8, arch, u.name)) {
+            sys.eprint("error: \"{s}\" is recognised but not implemented yet.\n", .{arch});
+            sys.eprint("  It needs {s}.\n", .{u.why});
+            sys.eprint("  Loading it as llama would produce fluent nonsense, so this is refused.\n", .{});
+            return Error.UnsupportedArchitecture;
+        }
+    }
 
     var cfg = model.Config{ .arch = arch };
     // Name the missing key. A bare `MissingTensor` from a config read sends the reader
@@ -869,4 +908,55 @@ test "a Mistral GGUF's sliding window is read, not ignored" {
     try std.testing.expect(cfg.rope_adjacent);
     try std.testing.expect(!cfg.use_gelu);
     try std.testing.expect(!cfg.norm_unit_offset);
+}
+
+test "a gemma4 GGUF is refused rather than loaded as llama" {
+    // Gemma 4 differs from llama in ways that cannot be guessed: per-layer head dims and FFN
+    // widths, an explicit per-layer sliding/full list, KV sharing and per-layer input
+    // embeddings. "Treat it like llama" would run and produce fluent nonsense, so the loader
+    // must refuse it. Every key below is one the official Gemma 4 E2B GGUF actually carries.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 0);
+    try putInt(&bytes, a, u64, 8); // exactly the pairs written below
+    try putStr(&bytes, a, "general.architecture", "gemma4");
+    try putU32Kv(&bytes, a, "gemma4.embedding_length", 1536);
+    try putU32Kv(&bytes, a, "gemma4.block_count", 35);
+    try putU32Kv(&bytes, a, "gemma4.attention.head_count", 8);
+    try putU32Kv(&bytes, a, "gemma4.attention.head_count_kv", 1);
+    try putU32Kv(&bytes, a, "gemma4.feed_forward_length", 6144);
+    try putU32Kv(&bytes, a, "gemma4.attention.key_length", 512);
+    try putU32Kv(&bytes, a, "gemma4.attention.sliding_window", 512);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    try std.testing.expectError(Error.UnsupportedArchitecture, loadConfig(&g));
+
+    // A nearby name that shares no such difference must still take the ordinary path, so this
+    // test cannot pass merely by refusing everything beginning with "gemma".
+    const a2 = std.testing.allocator;
+    var bytes2: std.ArrayList(u8) = .empty;
+    defer bytes2.deinit(a2);
+    try putInt(&bytes2, a2, u32, 0x4655_4747);
+    try putInt(&bytes2, a2, u32, 3);
+    try putInt(&bytes2, a2, u64, 0);
+    try putInt(&bytes2, a2, u64, 7);
+    try putStr(&bytes2, a2, "general.architecture", "gemma2");
+    try putU32Kv(&bytes2, a2, "gemma2.embedding_length", 2304);
+    try putU32Kv(&bytes2, a2, "gemma2.block_count", 26);
+    try putU32Kv(&bytes2, a2, "gemma2.attention.head_count", 8);
+    try putU32Kv(&bytes2, a2, "gemma2.feed_forward_length", 9216);
+    try putU32Kv(&bytes2, a2, "gemma2.attention.sliding_window", 4096);
+    try putU32Kv(&bytes2, a2, "gemma2.vocab_size", 256000);
+    while (bytes2.items.len % 32 != 0) try bytes2.append(a2, 0);
+    var g2 = try gguf.Gguf.fromBytes(a2, bytes2.items);
+    defer g2.deinit();
+    const cfg2 = try loadConfig(&g2);
+    try std.testing.expectEqual(@as(u32, 2304), cfg2.hidden);
+    try std.testing.expect(!cfg2.swa_all); // Gemma 2 alternates, it does not slide everywhere
 }

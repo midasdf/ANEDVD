@@ -103,7 +103,15 @@ fn explain(path: []const u8, e: anyerror) anyerror {
             }
         },
         error.UnsupportedArchitecture => {
-            sys.eprint("cannot load {s}: unsupported architecture (see src/hf.zig for the list).\n", .{path});
+            // The GGUF and HF loaders keep separate lists, so name the right one. Sending a
+            // GGUF user to src/hf.zig was a small thing that cost a real search.
+            sys.eprint("cannot load {s}: unsupported architecture ({s}).\n", .{
+                path,
+                if (isGguf(path))
+                    "see the known_architectures and unsupported_architectures lists in src/load_gguf.zig"
+                else
+                    "see hf.supported_architectures",
+            });
         },
         else => {},
     }
