@@ -898,32 +898,42 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
             cfg.vocab,
         });
     }
-    const tot = eng.stats.tokens;
-    // MoE: report the CPU expert time separately. On Qwen1.5-MoE it is the largest
-    // single cost and it does not appear in the ANE node split at all.
+    // Everything below is a DECODE-ONLY per-token figure.
     //
-    // Reported PER DECODE TOKEN, because that is what a user waits for. Dividing the
-    // whole run's MoE time by the decode count folds in the prompt pass and inflates
-    // the number by roughly (prompt+completion)/completion — on a 10-token prompt with
-    // 1 generated token that is 11x, which is how this line first reported "11.4 s per
-    // token" for something closer to 1 s.
-    if (eng.stats.moe_ns > 0 and stats.completion_tokens > 0) {
-        const moe_decode_ns: u64 = if (stats.prefill_ns + stats.decode_ns > 0)
-            eng.stats.moe_ns * stats.decode_ns / (stats.prefill_ns + stats.decode_ns)
-        else
-            eng.stats.moe_ns;
-        sys.print("CPU MoE experts: {d:.1} ms/token ({d:.0}% of decode wall time)\n", .{
-            @as(f64, @floatFromInt(moe_decode_ns)) / @as(f64, @floatFromInt(stats.completion_tokens)) / 1e6,
-            if (stats.decode_ns > 0) 100.0 * @as(f64, @floatFromInt(moe_decode_ns)) / @as(f64, @floatFromInt(stats.decode_ns)) else 0,
+    // `stats.tokens` counts every node pass, prefill's chunk-wide ones included, so
+    // dividing the summed node times by the decode token count mixed the prompt into
+    // the answer. On a 14-token prompt generating 1 token that inflated each number
+    // ~30x: qkv looked like 368 ms when a decode step is about 12 ms. The engine
+    // snapshots its counters when prefill finishes, so the prompt's share can be
+    // subtracted exactly instead of guessed at.
+    const pd = eng.stats.prefill_done_tokens;
+    const decode_passes = eng.stats.tokens -| pd;
+    const tot: u64 = decode_passes;
+    // Both phases, so the two are never confused for one another again: prefill and
+    // decode do the same arithmetic per token but decode reads a fresh set of experts
+    // every layer, so their per-token costs genuinely differ.
+    if (eng.stats.moe_ns > 0) {
+        const pd_moe = eng.stats.prefill_done_moe_ns;
+        const moe_decode_ns = eng.stats.moe_ns -| pd_moe;
+        const wall: f64 = @floatFromInt(@max(stats.decode_ns, 1));
+        sys.print("CPU MoE experts: prefill {d:.1} ms/token, decode {d:.1} ms/token ({d:.0}% of decode wall)\n", .{
+            @as(f64, @floatFromInt(pd_moe)) / 1e6 / @as(f64, @floatFromInt(@max(stats.prompt_tokens, 1))),
+            @as(f64, @floatFromInt(moe_decode_ns)) / 1e6 / @as(f64, @floatFromInt(@max(tot, 1))),
+            100.0 * @as(f64, @floatFromInt(moe_decode_ns)) / wall,
         });
     }
     if (tot > 0) {
         const t: f64 = @floatFromInt(tot);
-        sys.print("ANE per-token split: qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{
-            eng.stats.nodeMs(.qkv) / t,
-            eng.stats.nodeMs(.o) / t,
-            eng.stats.nodeMs(.ffn) / t,
-            eng.stats.nodeMs(.head) / t,
+        const dn = struct {
+            fn sub(now: u64, then: u64) u64 {
+                return now -| then;
+            }
+        }.sub;
+        sys.print("ANE per-token split (decode only): qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{
+            @as(f64, @floatFromInt(dn(eng.stats.node_ns[0], eng.stats.prefill_done_node_ns[0]))) / 1e6 / t,
+            @as(f64, @floatFromInt(dn(eng.stats.node_ns[1], eng.stats.prefill_done_node_ns[1]))) / 1e6 / t,
+            @as(f64, @floatFromInt(dn(eng.stats.node_ns[2], eng.stats.prefill_done_node_ns[2]))) / 1e6 / t,
+            @as(f64, @floatFromInt(dn(eng.stats.node_ns[3], eng.stats.prefill_done_node_ns[3]))) / 1e6 / t,
         });
         sys.print("  qkv staging: write {d:.2} ms, read {d:.2} ms per token\n", .{
             @as(f64, @floatFromInt(eng.stats.qkv_write_ns)) / 1e6 / t,

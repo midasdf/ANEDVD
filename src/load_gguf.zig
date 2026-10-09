@@ -345,7 +345,7 @@ pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.C
     if (cfg.layerIsSparse(index)) {
         // Routed experts run on the CPU; the shared expert takes the dense slots so
         // the ANE's existing FFN kernel serves it unchanged.
-        m.moe = try loadMoeLayer(allocator, g, cfg, index);
+        m.moe = try loadMoeLayerStreaming(allocator, g, cfg, index);
         if (cfg.shared_inter > 0) {
             m.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
             m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
@@ -402,6 +402,71 @@ pub const GgufHead = struct {
 /// (one read, no gather) but the two orders are not the same for every tensor, so
 /// each is checked against the expert's expected [out][in] shape rather than
 /// assumed.
+/// Load a MoE layer WITHOUT materialising its experts.
+///
+/// Only the router and the shared expert are copied; the routed experts stay in the
+/// mapping and are dequantised one at a time as the router asks for them. This is
+/// what makes a MoE model runnable at all here: Qwen1.5-MoE's experts are 25 GB as
+/// fp16 against this machine's 8 GB, and materialising them swapped the machine
+/// (997 MB used, 71M pageins) until decode was ~30x slower than the arithmetic
+/// justifies. The mapped file's untouched pages are clean, so the OS can evict them
+/// under pressure instead of paging out anonymous memory.
+pub fn loadMoeLayerStreaming(
+    allocator: std.mem.Allocator,
+    g: *const gguf.Gguf,
+    cfg: model.Config,
+    index: u32,
+) !model.MoeWeights {
+    var buf: [128]u8 = undefined;
+    var moe = model.MoeWeights{
+        .num_experts = cfg.num_experts,
+        .inter = cfg.moe_inter,
+        .shared_inter = cfg.shared_inter,
+        .hidden_dim = cfg.hidden,
+    };
+    errdefer moe.deinit(allocator);
+
+    const gate_elems = @as(usize, cfg.moe_inter) * cfg.hidden;
+    const down_elems = @as(usize, cfg.hidden) * cfg.moe_inter;
+    // Three slots so gate, up and down can be live at once (moeExpertAccum takes
+    // all three), each big enough for the larger projection.
+    const slot = @max(gate_elems, down_elems);
+    moe.expert_slot = slot;
+    moe.expert_scratch = try allocator.alloc(f16, slot * 3);
+
+    moe.router = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp.weight", .{index}) catch unreachable, cfg.hidden, cfg.num_experts);
+
+    // The tensor names must outlive this call, so they are duplicated and owned by
+    // MoeWeights. Assign them to `moe.source` FIRST and let the single
+    // `errdefer moe.deinit` above handle cleanup: giving each name its own errdefer as
+    // well, and then assigning them, frees them twice when a later `try` fails. That
+    // was a real double free at layer 1.
+    moe.source = .{
+        .gguf = g,
+        .gate_name = try allocator.dupe(u8, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_exps.weight", .{index}) catch unreachable),
+        .up_name = try allocator.dupe(u8, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_exps.weight", .{index}) catch unreachable),
+        .down_name = try allocator.dupe(u8, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_exps.weight", .{index}) catch unreachable),
+        .gate_elems = gate_elems,
+        .down_elems = down_elems,
+    };
+
+    if (cfg.shared_inter > 0) {
+        moe.shared_gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+        moe.shared_up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up_shexp.weight", .{index}) catch unreachable, cfg.hidden, cfg.shared_inter);
+        moe.shared_down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_shexp.weight", .{index}) catch unreachable, cfg.shared_inter, cfg.hidden);
+        // A 1-D vector of length hidden, not a [1][hidden] matrix: ggml stores the
+        // shared-expert gate as {n_embd}, which loadLinear's rank-2 checks reject.
+        {
+            const gate_f32 = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp_shexp.weight", .{index}) catch unreachable);
+            defer allocator.free(gate_f32);
+            if (gate_f32.len != cfg.hidden) return Error.DimensionMismatch;
+            moe.shared_gate_lin = try allocator.alloc(f16, cfg.hidden);
+            for (gate_f32, 0..) |v, i| moe.shared_gate_lin[i] = @floatCast(v);
+        }
+    }
+    return moe;
+}
+
 pub fn loadMoeLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, index: u32) !model.MoeWeights {
     var buf: [128]u8 = undefined;
     var moe = model.MoeWeights{

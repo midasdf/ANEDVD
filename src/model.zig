@@ -192,7 +192,34 @@ pub const HeadSource = struct {
 /// for gate/up and [experts][hidden][inter] for down) so the loader does one
 /// allocation per tensor instead of one per expert, and so the GGUF case (where
 /// the expert axis is the last one) has a natural place to land.
+/// Where an expert's weights live. A MoE model cannot be materialised: Qwen1.5-MoE
+/// is 25 GB of fp16 experts on disk-as-f16 against an 8 GB machine, and copying it
+/// into anonymous memory swaps the machine to a crawl (997 MB of swap and 71M
+/// pageins were measured). The file is instead left mapped, where its untouched
+/// pages are clean and evictable, and only the k experts a token routes to are
+/// dequantised — into a small per-layer cache, not into 25 GB.
+pub const MoeSource = struct {
+    /// The mapping the expert tensors live in.
+    gguf: *const @import("gguf.zig").Gguf,
+    /// Tensor names, one per projection.
+    gate_name: []const u8 = "",
+    up_name: []const u8 = "",
+    down_name: []const u8 = "",
+    /// Bytes per expert (identical for gate and up; down differs in element order
+    /// only, so the element count is what matters and each read derives its own).
+    gate_elems: usize = 0,
+    down_elems: usize = 0,
+};
+
 pub const MoeWeights = struct {
+    /// Streaming source. When set, `gate`/`up`/`down` are empty and
+    /// `moeExpertAccum` reads the experts through `expertScratch` instead.
+    source: ?MoeSource = null,
+    /// Scratch an expert is dequantised into: three slots, because
+    /// `moeExpertAccum` consumes gate, up and down together and they must not
+    /// alias. Layout: [3][max(gate_elems, down_elems)]. One expert's worth of
+    /// memory in total (about 35 MB for Qwen1.5-MoE), instead of 25 GB.
+    expert_scratch: []f16 = &.{},
     /// [num_experts][hidden]
     router: []f16 = &.{},
     /// [num_experts][moe_inter][hidden]
@@ -212,6 +239,8 @@ pub const MoeWeights = struct {
     shared_inter: u32 = 0,
     /// Cached so `expertGate` and friends can stride without a Config.
     hidden_dim: u32 = 0,
+    /// Elements per projection slot in `expert_scratch`.
+    expert_slot: usize = 0,
 
     pub fn deinit(self: *MoeWeights, allocator: std.mem.Allocator) void {
         if (self.router.len > 0) allocator.free(self.router);
@@ -222,7 +251,52 @@ pub const MoeWeights = struct {
         if (self.shared_up.len > 0) allocator.free(self.shared_up);
         if (self.shared_down.len > 0) allocator.free(self.shared_down);
         if (self.shared_gate_lin.len > 0) allocator.free(self.shared_gate_lin);
+        if (self.expert_scratch.len > 0) allocator.free(self.expert_scratch);
+        // The streaming source owns its tensor names (they must outlive the loader).
+        if (self.source) |src| {
+            if (src.gate_name.len > 0) allocator.free(src.gate_name);
+            if (src.up_name.len > 0) allocator.free(src.up_name);
+            if (src.down_name.len > 0) allocator.free(src.down_name);
+        }
         self.* = .{};
+    }
+
+    /// True when the experts are read from the mapping rather than held in memory.
+    pub fn streaming(self: *const MoeWeights) bool {
+        return self.source != null;
+    }
+
+    /// Dequantise one expert's `which` projection into `scratch`, returning the view.
+    ///
+    /// `which` is 0 = gate, 1 = up, 2 = down. Only valid for a streaming source; the
+    /// eager path returns the in-memory slice instead, which is why both go through
+    /// these accessors rather than the engine reaching into `gate`/`up`/`down`.
+    pub fn loadExpert(self: *const MoeWeights, e: u32, which: u2, scratch: []f16) []const f16 {
+        const src = self.source orelse return switch (which) {
+            0 => self.expertGate(e),
+            1 => self.expertUp(e),
+            else => self.expertDown(e),
+        };
+        const name = switch (which) {
+            0 => src.gate_name,
+            1 => src.up_name,
+            else => src.down_name,
+        };
+        const elems = switch (which) {
+            2 => src.down_elems,
+            else => src.gate_elems,
+        };
+        // Slot per projection, so the three live at once.
+        const slot = @as(usize, which) * self.expert_slot;
+        const dst = scratch[slot..][0..elems];
+        src.gguf.readExpertF16(name, e, self.num_experts, dst) catch |err| {
+            // A streaming read that fails leaves the scratch zeroed rather than
+            // reusing the previous expert's weights, which would be silently wrong.
+            @memset(dst, 0);
+            std.debug.print("moe: expert {d} of {s} failed: {s}\n", .{ e, name, @errorName(err) });
+            return dst;
+        };
+        return dst;
     }
 
     /// One expert's gate slice, [inter][hidden].

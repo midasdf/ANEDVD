@@ -75,6 +75,16 @@ pub const Stats = struct {
     pf_rope_ns: u64 = 0,
     /// Time spent on the CPU running routed MoE experts.
     moe_ns: u64 = 0,
+    /// Snapshots of the ANE counters taken when prefill ends, so a caller can report
+    /// decode-only "per token" figures. Without them `node_ns` mixes the prompt's
+    /// chunk-passes with decode's single-column passes: on a 14-token prompt with 1
+    /// generated token, dividing the sum by the decode count inflates every number
+    /// ~30x, which is exactly what the per-token split used to do.
+    prefill_done_tokens: u64 = 0,
+    prefill_done_node_ns: [4]u64 = @splat(0),
+    prefill_done_evals: [4]u64 = @splat(0),
+    prefill_done_moe_ns: u64 = 0,
+    prefill_done_ane_ns: u64 = 0,
     pf_attn_ns: u64 = 0,
     pf_norm_ns: u64 = 0,
     pf_stage_ns: u64 = 0,
@@ -502,14 +512,21 @@ pub const Engine = struct {
                     }
                 }
                 for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p| {
+                    // `loadExpert` reads from the mapping when the layer streams, and
+                    // returns the in-memory slice otherwise, so both paths share this
+                    // loop. The same scratch serves all three projections because each
+                    // is consumed before the next is read.
+                    const g_w = moe.loadExpert(e, 0, moe.expert_scratch);
+                    const u_w = moe.loadExpert(e, 1, moe.expert_scratch);
+                    const d_w = moe.loadExpert(e, 2, moe.expert_scratch);
                     cpu.moeExpertAccum(
                         self.moe_out[0..hidden],
                         self.moe_gate_scratch[0..moe.inter],
                         self.moe_upd_scratch[0..moe.inter],
                         hh,
-                        moe.expertGate(e),
-                        moe.expertUp(e),
-                        moe.expertDown(e),
+                        g_w,
+                        u_w,
+                        d_w,
                         moe.inter,
                         hidden,
                         p,
@@ -742,14 +759,21 @@ pub const Engine = struct {
                         );
                         @memset(self.moe_out[0..hd], 0);
                         for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p2| {
+                            // Same accessor as decode: reads from the mapping when the
+                            // layer streams. Calling expertGate() directly here indexed
+                            // the empty eager buffers and panicked
+                            // ("index out of bounds: index 158597120, len 0").
+                            const g_w = moe.loadExpert(e, 0, moe.expert_scratch);
+                            const u_w = moe.loadExpert(e, 1, moe.expert_scratch);
+                            const d_w = moe.loadExpert(e, 2, moe.expert_scratch);
                             cpu.moeExpertAccum(
                                 self.moe_out[0..hd],
                                 self.moe_gate_scratch[0..moe.inter],
                                 self.moe_upd_scratch[0..moe.inter],
                                 hh,
-                                moe.expertGate(e),
-                                moe.expertUp(e),
-                                moe.expertDown(e),
+                                g_w,
+                                u_w,
+                                d_w,
                                 moe.inter,
                                 hd,
                                 p2,
@@ -780,6 +804,13 @@ pub const Engine = struct {
             done += n;
             self.stats.tokens += 1;
         }
+        // Snapshot for decode-only reporting (see Stats.prefill_done_*).
+        self.stats.prefill_done_tokens = self.stats.tokens;
+        self.stats.prefill_done_node_ns = self.stats.node_ns;
+        self.stats.prefill_done_evals = self.stats.node_evals;
+        self.stats.prefill_done_moe_ns = self.stats.moe_ns;
+        self.stats.prefill_done_ane_ns = self.stats.ane_eval_ns;
+
         return self.logits;
     }
 
