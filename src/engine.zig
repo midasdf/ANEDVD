@@ -1217,6 +1217,19 @@ pub const Engine = struct {
             for (ref) |*v| v.* = cfg.final_logit_softcap * std.math.tanh(v.* / cfg.final_logit_softcap);
         }
         reportKernel("lm_head", self.logits, ref);
+        // Report each chunk separately: a whole-vocabulary number cannot say whether the
+        // first kernel is wrong or the chunk offsets are.
+        if (self.head_extra_built > 0) {
+            const chunk: usize = self.head_chunk;
+            var off: usize = 0;
+            for (0..self.head_extra_built + 1) |ci| {
+                const rows: usize = @min(chunk, cfg.vocab - off);
+                var name_buf: [24]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "  head chunk {d}", .{ci}) catch "  head chunk";
+                reportKernel(name, self.logits[off..][0..rows], ref[off..][0..rows]);
+                off += rows;
+            }
+        }
     }
 
     /// Run only the first `n` layers, then the final norm and lm head. Used to
