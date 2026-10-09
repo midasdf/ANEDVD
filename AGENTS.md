@@ -171,13 +171,22 @@ Implemented and verified to the extent stated:
 * A `<start_of_turn>` chat template selected from `tokenizer.chat_template`, and Gemma
   added to the HF architecture list.
 
-**Where it stands now.** All four of gemma-2-2b's kernels check OK against the CPU
-reference (qkv 1.5e-4, o 4.6e-4, ffn 4.3e-3, lm_head 2.0e-4), its prompt encodes correctly,
-and the tiny-random Gemma 2's prompt logits match `anedvd cpu` rank for rank. What still
-fails is `anedvd run`: it reports `WrongShape` from an IOSurface read once generation
-starts. The head is now split into bounded vocabulary chunks, so the suspects are the
-chunk kernels' output surfaces — `readOutputF16` requires `out.len == info.elemCount()`
-and the last chunk is shorter than the others.
+**Where it stands now.** The `WrongShape` is fixed (prefill was reading the whole
+vocabulary from one head chunk). All four of gemma-2-2b's kernels check OK against the CPU
+reference (qkv 2.0e-4, o 4.2e-4, ffn 4.1e-3, lm_head 2.1e-4), its prompt encodes correctly,
+and the tiny-random Gemma 2 checks OK.
+
+`anedvd run` on gemma-2-2b still emits a run of "." rather than an answer. The defect is
+**reachable in a single layer**:
+
+    anedvd verify models/gemma-2-2b-it-q4_k_m.gguf --layers 1
+      prefill: max|ANE - CPU| = 4.26e1  argmax 2 "<bos>" vs 603 "▁is"   MISMATCH
+
+so it is not something that accumulates over 26 layers, and `--layers 1` is a
+two-minute reproduction rather than a full run. Note the engine and `anedvd cpu` agree
+with each other on the tiny Gemma 2 but not on the real one, so the divergence is
+size-dependent: `head_dim` 256 against 32, `q_dim` 2048 against `hidden` 2304, and a
+4096 sliding window that neither prompt actually reaches.
 
 Open questions for whoever picks this up, in the order worth trying:
 
