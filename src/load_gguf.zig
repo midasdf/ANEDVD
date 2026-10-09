@@ -18,10 +18,17 @@ pub const Error = error{
     UnsupportedQuantization,
 };
 
-/// Architectures this loader has been exercised on, or that share their GGUF
-/// layout exactly (the same `*.block_count` config keys and `blk.N.*` tensor
-/// names). Anything else is accepted but warned about, because a wrong
-/// architecture guess produces fluent nonsense rather than an error.
+/// Architectures this loader will not warn about: the ones exercised on a real
+/// model here (llama, qwen2, qwen3, qwen2moe, gemma2, and the smollm family),
+/// plus the ones that share those GGUF layouts exactly — the same
+/// `*.block_count` config keys and `blk.N.*` tensor names.
+///
+/// Being on this list is not a statement that the architecture was run. Mistral
+/// and SmolLM3 are here on layout alone; Mistral's sliding window turned out to be
+/// ignored entirely until it was fixed from the config, which is exactly the kind
+/// of thing only running a model catches. Anything not listed is accepted with a
+/// warning, because a wrong architecture guess produces fluent nonsense rather
+/// than an error.
 pub const known_architectures = [_][]const u8{
     "llama",    "qwen2",   "qwen3",    "mistral",   "smollm",
     "smollm2",  "smollm3", "qwen2moe", "qwen3moe",  "granite",
