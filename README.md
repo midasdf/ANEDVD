@@ -94,7 +94,7 @@ Numerical correctness is checked at three levels:
 
 ```sh
 zig build                  # produces zig-out/bin/anedvd (ReleaseFast)
-zig build test             # 76 tests; the engine test skips without an ANE
+zig build test             # 120 tests; the ANE tests skip without an ANE
 zig fmt src build.zig
 ```
 
