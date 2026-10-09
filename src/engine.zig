@@ -1920,3 +1920,77 @@ test "the shared expert's output is scaled by sigmoid(gate . h) (needs the ANE)"
     // difference would be exactly 0 if the scale were ignored.
     try std.testing.expect(worst > 0.05);
 }
+
+test "an over-long prompt is refused, not written past the KV cache (needs the ANE)" {
+    // The KV cache holds exactly `max_seq` rows per layer. Before this guard, `verify` with
+    // a 1121-token prompt on a 1024-row context wrote past the cache and returned all-zero
+    // logits with rel = 1.0 instead of failing — a heap overflow that did not crash, so it
+    // read as a wrong answer rather than as a bug.
+    if (!ane.available()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    const cfg = model.Config{
+        .arch = "llama",
+        .hidden = 32,
+        .layers = 1,
+        .heads = 4,
+        .kv_heads = 2,
+        .head_dim = 8,
+        .inter = 64,
+        .vocab = 128,
+        .eps = 1e-5,
+        .rope_theta = 10000.0,
+        .rope_adjacent = false,
+    };
+    var mw = model.ModelWeights{ .allocator = a, .config = cfg };
+    defer mw.deinit();
+    mw.embed = try a.alloc(f16, @as(usize, cfg.vocab) * cfg.hidden);
+    mw.final_norm = try a.alloc(f32, cfg.hidden);
+    mw.layers = try a.alloc(model.LayerWeights, cfg.layers);
+    @memset(mw.layers, .{});
+    fillDeterministic(mw.embed, 1, 1.0);
+    fillDeterministicF32(mw.final_norm, 2, 1.0, 0.1);
+    {
+        const lw = &mw.layers[0];
+        lw.attn_norm = try a.alloc(f32, cfg.hidden);
+        lw.ffn_norm = try a.alloc(f32, cfg.hidden);
+        lw.qkv = try a.alloc(f16, @as(usize, cfg.qkvDim()) * cfg.hidden);
+        lw.o = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.qDim());
+        lw.gate = try a.alloc(f16, @as(usize, cfg.inter) * cfg.hidden);
+        lw.up = try a.alloc(f16, @as(usize, cfg.inter) * cfg.hidden);
+        lw.down = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.inter);
+        fillDeterministicF32(lw.attn_norm, 100, 1.0, 0.1);
+        fillDeterministicF32(lw.ffn_norm, 200, 1.0, 0.1);
+        fillDeterministic(lw.qkv, 300, 0.3);
+        fillDeterministic(lw.o, 400, 0.3);
+        fillDeterministic(lw.gate, 500, 0.3);
+        fillDeterministic(lw.up, 600, 0.3);
+        fillDeterministic(lw.down, 700, 0.3);
+    }
+
+    const rt = try mw.toRuntime(a);
+    var eng = try Engine.init(a, rt, mw.layerSource(), mw.headSource(rt.embed), .{
+        .max_seq = 8,
+        .verbose = false,
+        .chunk = 4,
+    });
+    defer eng.deinit();
+
+    // Exactly filling the context is fine: 8 tokens at max_seq 8.
+    const fits = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    _ = try eng.prefill(&fits, 0);
+
+    // One more than the context is refused, rather than writing a ninth row.
+    const too_many = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    try std.testing.expectError(error.ContextOverflow, eng.prefill(&too_many, 0));
+
+    // A later start position counts against the same bound: four tokens from position six
+    // would need row ten.
+    const late = [_]u32{ 1, 2, 3, 4 };
+    try std.testing.expectError(error.ContextOverflow, eng.prefill(&late, 6));
+    _ = try eng.prefill(&late, 4); // exactly reaching the end is allowed
+
+    // `forward` indexes the same cache with `pos`.
+    _ = try eng.forward(1, 7);
+    try std.testing.expectError(error.ContextOverflow, eng.forward(1, 8));
+}
