@@ -1447,3 +1447,39 @@ test "geluTanh matches the tanh-approximation GELU definition" {
     // GELU is not SiLU, and the difference is large where it matters.
     try std.testing.expect(@abs(geluTanh(-3.0) - (-3.0 / (1.0 + @exp(3.0)))) > 0.13);
 }
+
+test "sampling: with top_k set, no drawn token comes from outside the true top-k" {
+    // The invariant the bounded selection could break. `selectTopK agrees with a full sort`
+    // checks the selection in isolation; this checks what sampling actually draws from it,
+    // which is where a dropped or mis-ordered candidate would show up as a token that should
+    // not have been reachable at all.
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rand = prng.random();
+
+    const vocab = 4000;
+    const k = 8;
+    const logits = try a.alloc(f32, vocab);
+    defer a.free(logits);
+    const scratch = try a.alloc(Candidate, vocab);
+    defer a.free(scratch);
+
+    var trial: usize = 0;
+    while (trial < 40) : (trial += 1) {
+        for (logits) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(u32, 0, 1000))) * 0.01;
+        // A deliberately small spread, so many logits tie and the ordering is exercised.
+        const ordered = try a.dupe(f32, logits);
+        defer a.free(ordered);
+        std.mem.sort(f32, ordered, {}, comptime std.sort.desc(f32));
+        const threshold = ordered[k - 1];
+
+        var seed: u32 = rand.int(u32) | 1;
+        var draw: usize = 0;
+        while (draw < 50) : (draw += 1) {
+            const id = sample(logits, .{ .temperature = 1.0, .top_k = k, .top_p = 1.0 }, &.{}, &seed, scratch);
+            // Ties are fine: anything at or above the k-th largest value is legitimately in
+            // the kept set.
+            try std.testing.expect(logits[id] >= threshold);
+        }
+    }
+}
