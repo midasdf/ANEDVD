@@ -746,3 +746,18 @@ rather than an error:
         prefill scale removed  -> the MoE equivalence test fails
 
     Tests: 119 → 120. README's stale "76 tests" line is corrected too.
+27. **An over-long prompt also starved the completion.** `clampMaxTokens` limited a request to
+    `max_seq - prompt_len - 1`, which is correct while the prompt fits: the prompt keeps its
+    place and generation gets the remainder. When the prompt did NOT fit it fell back to a
+    single token, so a 154-token prompt with `max_seq` 128 asking for 20 tokens returned
+    **1** with `finish_reason: "length"` — measured against a live server, and it made a
+    growing conversation collapse to 1-token replies at turn 6.
+
+    A prompt the engine must truncate anyway is no reason to starve the completion, because
+    the context is freed by dropping prompt tokens regardless. The clamp now honours the
+    request up to `max_seq - 2` in that case, which still leaves at least one prompt token:
+
+        before:  completion=1,  dropped=28
+        after:   completion=20, dropped=47     (what the client asked for)
+
+    The drop is still reported in `usage.prompt_tokens_dropped` and in the server log.
