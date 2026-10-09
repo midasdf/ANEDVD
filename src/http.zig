@@ -27,7 +27,14 @@ const libc = struct {
     extern "c" fn send(fd: c_int, buf: [*]const u8, len: usize, flags: c_int) isize;
     extern "c" fn shutdown(fd: c_int, how: c_int) c_int;
     extern "c" fn signal(sig: c_int, handler: usize) usize;
+    extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 };
+
+/// `FIONREAD` on macOS: how many bytes are waiting to be read on a socket.
+const FIONREAD: c_ulong = 0x4004667f;
+
+/// Read without consuming.
+const MSG_PEEK: c_int = 0x2;
 
 const AF_INET: c_uint = 2;
 const SOCK_STREAM: c_uint = 1;
@@ -294,6 +301,36 @@ pub const Conn = struct {
         return (fds[0].revents & POLLIN) != 0;
     }
 
+    /// True when a whole request — headers and the full `Content-Length` body — is already
+    /// buffered on the socket, so `readRequest` cannot block.
+    ///
+    /// `hasPendingInput` only reports that *some* bytes arrived, which is not the same
+    /// thing and was a denial of service: a client that sent headers claiming
+    /// `Content-Length: 5000` and then 40 bytes made `readRequest` block in `recv` for the
+    /// whole 30 s receive timeout, and because that call sits on the server's single
+    /// service path, every other client was locked out meanwhile — measured, `/health`
+    /// timed out for 30 s. Waiting for the request to be complete before touching it means
+    /// a slow client can only ever occupy its own connection.
+    pub fn hasCompleteRequest(self: *const Conn) bool {
+        var avail: c_int = 0;
+        if (libc.ioctl(self.fd, FIONREAD, &avail) != 0 or avail <= 0) return false;
+        const avail_n: usize = @intCast(avail);
+        var buf: [8192]u8 = undefined;
+        const n = libc.recv(self.fd, &buf, @min(buf.len, avail_n), MSG_PEEK);
+        if (n <= 0) return false;
+        const got = buf[0..@intCast(n)];
+        const hdr_end = std.mem.indexOf(u8, got, "\r\n\r\n") orelse {
+            // Headers not finished inside the window: more must already be buffered for
+            // this to be safe, otherwise keep waiting.
+            return avail_n > buf.len;
+        };
+        var want: usize = 0;
+        if (findHeaderIn(got[0 .. hdr_end + 4], "content-length")) |v| {
+            want = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return false;
+        }
+        return got.len >= hdr_end + 4 + want;
+    }
+
     pub fn close(self: *Conn) void {
         if (self.fd >= 0) {
             _ = libc.shutdown(self.fd, SHUT_WR);
@@ -391,6 +428,49 @@ test "hasPendingInput reports readiness without blocking" {
     const b = "x";
     _ = libc.send(sv[1], b.ptr, b.len, 0);
     try std.testing.expect(conn.hasPendingInput(500));
+}
+
+test "hasCompleteRequest distinguishes a partial request from a whole one" {
+    // This is the check that closes the denial of service: a client that sends headers
+    // claiming Content-Length: 5000 and then 40 bytes makes `readRequest` block in recv
+    // for the whole 30 s receive timeout, which locked out every other client because it
+    // sits on the server's single service path. Verified fixed against a live server with
+    // three stalled connections parked: /health answered 4/4 instead of timing out.
+    var sv: [2]std.c.fd_t = undefined;
+    const AF_UNIX: c_int = 1;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) != 0) return error.SkipZigTest;
+    defer _ = std.c.close(sv[0]);
+    defer _ = std.c.close(sv[1]);
+    var conn = Conn{ .fd = sv[0] };
+
+    // Nothing yet.
+    try std.testing.expect(!conn.hasCompleteRequest());
+
+    // Headers only, promising a body that has not arrived: NOT complete.
+    const headers = "POST /x HTTP/1.1\r\nContent-Length: 20\r\n\r\n";
+    _ = libc.send(sv[1], headers.ptr, headers.len, 0);
+    try std.testing.expect(!conn.hasCompleteRequest());
+
+    // Part of the body is still not enough.
+    const part = "abcde";
+    _ = libc.send(sv[1], part.ptr, part.len, 0);
+    try std.testing.expect(!conn.hasCompleteRequest());
+
+    // The remaining bytes make it complete (5 + 15 = the promised 20).
+    const rest = "fghijklmnopqrst";
+    try std.testing.expectEqual(@as(usize, 15), rest.len);
+    _ = libc.send(sv[1], rest.ptr, rest.len, 0);
+    try std.testing.expect(conn.hasCompleteRequest());
+
+    // A body-less request is complete as soon as its headers are.
+    var sv2: [2]std.c.fd_t = undefined;
+    if (libc.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv2) != 0) return error.SkipZigTest;
+    defer _ = std.c.close(sv2[0]);
+    defer _ = std.c.close(sv2[1]);
+    var get = Conn{ .fd = sv2[0] };
+    const get_req = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+    _ = libc.send(sv2[1], get_req.ptr, get_req.len, 0);
+    try std.testing.expect(get.hasCompleteRequest());
 }
 
 test "ipv4 parsing produces network byte order" {

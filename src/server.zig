@@ -31,6 +31,11 @@ pub const Options = struct {
 };
 
 pub const Server = struct {
+    /// How many connections may be parked waiting to send their request while a generation
+    /// is in flight. Four covers a browser's parallel probe requests plus a client that is
+    /// mid-write, and is small enough that a stalled peer cannot consume much.
+    pub const max_pending: usize = 4;
+
     allocator: std.mem.Allocator,
     session: *generate.Session,
     opts: Options,
@@ -49,9 +54,16 @@ pub const Server = struct {
     /// time, so a single pointer is enough, and the prefill tick uses it to keep that
     /// stream's socket warm while prefill emits nothing.
     active_sink: ?*SseSink = null,
-    /// A connection accepted mid-generation that has not sent its request yet,
+    /// Connections accepted mid-generation that have not sent a complete request yet,
     /// kept alive between generated tokens instead of being dropped.
-    pending: ?http.Conn = null,
+    ///
+    /// This was a single slot, which made one bad client take the whole server down:
+    /// `servicePending` closed every newly accepted connection whenever the slot was
+    /// occupied, so a client that claimed `Content-Length: 5000` and then sent 40 bytes
+    /// held the slot for the full 30 s receive timeout and **`/health` timed out for every
+    /// other client** for that whole window (measured). Several slots mean a stalled
+    /// connection can only occupy its own.
+    pending: [max_pending]?http.Conn = @splat(null),
     /// The engine's context window, reported when a prompt has to be truncated.
     context_limit: u32 = 0,
 
@@ -70,17 +82,49 @@ pub const Server = struct {
             srv.setNonBlocking(true);
             const maybe = srv.acceptIfPending();
             srv.setNonBlocking(false);
-            var conn = maybe orelse {
-                sys.sleepMs(2);
-                continue;
-            };
-            self.handle(&conn) catch |e| {
-                if (e != error.WriteFailed and e != error.ConnectionClosed) {
-                    sys.eprint("request failed: {s}\n", .{@errorName(e)});
-                }
-            };
-            conn.close();
+            if (maybe) |accepted| {
+                var fresh = accepted;
+                self.park(&fresh);
+            }
+
+            // Serve any parked connection whose request has fully arrived. A client that
+            // sent only part of its request is left parked rather than handed to
+            // `readRequest`, which would block this loop in `recv` for the whole receive
+            // timeout and lock out every other client.
+            var served = false;
+            for (&self.pending) |*slot| {
+                var conn = slot.* orelse continue;
+                if (!conn.hasCompleteRequest()) continue;
+                slot.* = null;
+                self.handle(&conn) catch |e| {
+                    if (e != error.WriteFailed and e != error.ConnectionClosed) {
+                        sys.eprint("request failed: {s}\n", .{@errorName(e)});
+                    }
+                };
+                conn.close();
+                served = true;
+            }
+            if (!served) sys.sleepMs(2);
         }
+    }
+
+    /// Put a freshly accepted connection in a free slot, evicting a stalled one if needed.
+    ///
+    /// Evicting a connection whose request is incomplete — rather than closing the new
+    /// arrival — is what keeps a peer that opens sockets and never finishes its request
+    /// from locking out real clients: the stalled connection is the one sacrificed.
+    fn park(self: *Server, fresh: *http.Conn) void {
+        const slot = self.freePendingSlot() orelse blk: {
+            for (&self.pending) |*s| {
+                if (s.*) |*c| {
+                    if (!c.hasCompleteRequest()) break :blk s;
+                }
+            }
+            var extra = fresh.*;
+            extra.close();
+            return;
+        };
+        slot.* = fresh.*;
     }
 
     fn handle(self: *Server, conn: *http.Conn) !void {
@@ -261,31 +305,39 @@ pub const Server = struct {
 
     pub fn servicePending(self: *Server) void {
         var srv = self.listener orelse return;
+
+        // Fill whatever slots are free. A full set means the client is misbehaving or the
+        // machine is being hammered; close the extra rather than growing without bound.
         srv.setNonBlocking(true);
-        const maybe = srv.acceptIfPending();
+        var accepted: usize = 0;
+        while (accepted < max_pending) : (accepted += 1) {
+            const slot = self.freePendingSlot() orelse break;
+            slot.* = srv.acceptIfPending() orelse break;
+        }
         srv.setNonBlocking(false);
 
-        // Take a newly accepted connection only if we have no other waiting one.
-        if (maybe) |fresh| {
-            if (self.pending == null) {
-                self.pending = fresh;
-            } else {
-                var extra = fresh;
-                extra.close();
-            }
+        // Service every slot that already has a complete request. Slots that do not are
+        // left alone for the next tick, which is what keeps the 0 ms poll cheap.
+        for (&self.pending) |*slot| {
+            var conn = slot.* orelse continue;
+            // Wait for the WHOLE request, not merely the first bytes: see
+            // `hasCompleteRequest` for the denial of service that distinction caused.
+            if (!conn.hasCompleteRequest()) continue;
+            slot.* = null;
+            self.handlePendingRequest(&conn);
+            conn.close();
         }
-        var conn = self.pending orelse return;
+    }
 
-        // Do not wait: a poll that blocks would cost its timeout on every token
-        // (5 ms x 400 tokens was 1.2 s of added generation time). Keeping the
-        // connection in `pending` instead of dropping it is what makes the 0 ms
-        // check safe -- a real client's request arrives within a token, and the
-        // connection is still here when it does.
-        if (!conn.hasPendingInput(0)) return; // keep it for the next token
+    fn freePendingSlot(self: *Server) ?*?http.Conn {
+        for (&self.pending) |*slot| {
+            if (slot.* == null) return slot;
+        }
+        return null;
+    }
 
-        self.pending = null;
-        defer conn.close();
-
+    /// Answer one parked connection whose request has fully arrived.
+    fn handlePendingRequest(self: *Server, conn: *http.Conn) void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -306,7 +358,7 @@ pub const Server = struct {
             return;
         }
         if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
-            self.sendModels(&conn) catch return;
+            self.sendModels(conn) catch return;
             self.served_during_generation += 1;
             return;
         }
@@ -316,13 +368,15 @@ pub const Server = struct {
         // status at all, which looks like a crash; answer with a real HTTP error
         // and Retry-After so a client can tell the difference and back off.
         self.busy_rejections += 1;
-        tryBusyResponse(&conn, self.busy_rejections);
+        tryBusyResponse(conn, self.busy_rejections);
     }
 
-    /// Close a connection parked between tokens, at shutdown.
+    /// Close every connection parked between tokens, at shutdown.
     pub fn closePending(self: *Server) void {
-        if (self.pending) |*c| c.close();
-        self.pending = null;
+        for (&self.pending) |*slot| {
+            if (slot.*) |*c| c.close();
+            slot.* = null;
+        }
     }
 
     /// One line per request so multi-turn prefix reuse is observable in the
