@@ -171,8 +171,18 @@ Implemented and verified to the extent stated:
 * A `<start_of_turn>` chat template selected from `tokenizer.chat_template`, and Gemma
   added to the HF architecture list.
 
+**Where it stands now.** All four of gemma-2-2b's kernels check OK against the CPU
+reference (qkv 1.5e-4, o 4.6e-4, ffn 4.3e-3, lm_head 2.0e-4), its prompt encodes correctly,
+and the tiny-random Gemma 2's prompt logits match `anedvd cpu` rank for rank. What still
+fails is `anedvd run`: it reports `WrongShape` from an IOSurface read once generation
+starts. The head is now split into bounded vocabulary chunks, so the suspects are the
+chunk kernels' output surfaces — `readOutputF16` requires `out.len == info.elemCount()`
+and the last chunk is shorter than the others.
+
 Open questions for whoever picks this up, in the order worth trying:
 
+0. The `WrongShape` above. It is confined to `runHead`'s chunk loop: the kernels all
+   check OK, so it is the read, not the arithmetic.
 1. `query_pre_attn_scalar` is 256 for gemma-2-2b, equal to `head_dim`, so the existing
    `head_dim**-0.5` scaling matches. Check this for other Gemma sizes.
 2. `q_dim` (8 x 256 = 2048) is smaller than `hidden` (2304). Nothing has been verified
