@@ -94,6 +94,22 @@ zig fmt src build.zig
   unordered, which is 0.47 ms/token. `anedvd run` prints the cost per token. **When changing
   this, run `selectTopK agrees with a full sort` — it caught two candidate-dropping bugs in the
   first two attempts at the bounded selection.**
+* **The sampler's remaining cost, and the design for it (not implemented).** After the bounded
+  selection, sampling is 0.47 ms/token at temperature 1.0 of which 0.13 ms is the two
+  full-vocabulary walks; the rest is pass 2 materialising every candidate (`scratch[n] = ...`
+  for ~45k of them, ~360 KB of writes) so that `selectTopK` can then pick 40. The top-k could
+  be maintained during pass 2 instead, writing at most `k` entries. The kept set is provably
+  the same either way — it is `{v >= cut}` intersected with the top `k` of all logits, and that
+  intersection does not depend on the order the two are applied in.
+  Three details to get right, which is why it is deferred rather than done:
+  1. `top_k == 0` disables the selection and must keep materialising every candidate.
+  2. When `n <= top_k` the old code leaves the candidates in **index order**, not logit order,
+     and the sampler walks them cumulatively — so reordering changes which token a given seed
+     draws even though the distribution is unchanged. Match the old layout: maintain the top-k
+     by logit, then re-sort by index when `n <= top_k` (n is at most `top_k`, so it is cheap).
+  3. Ties: `selectTopK` orders equal logits by its insertion rules. Equal logits have equal
+     probability, so the distribution is unaffected, but a fixed-seed A/B will differ. Compare
+     distributions, not token ids, when validating this.
 * **Never `git checkout <path>` with uncommitted work you want to keep.** A bare
   `git checkout src` during this session silently destroyed ~2 hours of Gemma support
   (sandwich norms, logit soft-capping, sliding-window attention, chat template) that had
