@@ -150,7 +150,6 @@ zig fmt src build.zig
      reading the list rather than reasoning about the prefix match.
   4. A test mirroring "Mistral windows every layer; Gemma 2 alternates": with pattern 6, layers
      0-4 slide, layer 5 does not, layer 6 slides.
-  `gemma` (1) is in the same position and has no window at all, so it is only affected by (3).
   **All four are resolved** (round 42): the pattern is parsed from both formats, `toModelConfig`
   uses it with 2 as the Gemma 2 default, `load_gguf` clears `swa_all` when an explicit pattern
   is present, and `load_hf.test` pins pattern 6 through `toModelConfig` (126 tests). Piece 3
