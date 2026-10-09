@@ -508,6 +508,7 @@ pub const Engine = struct {
             self.ropeAndCache(li, pos, cfg, kv_dim);
             cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores, .{
                 .logit_softcap = cfg.attn_logit_softcap,
+                .scale = cfg.attn_scale,
                 .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
             });
             scatterColumn(self.attn[0..], self.sa[0..q_dim], ch, 0);
@@ -884,6 +885,7 @@ pub const Engine = struct {
                     self.sa,
                     .{
                         .logit_softcap = cfg.attn_logit_softcap,
+                        .scale = cfg.attn_scale,
                         .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
                     },
                 );
@@ -1180,6 +1182,13 @@ pub const Engine = struct {
         // that produces the logits rather than on a single-kernel version of it.
         try self.runHead();
         for (0..hidden) |c| h32[c] = @floatCast(self.head_in[c]);
+        // Also dump what the head was fed, so "input wrong" and "head kernel wrong" can be
+        // told apart: a correct kernel on a wrong input reports BROKEN either way.
+        var nrm: f64 = 0;
+        for (self.head_in[0..hidden]) |v| nrm += @as(f64, @floatCast(v)) * @as(f64, @floatCast(v));
+        sys.print("    head input: |x| = {d:.4}, x[0..3] = {e:.4} {e:.4} {e:.4}\n", .{
+            @sqrt(nrm), self.head_in[0], self.head_in[1], self.head_in[2],
+        });
         cpu.matmulF16(ref, self.head, h32[0..hidden], cfg.vocab, hidden);
         // `self.logits` has the architecture's final soft-cap applied; the reference must
         // get the same treatment or the comparison is meaningless. Without this,

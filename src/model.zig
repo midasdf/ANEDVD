@@ -71,6 +71,12 @@ pub const Config = struct {
     /// here uses SiLU. The two are far apart (at x = -3 they differ 40x), and picking
     /// wrongly keeps the text fluent while making every FFN output wrong.
     use_gelu: bool = false,
+    /// Explicit attention scale (1/sqrt(x)), overriding the usual 1/sqrt(head_dim).
+    ///
+    /// Gemma 2 sets `f_attention_scale = 1/sqrt(n_embd / n_head)` for every size except
+    /// 27B, and n_embd/n_head is NOT head_dim for gemma-2-2b (2304/8 = 288 against a
+    /// key length of 256), so the two formulas differ by 6%.
+    attn_scale: f32 = 0,
     /// True when the model "sandwiches" each sublayer between two more norms
     /// (Gemma 2): the attention output and the MLP output are both normalised before
     /// they join the residual.

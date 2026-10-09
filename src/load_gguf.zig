@@ -108,6 +108,11 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
         // Gemma 2 adds logit soft-capping and alternating sliding-window attention.
         // Both are read from the file, not assumed.
         cfg.use_gelu = true; // gemma 2: hidden_activation = "gelu_pytorch_tanh"
+        // gemma2 uses 1/sqrt(n_embd/n_head) (llama.cpp: f_attention_scale), which is not
+        // 1/sqrt(head_dim) when key_length differs from n_embd/n_head.
+        if (std.mem.eql(u8, arch, "gemma2") and cfg.heads > 0) {
+            cfg.attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden)) / @as(f32, @floatFromInt(cfg.heads)));
+        }
         cfg.attn_logit_softcap = g.getF32(key(&buf, arch, "attn_logit_softcapping")) orelse 0;
         cfg.final_logit_softcap = g.getF32(key(&buf, arch, "final_logit_softcapping")) orelse 0;
         cfg.sliding_window = g.getU32(key(&buf, arch, "attention.sliding_window")) orelse 0;

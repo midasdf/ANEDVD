@@ -364,6 +364,7 @@ fn refForward(
         }
         cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, scores, .{
             .logit_softcap = cfg.attn_logit_softcap,
+            .scale = cfg.attn_scale,
             .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
         });
         matmulF16(proj, lw.o, attn, hidden, q_dim);

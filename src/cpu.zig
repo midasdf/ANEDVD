@@ -183,7 +183,7 @@ pub fn attentionPrefill(
     const hd: usize = head_dim;
     const kv_dim: usize = @as(usize, n_kv_heads) * hd;
     const group = n_heads / n_kv_heads;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale = if (opts.scale > 0) opts.scale else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     std.debug.assert(scores.len >= n_past);
     std.debug.assert(query_scratch.len >= hd and out_scratch.len >= hd);
 
@@ -299,6 +299,9 @@ pub const AttnOpts = struct {
     /// Gemma 2 caps attention logits as `softcap * tanh(x / softcap)` before softmax;
     /// 0 disables. Confirmed against the reference.
     logit_softcap: f32 = 0,
+    /// Override for the 1/sqrt(head_dim) scale; 0 keeps the default. Gemma 2 needs
+    /// 1/sqrt(n_embd/n_head), which differs when key_length != n_embd/n_head.
+    scale: f32 = 0,
     /// Attend only to the last `window` positions (Gemma 2's odd layers). 0 = global.
     window: u32 = 0,
 };
@@ -332,7 +335,7 @@ pub fn attentionDecode(
     const hd: usize = head_dim;
     const kv_dim: usize = @as(usize, n_kv_heads) * hd;
     const group = n_heads / n_kv_heads;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale = if (opts.scale > 0) opts.scale else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     std.debug.assert(scores_scratch.len >= n_past);
     // Gemma 2's odd layers see only the last `window` positions.
