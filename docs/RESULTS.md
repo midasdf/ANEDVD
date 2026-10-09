@@ -673,3 +673,19 @@ rather than an error:
       EOS as its first token. A cold request returns `finish_reason: "stop"` with empty
       content, and so does the CLI (`stop: stop`, 0 tokens), so this is the model, not a
       cache or API fault.
+23. **Coverage added for guards and rules that only had comments.** Three paths were correct
+    but untested, so nothing would have stopped a refactor from breaking them:
+
+    * `TooManyTensors` / `TooManyMetadataEntries` — the guards that stop a crafted GGUF
+      claiming billions of entries from being honoured. Confirmed the test fails when both
+      are deleted (113 passed / 1 failed).
+    * `parseAtLeast` — the argument minimum rule, reachable now that `main.zig` is in the
+      test root. That module was the only one missing from `src/tests.zig`, so none of the
+      CLI was analysed by the test build.
+    * The MoE width derivation — `moe_inter` from `ffn_gate_exps` dims[1] and `num_experts`
+      from dims[2], not from metadata. Confirmed the test fails when the derivation is
+      replaced with the metadata default the code's own comment warns against
+      (115 passed / 1 failed).
+
+    Tests: 113 → 116. `main.zig`, `load_gguf.zig` and `gguf.zig` gained their first
+    coverage of these paths.
