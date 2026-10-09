@@ -390,10 +390,11 @@ fn refForward(
                     moe.inter,
                     hidden,
                     p,
+                    cfg.use_gelu,
                 );
             }
             if (moe.shared_inter > 0) {
-                cpu.mlpForward(shared_out, gate, h, moe.shared_gate, moe.shared_up, moe.shared_down, moe.shared_inter, hidden);
+                cpu.mlpForward(shared_out, gate, h, moe.shared_gate, moe.shared_up, moe.shared_down, moe.shared_inter, hidden, cfg.use_gelu);
                 // sigmoid(shared_gate_lin . h) scales the shared expert's output.
                 var g: f32 = 0;
                 for (moe.shared_gate_lin, h) |w, xv| g += @as(f32, @floatCast(w)) * xv;
@@ -404,7 +405,7 @@ fn refForward(
         } else {
             matmulF16(gate, lw.gate, h, inter, hidden);
             matmulF16(up, lw.up, h, inter, hidden);
-            cpu.siluMul(act, gate, up);
+            cpu.gateMul(act, gate, up, cfg.use_gelu);
             matmulF16(proj, lw.down, act, hidden, inter);
             cpu.addInPlace(x, proj);
         }

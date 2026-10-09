@@ -69,6 +69,29 @@ pub fn siluMul(out: []f32, gate: []const f32, up: []const f32) void {
     }
 }
 
+/// GELU with the tanh approximation, the form Gemma 2 uses
+/// (`hidden_activation = "gelu_pytorch_tanh"`):
+///   `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`
+///
+/// Not an interchangeable detail with SiLU: at x = -3 the two differ by 40x, so using
+/// the wrong one makes every Gemma FFN output wrong while the text stays fluent.
+pub fn geluTanh(x: f32) f32 {
+    const c = 0.7978845608028654; // sqrt(2/pi)
+    return 0.5 * x * (1.0 + std.math.tanh(c * (x + 0.044715 * x * x * x)));
+}
+
+/// `gelu(gate) * up`, the Gemma 2 SwiGLU equivalent.
+pub fn geluMul(out: []f32, gate: []const f32, up: []const f32) void {
+    for (out, gate, up) |*o, g, u| o.* = geluTanh(g) * u;
+}
+
+/// `silu(gate) * up` when `use_gelu` is true, else the SiLU form. One branch keeps the
+/// architecture difference out of every call site.
+pub fn gateMul(out: []f32, gate: []const f32, up: []const f32, use_gelu: bool) void {
+    if (use_gelu) return geluMul(out, gate, up);
+    return siluMul(out, gate, up);
+}
+
 pub fn addInPlace(dst: []f32, src: []const f32) void {
     for (dst, src) |*d, s| d.* += s;
 }
@@ -398,6 +421,7 @@ pub fn moeExpertAccumF32(
     inter: usize,
     hidden: usize,
     weight: f32,
+    use_gelu: bool,
 ) void {
     std.debug.assert(out.len >= hidden and hidden_scratch.len >= inter);
     matmulF32(hidden_scratch[0..inter], gate, h, inter, hidden);
@@ -406,7 +430,7 @@ pub fn moeExpertAccumF32(
     while (i < inter) : (i += 1) {
         const g = hidden_scratch[i];
         const u = inter_scratch[i];
-        inter_scratch[i] = (g / (1.0 + @exp(-g))) * u;
+        inter_scratch[i] = (if (use_gelu) geluTanh(g) else g / (1.0 + @exp(-g))) * u;
     }
     var o: usize = 0;
     while (o < hidden) : (o += 1) {
@@ -1087,6 +1111,7 @@ pub fn moeExpertAccum(
     inter: usize,
     hidden: usize,
     weight: f32,
+    use_gelu: bool,
 ) void {
     std.debug.assert(out.len >= hidden and hidden_scratch.len >= inter);
     // gate and up are both [inter][hidden] projections of the same input, so use the
@@ -1101,7 +1126,7 @@ pub fn moeExpertAccum(
     while (i < inter) : (i += 1) {
         const g = hidden_scratch[i];
         const u = inter_scratch[i];
-        const s = g / (1.0 + @exp(-g));
+        const s = if (use_gelu) geluTanh(g) else g / (1.0 + @exp(-g));
         inter_scratch[i] = s * u;
     }
     // out += weight * (down @ act)
@@ -1132,6 +1157,7 @@ pub fn mlpForward(
     down: []const f16,
     inter: usize,
     hidden: usize,
+    use_gelu: bool,
 ) void {
     matmulF16(gate_scratch[0..inter], gate, h, inter, hidden);
     var i: usize = 0;
@@ -1140,7 +1166,7 @@ pub fn mlpForward(
         var acc: f32 = 0;
         const row = up[i * hidden ..][0..hidden];
         for (row, h) |w, x| acc += @as(f32, @floatCast(w)) * x;
-        const s = g / (1.0 + @exp(-g));
+        const s = if (use_gelu) geluTanh(g) else g / (1.0 + @exp(-g));
         gate_scratch[i] = s * acc;
     }
     var o: usize = 0;
@@ -1315,11 +1341,11 @@ test "moeExpertAccum matches a hand-computed SwiGLU expert" {
     var out = [_]f32{ 0, 0, 0, 0 };
     var gs: [inter]f32 = undefined;
     var is: [inter]f32 = undefined;
-    moeExpertAccum(&out, &gs, &is, &h, &gate, &up, &down, inter, hidden, 1.0);
+    moeExpertAccum(&out, &gs, &is, &h, &gate, &up, &down, inter, hidden, 1.0, false);
     for (want, out) |w, got| try std.testing.expectApproxEqAbs(w, got, 1e-5);
 
     // The weight scales the contribution, and a second call accumulates.
-    moeExpertAccum(&out, &gs, &is, &h, &gate, &up, &down, inter, hidden, 2.0);
+    moeExpertAccum(&out, &gs, &is, &h, &gate, &up, &down, inter, hidden, 2.0, false);
     for (want, out) |w, got| try std.testing.expectApproxEqAbs(3.0 * w, got, 1e-5);
 }
 
@@ -1365,4 +1391,21 @@ test "rmsnorm with a unit-offset weight matches the Gemma formula" {
     for (&w_off, w) |*o, wi| o.* = 1.0 + wi;
     rmsnorm(got, &x, &w_off, 1e-6);
     for (got, want) |g, e| try std.testing.expectApproxEqAbs(e, g, 1e-6);
+}
+
+test "geluTanh matches the tanh-approximation GELU definition" {
+    // Reference values computed from 0.5 * x * (1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))).
+    const cases = [_]struct { x: f32, want: f32 }{
+        .{ .x = 0.0, .want = 0.0 },
+        .{ .x = 1.0, .want = 0.84119199 },
+        .{ .x = -1.0, .want = -0.15880796 },
+        .{ .x = 3.0, .want = 2.99636241 },
+        .{ .x = -3.0, .want = -0.00363739 },
+        .{ .x = 0.5, .want = 0.34571400 },
+    };
+    for (cases) |c| {
+        try std.testing.expectApproxEqAbs(c.want, geluTanh(c.x), 1e-6);
+    }
+    // GELU is not SiLU, and the difference is large where it matters.
+    try std.testing.expect(@abs(geluTanh(-3.0) - (-3.0 / (1.0 + @exp(3.0)))) > 0.13);
 }

@@ -22,6 +22,9 @@ pub const supported_architectures: []const []const u8 = &.{
     "Qwen3MoeForCausalLM",
     "MistralForCausalLM",
     "SmolLM3ForCausalLM",
+    "GemmaForCausalLM",
+    "Gemma2ForCausalLM",
+    "Gemma3ForCausalLM",
 };
 
 /// `supported_architectures` rendered as a comma-separated list, at comptime.
@@ -43,6 +46,9 @@ const model_type_map = .{
     .{ "qwen3_moe", "Qwen3MoeForCausalLM" },
     .{ "mistral", "MistralForCausalLM" },
     .{ "smollm3", "SmolLM3ForCausalLM" },
+    .{ "gemma", "GemmaForCausalLM" },
+    .{ "gemma2", "Gemma2ForCausalLM" },
+    .{ "gemma3", "Gemma3ForCausalLM" },
 };
 
 pub const Error = error{
@@ -106,6 +112,13 @@ pub const Config = struct {
     decoder_sparse_step: u32,
     /// Layer indices that stay dense even though the model has experts.
     mlp_only_layers: u64,
+    /// Gemma 2: `softcap * tanh(x / softcap)` on attention logits and on the final
+    /// logits. 0 when absent, which disables the cap.
+    attn_logit_softcapping: f32,
+    final_logit_softcapping: f32,
+    /// Gemma 2: sliding-window size, and the per-layer type list it alternates with.
+    sliding_window: u32,
+    sliding_window_size: u32,
 
     /// Frees `arch`. All other fields are value types.
     pub fn deinit(self: *Config, allocator: Allocator) void {
@@ -196,6 +209,10 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
         .norm_topk_prob = getBool(obj, &.{"norm_topk_prob"}) orelse false,
         .decoder_sparse_step = getU32(obj, &.{"decoder_sparse_step"}) orelse 1,
         .mlp_only_layers = getLayerMask(obj, "mlp_only_layers"),
+        .attn_logit_softcapping = getF32(obj, &.{"attn_logit_softcapping"}) orelse 0,
+        .final_logit_softcapping = getF32(obj, &.{"final_logit_softcapping"}) orelse 0,
+        .sliding_window = getU32(obj, &.{"sliding_window"}) orelse 0,
+        .sliding_window_size = getU32(obj, &.{"sliding_window_size"}) orelse 0,
     };
 }
 

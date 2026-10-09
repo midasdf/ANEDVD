@@ -65,6 +65,12 @@ pub const Config = struct {
     /// and layer 1 is global. Getting this backwards produces real words in the wrong
     /// order rather than obvious garbage.
     swa_pattern: u32 = 2,
+    /// True when the FFN uses `gelu(gate) * up` rather than `silu(gate) * up`.
+    ///
+    /// Gemma 2 sets `hidden_activation = "gelu_pytorch_tanh"`; every other architecture
+    /// here uses SiLU. The two are far apart (at x = -3 they differ 40x), and picking
+    /// wrongly keeps the text fluent while making every FFN output wrong.
+    use_gelu: bool = false,
     /// True when the model "sandwiches" each sublayer between two more norms
     /// (Gemma 2): the attention output and the MLP output are both normalised before
     /// they join the residual.

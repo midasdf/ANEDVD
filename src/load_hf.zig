@@ -74,7 +74,12 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         return Error.UnsupportedArchitecture;
     }
     return .{
-        .arch = if (std.mem.startsWith(u8, c.arch, "Qwen")) "qwen2" else "llama",
+        .arch = if (std.mem.startsWith(u8, c.arch, "Qwen"))
+            "qwen2"
+        else if (std.mem.startsWith(u8, c.arch, "Gemma"))
+            "gemma2"
+        else
+            "llama",
         .hidden = c.hidden_size,
         .layers = c.num_hidden_layers,
         .heads = c.num_attention_heads,
@@ -94,6 +99,16 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         .norm_topk_prob = c.norm_topk_prob,
         .sparse_step = c.decoder_sparse_step,
         .mlp_only_mask = c.mlp_only_layers,
+        .norm_unit_offset = std.mem.startsWith(u8, c.arch, "Gemma"),
+        .embed_scale = if (std.mem.startsWith(u8, c.arch, "Gemma"))
+            @sqrt(@as(f32, @floatFromInt(c.hidden_size)))
+        else
+            1.0,
+        .use_gelu = std.mem.startsWith(u8, c.arch, "Gemma"),
+        // Gemma 2's caps and window come from the config, like the GGUF metadata.
+        .attn_logit_softcap = c.attn_logit_softcapping,
+        .final_logit_softcap = c.final_logit_softcapping,
+        .sliding_window = if (c.sliding_window > 0) c.sliding_window else c.sliding_window_size,
     };
 }
 

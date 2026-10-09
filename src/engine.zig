@@ -499,7 +499,7 @@ pub const Engine = struct {
                     gate[c] = @floatCast(self.dec_out[c]);
                     up[c] = @floatCast(self.dec_out[inter + c]);
                 }
-                cpu.siluMul(self.sa[0..inter], gate, up);
+                cpu.gateMul(self.sa[0..inter], gate, up, cfg.use_gelu);
                 for (0..inter) |c| self.dec_in[c] = @floatCast(self.sa[c]);
                 const dk = &k.down.?;
                 try dk.writeInputColumnF16(0, 0, self.dec_in[0..inter]);
@@ -595,6 +595,7 @@ pub const Engine = struct {
                             moe.inter,
                             hidden,
                             p,
+                            cfg.use_gelu,
                         );
                     } else {
                         const g_w = moe.loadExpert(e, 0, moe.expert_scratch);
@@ -611,6 +612,7 @@ pub const Engine = struct {
                             moe.inter,
                             hidden,
                             p,
+                            cfg.use_gelu,
                         );
                     }
                 }
@@ -848,7 +850,7 @@ pub const Engine = struct {
                             gate[c] = @floatCast(self.out16[c * ch + j]);
                             up[c] = @floatCast(self.out16[(inter + c) * ch + j]);
                         }
-                        cpu.siluMul(self.sa[0..inter], gate, up);
+                        cpu.gateMul(self.sa[0..inter], gate, up, cfg.use_gelu);
                         for (0..inter) |c| self.in16[c * ch + j] = @floatCast(self.sa[c]);
                     }
                     const dk = &k.down.?;
@@ -941,6 +943,7 @@ pub const Engine = struct {
                                     moe.inter,
                                     hd,
                                     w,
+                                    cfg.use_gelu,
                                 );
                             }
                         } else {
@@ -962,6 +965,7 @@ pub const Engine = struct {
                                     moe.inter,
                                     hd,
                                     w,
+                                    cfg.use_gelu,
                                 );
                             }
                         }
