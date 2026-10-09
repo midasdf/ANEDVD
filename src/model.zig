@@ -63,6 +63,10 @@ pub const Config = struct {
     /// Gemma 2 alternates: even layers attend globally, odd layers only within the
     /// window (llama.cpp's gemma2 pattern).
     swa_pattern: u32 = 2,
+    /// True when the model "sandwiches" each sublayer between two more norms
+    /// (Gemma 2): the attention output and the MLP output are both normalised before
+    /// they join the residual.
+    sandwich_norms: bool = false,
 
     /// True when this layer attends within the sliding window rather than globally.
     pub fn layerIsSliding(self: Config, layer: u32) bool {
@@ -141,6 +145,9 @@ pub const Matrices = struct {
 pub const Norm = struct {
     attn: []f32 = &.{},
     ffn: []f32 = &.{},
+    /// Gemma 2's sandwich norms; empty for every other architecture.
+    post_attn: []f32 = &.{},
+    post_ffw: []f32 = &.{},
     /// Attention biases (Qwen2 and friends); applied on the CPU after the ANE
     /// projection, so they must outlive the matrices.
     qkv_bias: ?[]f32 = null,
@@ -149,6 +156,9 @@ pub const Norm = struct {
     /// before RoPE.
     q_norm: ?[]f32 = null,
     k_norm: ?[]f32 = null,
+    /// Gemma 2's sandwich norms: [hidden] each, null when the model has none.
+    post_attn_norm: ?[]f32 = null,
+    post_ffw_norm: ?[]f32 = null,
 };
 
 /// Everything the engine needs at run time: the token embedding, the final
@@ -395,6 +405,9 @@ pub const LayerWeights = struct {
     /// loaded here too.
     q_norm: ?[]f32 = null,
     k_norm: ?[]f32 = null,
+    /// Gemma 2's sandwich norms: [hidden] each, null when the model has none.
+    post_attn_norm: ?[]f32 = null,
+    post_ffw_norm: ?[]f32 = null,
     /// [(q + k + v) dims][hidden]
     qkv: []f16 = &.{},
     /// [hidden][q_dim]
@@ -442,11 +455,15 @@ pub const LayerWeights = struct {
             .ffn = self.ffn_norm,
             .q_norm = self.q_norm,
             .k_norm = self.k_norm,
+            .post_attn = self.post_attn_norm orelse &.{},
+            .post_ffw = self.post_ffw_norm orelse &.{},
         };
         self.attn_norm = &.{};
         self.ffn_norm = &.{};
         self.q_norm = null;
         self.k_norm = null;
+        self.post_attn_norm = null;
+        self.post_ffw_norm = null;
         return n;
     }
 
@@ -511,6 +528,8 @@ pub const ModelWeights = struct {
             if (lw.o_bias) |b| out.layers[i].o_bias = try allocator.dupe(f32, b);
             if (lw.q_norm) |b| out.layers[i].q_norm = try allocator.dupe(f32, b);
             if (lw.k_norm) |b| out.layers[i].k_norm = try allocator.dupe(f32, b);
+            if (lw.post_attn_norm) |b| out.layers[i].post_attn_norm = try allocator.dupe(f32, b);
+            if (lw.post_ffw_norm) |b| out.layers[i].post_ffw_norm = try allocator.dupe(f32, b);
         }
         return out;
     }

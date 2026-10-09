@@ -151,6 +151,9 @@ pub const Engine = struct {
     dec_out: []f16,
     /// Width-1 staging for the lm-head kernel.
     head_in: []f16,
+    /// Scratch for Gemma 2's sandwich norms. Always allocated: it is used on dense
+    /// models, where `moe_hidden` (MoE-only, empty) would be an empty slice.
+    sandwich: []f32 = &.{},
     /// The head kernel's output: [vocab], read back once per prefill and per token.
     /// Separate from `out16` because that is sized `stage * chunk` for activations and
     /// multiplying the vocabulary into it wasted 78 MB.
@@ -215,6 +218,7 @@ pub const Engine = struct {
         if (self.moe_idx.len > 0) self.allocator.free(self.moe_idx);
         if (self.moe_out.len > 0) self.allocator.free(self.moe_out);
         if (self.moe_hidden.len > 0) self.allocator.free(self.moe_hidden);
+        if (self.sandwich.len > 0) self.allocator.free(self.sandwich);
         if (self.moe_chunk_idx.len > 0) self.allocator.free(self.moe_chunk_idx);
         if (self.moe_expert_scratch_f32_alt.len > 0) self.allocator.free(self.moe_expert_scratch_f32_alt);
         if (self.moe_chunk_probs.len > 0) self.allocator.free(self.moe_chunk_probs);
@@ -272,6 +276,7 @@ pub const Engine = struct {
         self.moe_idx = &.{};
         self.moe_out = &.{};
         self.moe_hidden = &.{};
+        self.sandwich = &.{};
         self.moe_chunk_idx = &.{};
         self.moe_expert_scratch_f32_alt = &.{};
         self.moe_chunk_probs = &.{};
@@ -373,6 +378,7 @@ pub const Engine = struct {
         self.dec_in = try allocator.alloc(f16, stage);
         self.dec_out = try allocator.alloc(f16, stage);
         self.head_in = try allocator.alloc(f16, cfg.hidden);
+        self.sandwich = try allocator.alloc(f32, cfg.hidden);
         self.head_out = try allocator.alloc(f16, cfg.vocab);
         const vec = @max(cfg.qDim(), @max(cfg.kvDim(), cfg.inter));
         self.sq = try allocator.alloc(f32, vec);
@@ -466,8 +472,13 @@ pub const Engine = struct {
             for (0..hidden) |c| {
                 var v = @as(f32, @floatCast(self.dec_out[c]));
                 if (norm.o_bias) |b| v += b[c];
-                self.x[c * ch] += v;
+                self.sandwich[c] = v;
             }
+            // Gemma 2 normalises the attention output before it joins the residual.
+            if (norm.post_attn.len == hidden) {
+                rmsnormFlat(self.sandwich[0..hidden], norm.post_attn, cfg.eps);
+            }
+            for (0..hidden) |c| self.x[c * ch] += self.sandwich[c];
 
             // ---- feed-forward on ANE ----
             rmsnormColumn(self.dec_in[0..hidden], self.x, norm.ffn, cfg.eps, ch);
@@ -524,8 +535,13 @@ pub const Engine = struct {
             } else {
                 for (0..hidden) |c| {
                     const v: f32 = @floatCast(self.dec_out[c]);
-                    self.x[c * ch] += v;
+                    self.sandwich[c] = v;
                 }
+                // Gemma 2 normalises the MLP output before it joins the residual.
+                if (norm.post_ffw.len == hidden) {
+                    rmsnormFlat(self.sandwich[0..hidden], norm.post_ffw, cfg.eps);
+                }
+                for (0..hidden) |c| self.x[c * ch] += self.sandwich[c];
             }
 
             // ---- routed experts (MoE), on the CPU ----
@@ -644,6 +660,17 @@ pub const Engine = struct {
             if (idx[col * topk + s] == expert) return probs[col * topk + s];
         }
         return 0;
+    }
+
+    /// RMSNorm over a flat f32 vector, in place. Used for Gemma 2's sandwich norms, where
+    /// the value to normalise is a plain activation column rather than a strided chunk.
+    fn rmsnormFlat(v: []f32, weight: []const f32, eps: f32) void {
+        const n = weight.len;
+        std.debug.assert(v.len >= n);
+        var acc: f32 = 0;
+        for (v[0..n]) |x| acc += x * x;
+        const inv = 1.0 / @sqrt(acc / @as(f32, @floatFromInt(n)) + eps);
+        for (v[0..n], weight) |*x, w| x.* = x.* * inv * w;
     }
 
     /// RMSNorm applied per attention head (Qwen3's q_norm/k_norm), before RoPE.
@@ -783,8 +810,13 @@ pub const Engine = struct {
                     for (0..hidden) |c| {
                         var v = @as(f32, @floatCast(self.out16[c * ch + j]));
                         if (norm.o_bias) |b| v += b[c];
-                        self.x[c * ch + j] += v;
+                        self.sandwich[c] = v;
                     }
+                    // Gemma 2 normalises each column's attention output before the residual.
+                    if (norm.post_attn.len == hidden) {
+                        rmsnormFlat(self.sandwich[0..hidden], norm.post_attn, cfg.eps);
+                    }
+                    for (0..hidden) |c| self.x[c * ch + j] += self.sandwich[c];
                 }
 
                 // ---- feed-forward ----
@@ -940,7 +972,15 @@ pub const Engine = struct {
                     self.stats.moe_ns += sys.nowNs() - t_moe;
                 } else {
                     for (0..n) |j| {
-                        for (0..hidden) |c| self.x[c * ch + j] += @floatCast(self.out16[c * ch + j]);
+                        for (0..hidden) |c| {
+                            const v: f32 = @floatCast(self.out16[c * ch + j]);
+                            self.sandwich[c] = v;
+                        }
+                        // Gemma 2 normalises each column's MLP output before the residual.
+                        if (norm.post_ffw.len == hidden) {
+                            rmsnormFlat(self.sandwich[0..hidden], norm.post_ffw, cfg.eps);
+                        }
+                        for (0..hidden) |c| self.x[c * ch + j] += self.sandwich[c];
                     }
                 }
             }

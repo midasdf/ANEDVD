@@ -101,12 +101,19 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     // against the reference implementation rather than guessed.
     if (std.mem.startsWith(u8, arch, "gemma")) {
         cfg.norm_unit_offset = true;
+        // The GGUF stores UNSCALED embedding weights (measured: mean|w| ~ 1e-5 on
+        // gemma-2-2b, where the HF standard deviation is ~0.01 and a baked-in
+        // sqrt(2304) would give ~0.5), so the scale must be applied here.
         cfg.embed_scale = @sqrt(@as(f32, @floatFromInt(cfg.hidden)));
         // Gemma 2 adds logit soft-capping and alternating sliding-window attention.
         // Both are read from the file, not assumed.
         cfg.attn_logit_softcap = g.getF32(key(&buf, arch, "attn_logit_softcapping")) orelse 0;
         cfg.final_logit_softcap = g.getF32(key(&buf, arch, "final_logit_softcapping")) orelse 0;
         cfg.sliding_window = g.getU32(key(&buf, arch, "attention.sliding_window")) orelse 0;
+        // gemma2 and later sandwich each sublayer between two more norms.
+        if (g.tensor(std.fmt.bufPrint(&buf, "blk.0.post_attention_norm.weight", .{}) catch unreachable) != null) {
+            cfg.sandwich_norms = true;
+        }
     }
 
     // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /
@@ -256,6 +263,10 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         }
         lw.attn_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
         lw.ffn_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+        if (cfg.sandwich_norms) {
+            lw.post_attn_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_attention_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+            lw.post_ffw_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_ffw_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+        }
 
         const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{li}) catch unreachable, cfg.hidden, cfg.qDim());
         defer allocator.free(q);
@@ -339,6 +350,10 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
     for (rt.norms, 0..) |*n, i| {
         const li: u32 = @intCast(i);
         n.attn = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+        if (cfg.sandwich_norms) {
+            n.post_attn = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_attention_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+            n.post_ffw = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_ffw_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+        }
         n.ffn = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable) != null) {
             const bq = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable);

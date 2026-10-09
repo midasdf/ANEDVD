@@ -269,6 +269,28 @@ pub fn formatChatFor(
     // put their markers in the vocabulary), so this is selected from the GGUF
     // `tokenizer.chat_template` text, not by tokenId lookup.
     const zephyr = !chatml and std.mem.indexOf(u8, tok.chat_template, "<|user|>") != null;
+    // Gemma: <start_of_turn>user ... <end_of_turn> <start_of_turn>model. Selected from
+    // the metadata like the others; without it Gemma falls back to "User:/Assistant:",
+    // which it was never trained on.
+    const gemma = !chatml and !zephyr and std.mem.indexOf(u8, tok.chat_template, "<start_of_turn>") != null;
+
+    if (gemma) {
+        if (default_system) |sys_text| {
+            try out.appendSlice(allocator, "<start_of_turn>user\n");
+            try out.appendSlice(allocator, sys_text);
+            try out.appendSlice(allocator, "<end_of_turn>\n");
+        }
+        for (messages) |m| {
+            const role = if (m.role == .assistant) "model" else "user";
+            try out.appendSlice(allocator, "<start_of_turn>");
+            try out.appendSlice(allocator, role);
+            try out.appendSlice(allocator, "\n");
+            try out.appendSlice(allocator, m.content);
+            try out.appendSlice(allocator, "<end_of_turn>\n");
+        }
+        try out.appendSlice(allocator, "<start_of_turn>model\n");
+        return out.toOwnedSlice(allocator);
+    }
 
     if (zephyr) {
         // The template uses the EOS *piece text* as the separator; emitting the
