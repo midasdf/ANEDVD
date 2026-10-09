@@ -53,6 +53,22 @@ pub const Config = struct {
     /// Gemma scales the embedding by `sqrt(hidden_size)` on the way in
     /// (`GemmaTextScaledWordEmbedding`). 1.0 for every other architecture.
     embed_scale: f32 = 1.0,
+    /// Gemma 2 caps attention logits as `softcap * tanh(x / softcap)` before softmax;
+    /// 0 disables. Confirmed against Gemma2Attention.
+    attn_logit_softcap: f32 = 0,
+    /// The same cap applied to the final logits; 0 disables.
+    final_logit_softcap: f32 = 0,
+    /// Sliding-window size for the layers that use it; 0 disables windowing.
+    sliding_window: u32 = 0,
+    /// Gemma 2 alternates: even layers attend globally, odd layers only within the
+    /// window (llama.cpp's gemma2 pattern).
+    swa_pattern: u32 = 2,
+
+    /// True when this layer attends within the sliding window rather than globally.
+    pub fn layerIsSliding(self: Config, layer: u32) bool {
+        if (self.sliding_window == 0 or self.swa_pattern == 0) return false;
+        return layer % self.swa_pattern != 0;
+    }
 
     /// True when this layer runs the sparse block rather than a dense MLP.
     pub fn layerIsSparse(self: Config, layer: u32) bool {

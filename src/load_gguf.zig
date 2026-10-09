@@ -102,6 +102,11 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     if (std.mem.startsWith(u8, arch, "gemma")) {
         cfg.norm_unit_offset = true;
         cfg.embed_scale = @sqrt(@as(f32, @floatFromInt(cfg.hidden)));
+        // Gemma 2 adds logit soft-capping and alternating sliding-window attention.
+        // Both are read from the file, not assumed.
+        cfg.attn_logit_softcap = g.getF32(key(&buf, arch, "attn_logit_softcapping")) orelse 0;
+        cfg.final_logit_softcap = g.getF32(key(&buf, arch, "final_logit_softcapping")) orelse 0;
+        cfg.sliding_window = g.getU32(key(&buf, arch, "attention.sliding_window")) orelse 0;
     }
 
     // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /

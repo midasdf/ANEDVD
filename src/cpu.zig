@@ -155,6 +155,7 @@ pub fn attentionPrefill(
     scores: []f32,
     query_scratch: []f32,
     out_scratch: []f32,
+    opts: AttnOpts,
 ) void {
     const hd: usize = head_dim;
     const kv_dim: usize = @as(usize, n_kv_heads) * hd;
@@ -173,9 +174,13 @@ pub fn attentionPrefill(
             for (0..hd) |d| query_scratch[d] = q[base + d * chan_stride];
             const q_h = query_scratch[0..hd];
             const sc = scores[0..visible];
-            for (0..visible) |t| {
+            // Gemma 2's odd layers attend only within the window; positions outside it
+            // must be masked or the softmax mixes in unrelated keys.
+            const first = attentionStart(visible, opts.window);
+            for (0..first) |t| sc[t] = -std.math.inf(f32);
+            for (first..visible) |t| {
                 const k_t = k_cache[t * kv_dim + kvh * hd ..][0..hd];
-                sc[t] = dotF32F16(q_h, k_t) * scale;
+                sc[t] = softcapLogit(dotF32F16(q_h, k_t) * scale, opts.logit_softcap);
             }
             softmax(sc);
             @memset(out_scratch[0..hd], 0);
@@ -265,6 +270,30 @@ fn expApproxVec(x: F32x) F32x {
 ///   out   : [n_heads * head_dim]
 ///
 /// GQA: query head h reads KV head h / (n_heads / n_kv_heads).
+/// Attention knobs that differ per architecture; the zero value gives plain
+/// Llama/Qwen behaviour, so dense models pass `.{}.`
+pub const AttnOpts = struct {
+    /// Gemma 2 caps attention logits as `softcap * tanh(x / softcap)` before softmax;
+    /// 0 disables. Confirmed against the reference.
+    logit_softcap: f32 = 0,
+    /// Attend only to the last `window` positions (Gemma 2's odd layers). 0 = global.
+    window: u32 = 0,
+};
+
+/// `softcap * tanh(x / softcap)`, the Gemma 2 logit cap.
+fn softcapLogit(x: f32, softcap: f32) f32 {
+    if (softcap <= 0) return x;
+    return softcap * std.math.tanh(x / softcap);
+}
+
+/// The first cache position a query of `visible` keys may attend to, given a window.
+pub fn attentionStart(visible: usize, window: u32) usize {
+    if (window == 0) return 0;
+    const w: usize = window;
+    if (visible <= w) return 0;
+    return visible - w;
+}
+
 pub fn attentionDecode(
     out: []f32,
     q: []const f32,
@@ -275,6 +304,7 @@ pub fn attentionDecode(
     n_kv_heads: u32,
     head_dim: u32,
     scores_scratch: []f32,
+    opts: AttnOpts,
 ) void {
     const hd: usize = head_dim;
     const kv_dim: usize = @as(usize, n_kv_heads) * hd;
@@ -282,14 +312,17 @@ pub fn attentionDecode(
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     std.debug.assert(scores_scratch.len >= n_past);
+    // Gemma 2's odd layers see only the last `window` positions.
+    const first = attentionStart(n_past, opts.window);
 
     for (0..n_heads) |h| {
         const kvh = h / group;
         const q_h = q[h * hd ..][0..hd];
         const scores = scores_scratch[0..n_past];
-        for (0..n_past) |t| {
+        for (0..first) |t| scores[t] = -std.math.inf(f32);
+        for (first..n_past) |t| {
             const k_t = k_cache[t * kv_dim + kvh * hd ..][0..hd];
-            scores[t] = dotF32F16(q_h, k_t) * scale;
+            scores[t] = softcapLogit(dotF32F16(q_h, k_t) * scale, opts.logit_softcap);
         }
         softmax(scores);
         const o_h = out[h * hd ..][0..hd];
@@ -738,8 +771,8 @@ test "attentionPrefill matches attentionDecode for a single query" {
     var os: [heads * hd]f32 = undefined;
     // Query at position 2 sees all three cached entries. One column, so the
     // channel-major buffer is just [channel * 1 + 0] = plain channel order.
-    attentionDecode(&a, &q, &k, &v, 3, heads, kv_heads, hd, &scratch);
-    attentionPrefill(&b, &q, 1, 1, &k, &v, n_past, 1, 2, heads, kv_heads, hd, &scratch, &qs, &os);
+    attentionDecode(&a, &q, &k, &v, 3, heads, kv_heads, hd, &scratch, .{});
+    attentionPrefill(&b, &q, 1, 1, &k, &v, n_past, 1, 2, heads, kv_heads, hd, &scratch, &qs, &os, .{});
     for (a, b) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
 }
 
@@ -816,7 +849,7 @@ test "attentionDecode fast paths match a brute-force reference" {
         for (k) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
         for (v) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
 
-        attentionDecode(got, q, k, v, n_past, heads, kv_heads, head_dim, scratch);
+        attentionDecode(got, q, k, v, n_past, heads, kv_heads, head_dim, scratch, .{});
         @memset(want, 0);
         attentionDecodeReference(want[0 .. @as(usize, heads) * hd], q, k, v, n_past, heads, kv_heads, head_dim);
         for (0..@as(usize, heads) * hd) |i| {
@@ -865,11 +898,11 @@ test "attentionPrefill fast paths match attentionDecode" {
         for (k) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
         for (v) |*x| x.* = @floatCast(rand.float(f32) * 2 - 1);
 
-        attentionPrefill(batched, q, chunk, 1, k, v, n_past, n_q, 0, heads, kv_heads, head_dim, scores, qs, os);
+        attentionPrefill(batched, q, chunk, 1, k, v, n_past, n_q, 0, heads, kv_heads, head_dim, scores, qs, os, .{});
         // Every query must equal the single-token path at the same position.
         for (0..n_q) |qi| {
             for (0..q_dim) |c| one[c] = q[c * chunk + qi];
-            attentionDecode(want, one, k, v, qi + 1, heads, kv_heads, head_dim, scores);
+            attentionDecode(want, one, k, v, qi + 1, heads, kv_heads, head_dim, scores, .{});
             for (0..q_dim) |c| {
                 try std.testing.expectApproxEqAbs(want[c], batched[c * chunk + qi], 1e-3);
             }
@@ -891,7 +924,7 @@ test "attentionPrefill honours the causal mask" {
     var scratch: [4]f32 = undefined;
     var qs: [2]f32 = undefined;
     var os: [2]f32 = undefined;
-    attentionPrefill(&out, &q, 2, 1, &k, &v, 2, 2, 0, heads, kv_heads, hd, &scratch, &qs, &os);
+    attentionPrefill(&out, &q, 2, 1, &k, &v, 2, 2, 0, heads, kv_heads, hd, &scratch, &qs, &os, .{});
     // Column 0 of the output (channel 0, column 0) sees only cache entry 0.
     try std.testing.expectApproxEqAbs(@as(f32, 10), out[0], 1e-3);
     // Column 1 sees both entries, so the mean of v (10 and 0) on channel 0.
@@ -914,7 +947,7 @@ test "attentionDecode single past position returns v" {
     const k = [_]f16{ 1, 0, 1, 0 };
     const v = [_]f16{ 0.5, 0.25, 0.125, 0.0625 };
     var scratch: [1]f32 = undefined;
-    attentionDecode(&out, &q, &k, &v, 1, 2, 2, 2, &scratch);
+    attentionDecode(&out, &q, &k, &v, 1, 2, 2, 2, &scratch, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.125), out[2], 1e-5);
 }

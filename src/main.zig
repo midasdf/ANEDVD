@@ -362,7 +362,10 @@ fn refForward(
             st.k[li][@as(usize, pos) * kv_dim + i] = @floatCast(kk[i]);
             st.v[li][@as(usize, pos) * kv_dim + i] = @floatCast(vv[i]);
         }
-        cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, scores);
+        cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, scores, .{
+            .logit_softcap = cfg.attn_logit_softcap,
+            .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
+        });
         matmulF16(proj, lw.o, attn, hidden, q_dim);
         if (lw.o_bias) |b| cpu.addInPlace(proj, b);
         cpu.addInPlace(x, proj);
@@ -410,6 +413,11 @@ fn refForward(
     cpu.rmsnorm(h, x, mw.final_norm, cfg.eps);
     const logits = try allocator.alloc(f32, cfg.vocab);
     matmulF16(logits, mw.headWeights(), h, cfg.vocab, hidden);
+    if (cfg.final_logit_softcap > 0) {
+        for (logits) |*l| {
+            l.* = cfg.final_logit_softcap * std.math.tanh(l.* / cfg.final_logit_softcap);
+        }
+    }
     return logits;
 }
 
@@ -1459,9 +1467,9 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
     }
 
     // Whole attention.
-    cpu.attentionDecode(out, q, k, v, ctx, heads, kv_heads, hd, scores);
+    cpu.attentionDecode(out, q, k, v, ctx, heads, kv_heads, hd, scores, .{});
     var t0 = sys.nowNs();
-    for (0..iters) |_| cpu.attentionDecode(out, q, k, v, ctx, heads, kv_heads, hd, scores);
+    for (0..iters) |_| cpu.attentionDecode(out, q, k, v, ctx, heads, kv_heads, hd, scores, .{});
     const full_ns = (sys.nowNs() - t0) / iters;
 
     // Dot products only (no softmax, no AV).
@@ -1521,11 +1529,11 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
         x.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0;
     }
 
-    cpu.attentionPrefill(out_buf, q_buf, n_q, 1, k, v, ctx, n_q, ctx - n_q, heads, kv_heads, hd, scores, qs, os_buf);
+    cpu.attentionPrefill(out_buf, q_buf, n_q, 1, k, v, ctx, n_q, ctx - n_q, heads, kv_heads, hd, scores, qs, os_buf, .{});
     const pf_iters: u32 = @max(1, iters / 8);
     t0 = sys.nowNs();
     for (0..pf_iters) |_| {
-        cpu.attentionPrefill(out_buf, q_buf, n_q, 1, k, v, ctx, n_q, ctx - n_q, heads, kv_heads, hd, scores, qs, os_buf);
+        cpu.attentionPrefill(out_buf, q_buf, n_q, 1, k, v, ctx, n_q, ctx - n_q, heads, kv_heads, hd, scores, qs, os_buf, .{});
     }
     const pf_ns = (sys.nowNs() - t0) / pf_iters;
 

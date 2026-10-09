@@ -446,7 +446,10 @@ pub const Engine = struct {
             gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, 0);
             gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, 0);
             self.ropeAndCache(li, pos, cfg, kv_dim);
-            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores);
+            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores, .{
+                .logit_softcap = cfg.attn_logit_softcap,
+                .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
+            });
             scatterColumn(self.attn[0..], self.sa[0..q_dim], ch, 0);
 
             // ---- attention output projection on ANE ----
@@ -611,7 +614,14 @@ pub const Engine = struct {
         self.stats.node_ns[@backingInt(Node.head)] += dt_head;
         self.stats.node_evals[@backingInt(Node.head)] += 1;
         try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
-        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.head_out[i]);
+        for (self.logits, 0..) |*l, i| {
+            const v: f32 = @floatCast(self.head_out[i]);
+            // Gemma 2 caps the final logits too.
+            l.* = if (cfg.final_logit_softcap > 0)
+                cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
+            else
+                v;
+        }
 
         self.stats.total_ns += sys.nowNs() - t_start;
         self.stats.tokens += 1;
@@ -753,6 +763,10 @@ pub const Engine = struct {
                     self.scores,
                     self.sq,
                     self.sa,
+                    .{
+                        .logit_softcap = cfg.attn_logit_softcap,
+                        .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
+                    },
                 );
                 self.stats.pf_attn_ns += sys.nowNs() - ta0;
 
@@ -941,7 +955,14 @@ pub const Engine = struct {
             self.stats.ane_eval_ns += sys.nowNs() - th;
             self.stats.ane_evals += 1;
             try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
-            for (self.logits, 0..) |*l, i| l.* = @floatCast(self.head_out[i]);
+            for (self.logits, 0..) |*l, i| {
+                const v: f32 = @floatCast(self.head_out[i]);
+                // Gemma 2 caps the final logits too.
+                l.* = if (cfg.final_logit_softcap > 0)
+                    cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
+                else
+                    v;
+            }
 
             done += n;
             self.stats.tokens += 1;
@@ -1030,7 +1051,14 @@ pub const Engine = struct {
         try self.head_kernel.eval();
         try self.head_kernel.readOutputF16(0, self.head_out[0..cfg.vocab]);
         for (0..hidden) |c| h32[c] = @floatCast(self.head_in[c]);
-        for (self.logits, 0..) |*l, i| l.* = @floatCast(self.head_out[i]);
+        for (self.logits, 0..) |*l, i| {
+            const v: f32 = @floatCast(self.head_out[i]);
+            // Gemma 2 caps the final logits too.
+            l.* = if (cfg.final_logit_softcap > 0)
+                cfg.final_logit_softcap * std.math.tanh(v / cfg.final_logit_softcap)
+            else
+                v;
+        }
         cpu.matmulF16(ref, self.head, h32[0..hidden], cfg.vocab, hidden);
         reportKernel("lm_head", self.logits, ref);
     }
