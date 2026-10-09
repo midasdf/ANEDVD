@@ -890,3 +890,13 @@ rather than an error:
     just read while still filling, and leaving the inserted value in the array twice when it
     came from the tail. AGENTS.md warns that two earlier hand-rolled partial selections were
     wrong and had to be reverted; this time the test that made it safe was already there.
+38. **The sampling change is now checked at the draw, not only at the selection.** Replacing
+    the full sort with a bounded selection made `selectTopK agrees with a full sort` the guard;
+    that test sees a wrong array. The new test sees the consequence: with `top_k` set, 50 draws
+    over 40 trials on 4000 logits (small spread, so ties are common) must never return a token
+    below the k-th largest logit. Breaking the running-minimum comparison fails three tests
+    including this one, so it is not redundant.
+
+    One thing worth recording: the first break I tried was logically equivalent to the original
+    (`items[k-1].logit > c.logit` against `c.logit <= items[k-1].logit`) and correctly passed.
+    A deliberate break has to actually break something. Tests: 124 -> 125.
