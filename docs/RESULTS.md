@@ -900,3 +900,14 @@ rather than an error:
     One thing worth recording: the first break I tried was logically equivalent to the original
     (`items[k-1].logit > c.logit` against `c.logit <= items[k-1].logit`) and correctly passed.
     A deliberate break has to actually break something. Tests: 124 -> 125.
+39. **The server path re-checked after the sampler change.** The sampler is shared by the CLI,
+    the HTTP API and the WebUI, so changing `selectTopK` lands in all three at once. A live
+    smoke test on SmolLM2-135M:
+
+        greedy, non-streaming   "The capital of France is Paris"
+        temperature 1.0, top_k 40   "The sea. It's the unsung hero of our l..."  finish "length"
+        streaming               9 SSE chunks, terminated by [DONE]
+        a second request        answered
+
+    Streaming and the top_k path are the two that matter here: the first goes through the SSE
+    holdback, and the second is the code the bounded selection replaced.
