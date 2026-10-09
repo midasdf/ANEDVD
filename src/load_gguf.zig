@@ -127,6 +127,16 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
         }
     }
 
+    // Mistral (and any other llama-family model that declares one) uses the sliding window
+    // on EVERY layer, unlike Gemma 2's alternating pattern. Ignoring it made those models
+    // attend globally over the whole context.
+    if (!std.mem.startsWith(u8, arch, "gemma")) {
+        if (g.getU32(key(&buf, arch, "attention.sliding_window"))) |w| {
+            cfg.sliding_window = w;
+            cfg.swa_all = true;
+        }
+    }
+
     // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /
     // .expert_shared_count / .expert_feed_forward_length).
     cfg.num_experts = g.getU32(key(&buf, arch, "expert_count")) orelse 0;

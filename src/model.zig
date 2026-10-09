@@ -74,6 +74,11 @@ pub const Config = struct {
     /// and layer 1 is global. Getting this backwards produces real words in the wrong
     /// order rather than obvious garbage.
     swa_pattern: u32 = 2,
+    /// Every layer uses the sliding window rather than alternating. Mistral is the case:
+    /// llama.cpp calls `set_swa_pattern(0, ..)`, whose rule is `n_pattern == 0 || ...`, so
+    /// all layers slide. Applying Gemma 2's alternating pattern to Mistral would window only
+    /// half its layers and attend globally on the rest.
+    swa_all: bool = false,
     /// True when the FFN uses `gelu(gate) * up` rather than `silu(gate) * up`.
     ///
     /// Gemma 2 sets `hidden_activation = "gelu_pytorch_tanh"`; every other architecture
@@ -97,7 +102,9 @@ pub const Config = struct {
     /// `"sliding_attention" if (i + 1) % 2 else "full_attention"`, i.e. layer 0 slides.
     /// Writing this as `layer % 2 != 0` inverts every layer.
     pub fn layerIsSliding(self: Config, layer: u32) bool {
-        if (self.sliding_window == 0 or self.swa_pattern == 0) return false;
+        if (self.sliding_window == 0) return false;
+        if (self.swa_all) return true; // Mistral: llama.cpp's `n_pattern == 0` case
+        if (self.swa_pattern == 0) return false;
         return (layer + 1) % self.swa_pattern != 0;
     }
 
@@ -657,4 +664,25 @@ test "Gemma's unit-offset norm is a per-source decision" {
     try std.testing.expectEqual(@as(f32, 1.0), plain.embed_scale);
     try std.testing.expectEqual(@as(f32, 0), plain.attn_scale);
     try std.testing.expectEqual(@as(f32, 0), plain.attn_logit_softcap);
+}
+
+test "Mistral windows every layer; Gemma 2 alternates" {
+    // Two architectures, two different rules, and getting either wrong makes attention see
+    // the wrong keys. llama.cpp's `set_swa_pattern(n_pattern, ..)` is
+    // `is_swa[il] = n_pattern == 0 || ...`, so `n_pattern == 0` means EVERY layer slides —
+    // that is Mistral. Gemma 2 instead alternates, `sliding if (layer + 1) % 2`.
+    const mistral = Config{ .sliding_window = 4096, .swa_all = true };
+    for (0..6) |li| try std.testing.expect(mistral.layerIsSliding(@intCast(li)));
+
+    const gemma2 = Config{ .sliding_window = 4096, .swa_pattern = 2 };
+    try std.testing.expect(gemma2.layerIsSliding(0));
+    try std.testing.expect(!gemma2.layerIsSliding(1));
+    try std.testing.expect(gemma2.layerIsSliding(2));
+    try std.testing.expect(!gemma2.layerIsSliding(3));
+
+    // No window at all: nothing slides, whatever the pattern says. This is every model whose
+    // config has no `sliding_window` key, which is most of them.
+    const plain = Config{ .swa_all = true };
+    try std.testing.expect(!plain.layerIsSliding(0));
+    try std.testing.expect(!plain.layerIsSliding(1));
 }

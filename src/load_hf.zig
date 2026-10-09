@@ -109,6 +109,9 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         .attn_logit_softcap = c.attn_logit_softcapping,
         .final_logit_softcap = c.final_logit_softcapping,
         .sliding_window = if (c.sliding_window > 0) c.sliding_window else c.sliding_window_size,
+        // Mistral-style models apply their window to every layer; only Gemma 2 alternates,
+        // and that is handled by `swa_pattern` defaulting to 2.
+        .swa_all = !std.mem.startsWith(u8, c.arch, "Gemma"),
     };
 }
 
