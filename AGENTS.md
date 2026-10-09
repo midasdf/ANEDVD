@@ -236,3 +236,14 @@ attempt does not repeat the search:
   what differs between `diagnose` and `Engine.prefill` for the last column.
 * The tiny Gemma 2 (hidden 8) passes the same comparison at rel 4.1e-3, so whatever it is
   scales with model size.
+* **Correction to the head-input comparison I recorded earlier.** I compared the engine's
+  `head_in` (232.19) against the reference's 227.34 and called it fp16 rounding. Those are
+  different tokens: `verify` runs prefill, then a decode step, then the reference loop, so the
+  engine's buffer holds the DECODE step's input, whose matching reference line is 228.37.
+  Corrected, the difference is 1.67%, and fp16 storage can account for only ~0.024% (10-bit
+  mantissa, values around 4.8). **So the head input genuinely differs and the cause is
+  upstream of it** — which rules out "the engine stores the same numbers less precisely" and
+  points at the embedding or the final-norm application.
+* The depth sweep reproduces exactly with the current binary (0.45360 vs 0.46882e-1 for
+  `--layers 0` and `1`), so the earlier figures were not affected by the KV-cache overflow
+  fixed in rounds 23-25: those runs used a 6-token prompt, far below any context limit.
