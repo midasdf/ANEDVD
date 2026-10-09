@@ -790,3 +790,15 @@ rather than an error:
 
     The consequence worth stating plainly: `verify` is the ground truth behind every numerical
     claim in this project, and above 1024 tokens it had been comparing garbage with garbage.
+30. **The KV-cache overflow was heap corruption, not just a wrong number.** Removing the two
+    `ContextOverflow` guards to check the new test does not merely fail it:
+
+        expected error.ContextOverflow, found { 1.51, -0.36, ... }
+        thread panic: free of invalid memory [addr: 100a04040, len: 256]
+                      or corrupted metadata
+
+    The panic confirms it was memory unsafety rather than a numerical slip, and explains why
+    `verify` returned all-zero logits with `rel = 1.0`: it had corrupted the allocator's
+    metadata rather than crashing outright. The test covers all four boundaries — exactly
+    filling the context, one token past it, a late start position (`prefill(ids, 6)` with four
+    tokens needs row ten of an eight-row cache), and `forward` at `pos == max_seq`.
