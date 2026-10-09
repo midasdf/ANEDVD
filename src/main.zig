@@ -900,13 +900,21 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     }
     const tot = eng.stats.tokens;
     // MoE: report the CPU expert time separately. On Qwen1.5-MoE it is the largest
-    // single cost by far, and it does not appear in the ANE node split at all.
-    if (eng.stats.moe_ns > 0 and stats.completion_tokens + stats.prompt_tokens > 0) {
-        const tokens: f64 = @floatFromInt(stats.completion_tokens + stats.prompt_tokens);
-        sys.print("CPU MoE experts: {d:.1} ms/token ({d:.0}% of decode+prefill)\n", .{
-            @as(f64, @floatFromInt(eng.stats.moe_ns)) / tokens / 1e6,
-            100.0 * @as(f64, @floatFromInt(eng.stats.moe_ns)) /
-                @as(f64, @floatFromInt(stats.prefill_ns + stats.decode_ns)),
+    // single cost and it does not appear in the ANE node split at all.
+    //
+    // Reported PER DECODE TOKEN, because that is what a user waits for. Dividing the
+    // whole run's MoE time by the decode count folds in the prompt pass and inflates
+    // the number by roughly (prompt+completion)/completion — on a 10-token prompt with
+    // 1 generated token that is 11x, which is how this line first reported "11.4 s per
+    // token" for something closer to 1 s.
+    if (eng.stats.moe_ns > 0 and stats.completion_tokens > 0) {
+        const moe_decode_ns: u64 = if (stats.prefill_ns + stats.decode_ns > 0)
+            eng.stats.moe_ns * stats.decode_ns / (stats.prefill_ns + stats.decode_ns)
+        else
+            eng.stats.moe_ns;
+        sys.print("CPU MoE experts: {d:.1} ms/token ({d:.0}% of decode wall time)\n", .{
+            @as(f64, @floatFromInt(moe_decode_ns)) / @as(f64, @floatFromInt(stats.completion_tokens)) / 1e6,
+            if (stats.decode_ns > 0) 100.0 * @as(f64, @floatFromInt(moe_decode_ns)) / @as(f64, @floatFromInt(stats.decode_ns)) else 0,
         });
     }
     if (tot > 0) {
