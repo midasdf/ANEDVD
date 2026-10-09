@@ -389,3 +389,63 @@ pub fn loadMoeLayer(allocator: std.mem.Allocator, sh: *const Shards, cfg: model.
     }
     return moe;
 }
+
+test "a Gemma HF checkpoint needs the (1 + w) offset that a GGUF does not" {
+    // This asymmetry took four rounds to find and is the difference between "Paris" and a
+    // run of dots. An HF checkpoint stores the RAW norm parameter (mean ~0.19 on
+    // gemma-2-2b), so the offset must be added; the GGUF converter has already applied it
+    // (measured mean 1.1927). `load_hf` sets the flag, `load_gguf` clears it, and both
+    // sides are pinned here and in `load_gguf`'s own tests.
+    const c = hf.Config{
+        .arch = "Gemma2ForCausalLM",
+        .hidden_size = 2304,
+        .num_hidden_layers = 26,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .head_dim = 256,
+        .intermediate_size = 9216,
+        .vocab_size = 256000,
+        .num_experts = 0,
+        .num_experts_per_tok = 0,
+        .moe_intermediate_size = 0,
+        .shared_expert_intermediate_size = 0,
+        .norm_topk_prob = false,
+        .decoder_sparse_step = 1,
+        .mlp_only_layers = 0,
+        .attn_logit_softcapping = 50.0,
+        .final_logit_softcapping = 30.0,
+        .sliding_window = 4096,
+        .sliding_window_size = 4096,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 10000.0,
+        .tie_word_embeddings = true,
+        .max_position_embeddings = 8192,
+        .bos_token_id = 2,
+        .eos_token_id = 1,
+    };
+    const m = try toModelConfig(c);
+    // The offset: present for HF, absent for GGUF.
+    try std.testing.expect(m.norm_unit_offset);
+    // sqrt(hidden) = 48, not 1.
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 2304)), m.embed_scale, 1e-4);
+    // Gemma's FFN is tanh-GELU; at x = -3 that differs from SiLU by 40x.
+    try std.testing.expect(m.use_gelu);
+    // Both soft-caps and the window are carried, not defaulted away.
+    try std.testing.expectApproxEqAbs(@as(f32, 50.0), m.attn_logit_softcap, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0), m.final_logit_softcap, 1e-6);
+    try std.testing.expectEqual(@as(u32, 4096), m.sliding_window);
+    // Layer 0 slides: the reference builds layer_types as `sliding if (i + 1) % 2`.
+    try std.testing.expect(m.layerIsSliding(0));
+    try std.testing.expect(!m.layerIsSliding(1));
+    // gemma-2's q_dim (2048) is smaller than its hidden (2304).
+    try std.testing.expectEqual(@as(u32, 2048), m.qDim());
+    try std.testing.expectEqual(@as(u32, 1024), m.kvDim());
+
+    // A non-Gemma checkpoint must pick up none of it.
+    var q = c;
+    q.arch = "LlamaForCausalLM";
+    const lm = try toModelConfig(q);
+    try std.testing.expect(!lm.norm_unit_offset);
+    try std.testing.expect(!lm.use_gelu);
+    try std.testing.expectEqual(@as(f32, 1.0), lm.embed_scale);
+}

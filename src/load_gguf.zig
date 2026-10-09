@@ -773,3 +773,41 @@ test "MoE widths come from the tensor shapes, not the metadata" {
     // feed_forward_length stays the SHARED width; it is a different number.
     try std.testing.expectEqual(@as(u32, 5632), cfg.inter);
 }
+
+test "a Gemma GGUF does NOT need the (1 + w) offset, because it is already applied" {
+    // The other half of the asymmetry pinned in `load_hf`. Measured on gemma-2-2b:
+    // `blk.0.attn_norm.weight` has mean 1.1927, which IS the effective `(1 + w)` for a
+    // converged model; the raw HF parameter would have mean ~0.19. Adding the offset again
+    // doubles every norm and the model emits "." instead of an answer.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 1); // blk.0.post_attention_norm.weight
+    try putInt(&bytes, a, u64, 8); // eight kv pairs, exactly as written below
+    try putStr(&bytes, a, "general.architecture", "gemma2");
+    try putU32Kv(&bytes, a, "gemma2.embedding_length", 2304);
+    try putU32Kv(&bytes, a, "gemma2.block_count", 26);
+    try putU32Kv(&bytes, a, "gemma2.attention.head_count", 8);
+    try putU32Kv(&bytes, a, "gemma2.attention.head_count_kv", 4);
+    try putU32Kv(&bytes, a, "gemma2.attention.key_length", 256);
+    try putU32Kv(&bytes, a, "gemma2.feed_forward_length", 9216);
+    try putU32Kv(&bytes, a, "gemma2.vocab_size", 256000);
+    // The soft-caps are optional (`orelse 0`), so they are left out here deliberately.
+    try putTensor(&bytes, a, "blk.0.post_attention_norm.weight", &.{2304}, 0, 0);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expect(!cfg.norm_unit_offset); // NOT applied: the file already has it
+    try std.testing.expect(cfg.use_gelu);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 2304)), cfg.embed_scale, 1e-4);
+    // The sandwich norms are detected from the tensor being present.
+    try std.testing.expect(cfg.sandwich_norms);
+    // attn_scale is 1/sqrt(n_embd/n_head) = 1/sqrt(288), not 1/sqrt(256).
+    try std.testing.expect(cfg.attn_scale > 0);
+    try std.testing.expectApproxEqAbs(1.0 / @sqrt(288.0), cfg.attn_scale, 1e-5);
+}
