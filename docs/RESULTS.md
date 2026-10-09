@@ -595,3 +595,16 @@ rather than an error:
     2048-wide conv reaches 30 GB/s — the kernel is fine, the shape is simply below the
     floor's useful range. It also bounds priorities (1) and (2): the CPU-side sampler and
     attention are already a few per cent, and the ANE side is floor- plus bandwidth-bound.
+18. **The API returned invalid UTF-8 for non-ASCII output.** A Japanese prompt through
+    `/v1/chat/completions` produced a body that failed `bytes.decode("utf-8")`:
+
+        b'\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81'   <- ends mid-character
+
+    Token boundaries fall inside multi-byte characters (the vocabulary splits by bytes), so
+    concatenating token pieces can end in a truncated sequence, and `max_tokens` can cut a
+    generation mid-character. Strict JSON clients reject such a body outright.
+
+    Streaming now trims each emit slice back to a UTF-8 boundary so a partial sequence waits
+    for the token that completes it, exactly as stop sequences already do; the final flush
+    and the non-streaming route replace what cannot be completed with U+FFFD. Verified both
+    routes: `VALID UTF-8`, content `こんにち<U+FFFD>`, and ASCII output unchanged.
