@@ -63,16 +63,36 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     const arch = g.arch() orelse "llama";
 
     var cfg = model.Config{ .arch = arch };
-    cfg.hidden = g.getU32(key(&buf, arch, "embedding_length")) orelse return Error.MissingTensor;
-    cfg.layers = g.getU32(key(&buf, arch, "block_count")) orelse return Error.MissingTensor;
-    cfg.heads = g.getU32(key(&buf, arch, "attention.head_count")) orelse return Error.MissingTensor;
+    // Name the missing key. A bare `MissingTensor` from a config read sends the reader
+    // looking for a broken tensor, when the actual problem is that this file does not
+    // carry the metadata an architecture of this name needs — which happens when the
+    // architecture string is wrong or the file is for a different runtime.
+    cfg.hidden = g.getU32(key(&buf, arch, "embedding_length")) orelse {
+        sys.eprint("gguf: no {s} in this file (arch \"{s}\").\n", .{ key(&buf, arch, "embedding_length"), arch });
+        return Error.MissingTensor;
+    };
+    cfg.layers = g.getU32(key(&buf, arch, "block_count")) orelse {
+        sys.eprint("gguf: no {s} in this file.\n", .{key(&buf, arch, "block_count")});
+        return Error.MissingTensor;
+    };
+    cfg.heads = g.getU32(key(&buf, arch, "attention.head_count")) orelse {
+        sys.eprint("gguf: no {s} in this file.\n", .{key(&buf, arch, "attention.head_count")});
+        return Error.MissingTensor;
+    };
     cfg.kv_heads = g.getU32(key(&buf, arch, "attention.head_count_kv")) orelse cfg.heads;
-    cfg.inter = g.getU32(key(&buf, arch, "feed_forward_length")) orelse return Error.MissingTensor;
+    cfg.inter = g.getU32(key(&buf, arch, "feed_forward_length")) orelse {
+        sys.eprint("gguf: no {s} in this file.\n", .{key(&buf, arch, "feed_forward_length")});
+        return Error.MissingTensor;
+    };
     cfg.head_dim = g.getU32(key(&buf, arch, "attention.key_length")) orelse (cfg.hidden / cfg.heads);
     cfg.eps = g.getF32(key(&buf, arch, "attention.layer_norm_rms_epsilon")) orelse 1e-5;
     cfg.rope_theta = g.getF32(key(&buf, arch, "rope.freq_base")) orelse 10000.0;
     cfg.vocab = g.getU32(key(&buf, arch, "vocab_size")) orelse blk: {
-        const toks = g.getStringArray("tokenizer.ggml.tokens") orelse return Error.MissingTensor;
+        // No vocab_size and no token list: report both, since either could be the cause.
+        const toks = g.getStringArray("tokenizer.ggml.tokens") orelse {
+            sys.eprint("gguf: no {s} and no tokenizer.ggml.tokens to fall back on.\n", .{key(&buf, arch, "vocab_size")});
+            return Error.MissingTensor;
+        };
         break :blk @intCast(toks.len);
     };
     cfg.tie_embeddings = g.tensor("output.weight") == null;
@@ -578,4 +598,76 @@ fn loadExperts(
     } else {
         return Error.DimensionMismatch;
     }
+}
+
+test "a config missing a required key is reported, not silently zeroed" {
+    // A bare `MissingTensor` from a config read sent the reader looking for a broken
+    // tensor. The loader now names the key, which is the difference between "this file
+    // is for another runtime" and "your download is corrupt".
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 0); // no tensors
+    try putInt(&bytes, a, u64, 2); // two kv pairs
+    try putStr(&bytes, a, "general.architecture", "llama");
+    try putInt(&bytes, a, u64, "llama.embedding_length".len);
+    try bytes.appendSlice(a, "llama.embedding_length");
+    try putInt(&bytes, a, u32, 4);
+    try putInt(&bytes, a, u32, 576);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    // block_count is deliberately absent.
+    try std.testing.expectError(Error.MissingTensor, loadConfig(&g));
+}
+
+test "a complete config still loads" {
+    // Guards the diagnostics above against swallowing real errors: a file with every
+    // required key must load, not report one missing.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 0);
+    try putInt(&bytes, a, u64, 6);
+    try putStr(&bytes, a, "general.architecture", "llama");
+    try putU32Kv(&bytes, a, "llama.embedding_length", 576);
+    try putU32Kv(&bytes, a, "llama.block_count", 4);
+    try putU32Kv(&bytes, a, "llama.attention.head_count", 9);
+    try putU32Kv(&bytes, a, "llama.feed_forward_length", 1536);
+    try putU32Kv(&bytes, a, "llama.vocab_size", 1024);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expectEqual(@as(u32, 576), cfg.hidden);
+    try std.testing.expectEqual(@as(u32, 4), cfg.layers);
+    try std.testing.expectEqual(@as(u32, 9), cfg.heads);
+    try std.testing.expectEqual(@as(u32, 1024), cfg.vocab);
+}
+
+fn putInt(buf: *std.ArrayList(u8), a: std.mem.Allocator, comptime T: type, v: T) !void {
+    var tmp: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &tmp, v, .little);
+    try buf.appendSlice(a, &tmp);
+}
+
+fn putStr(buf: *std.ArrayList(u8), a: std.mem.Allocator, k: []const u8, value: []const u8) !void {
+    try putInt(buf, a, u64, k.len);
+    try buf.appendSlice(a, k);
+    try putInt(buf, a, u32, 8); // string
+    try putInt(buf, a, u64, value.len);
+    try buf.appendSlice(a, value);
+}
+
+fn putU32Kv(buf: *std.ArrayList(u8), a: std.mem.Allocator, k: []const u8, value: u32) !void {
+    try putInt(buf, a, u64, k.len);
+    try buf.appendSlice(a, k);
+    try putInt(buf, a, u32, 4); // u32
+    try putInt(buf, a, u32, value);
 }
