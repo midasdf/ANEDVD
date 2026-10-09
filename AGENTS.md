@@ -188,8 +188,27 @@ Two lessons worth keeping:
   0.19 — settled it in a minute.
 
 Gemma does not yet pass `verify` (rel 0.45 prefill / 0.61 decode against a 10% bar), so a
-numerical difference between the two paths remains, but it is measured on a metric that
-can be trusted and against a reference that implements the whole architecture.
+numerical difference between the two paths remains. What is known about it, so the next
+attempt does not repeat the search:
+
+* The engine is **internally consistent**: `run --ab` reports `max|diff| = 0.000000e0`
+  between prefill and decode, so this is engine-vs-reference, not prefill-vs-decode.
+* **Every kernel is correct at layer 0 on a real prompt token**: `check` now diagnoses
+  token 603 (from "The capital of France is") instead of the hardcoded id 1, and reports
+  qkv 2.7e-4, o 4.0e-4, ffn 4.2e-3, lm_head 2.1e-4 — OK, exit 0. Each of the three head
+  chunks is fine individually too.
+* A depth sweep says the error is largest with **zero** layers and one layer *reduces* it:
+
+      --layers 0   rel 0.4536   (no layer runs at all)
+      --layers 1   rel 0.0469   (passes)
+      --layers 2   rel 0.1190
+      --layers 3   rel 0.1395
+
+  So it originates in the path before any layer — embed -> final_norm -> head — rather than
+  accumulating through the stack. `check` exercises that same path and passes, so look for
+  what differs between `diagnose` and `Engine.prefill` for the last column.
+* The tiny Gemma 2 (hidden 8) passes the same comparison at rel 4.1e-3, so whatever it is
+  scales with model size.
 
 ## Toolchain
 
