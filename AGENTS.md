@@ -188,6 +188,25 @@ with each other on the tiny Gemma 2 but not on the real one, so the divergence i
 size-dependent: `head_dim` 256 against 32, `q_dim` 2048 against `hidden` 2304, and a
 4096 sliding window that neither prompt actually reaches.
 
+**Important:** `anedvd cpu` — the reference the engine is normally checked against —
+ALSO produces wrong text for gemma-2-2b, so there is a bug the two paths share. That
+rules out the engine-specific machinery (ANE kernels, chunking, surface layouts) and
+points at the shared model code: the norm application, the attention maths, or the
+residual wiring. It also means the engine/reference agreement on the tiny Gemma 2 is not
+evidence that either is right — they can be wrong together, which is exactly the trap
+documented under "beware checks that cannot fail".
+
+Established by measurement, so they can be skipped:
+
+* `head_dim` is 256 for gemma-2 and 32 for the tiny model. The prefill/decode attention
+  equivalence tests now cover 256 and pass, so attention is consistent at that size.
+* Disabling the sliding window changes nothing (neither prompt reaches 4096).
+* The o projection is built `cin = qDim (2048) -> cout = hidden (2304)`, correct for a
+  model whose q_dim is smaller than its hidden.
+* Every Gemma flag loads: sandwich, unit-offset norm, gelu, both soft-caps, the window,
+  and layer 0's four norms all arrive at hidden = 2304.
+* Q6_K, the type of Gemma's embedding tensor, is bit-exact against llama.cpp.
+
 Open questions for whoever picks this up, in the order worth trying:
 
 0. The `WrongShape` above. It is confined to `runHead`'s chunk loop: the kernels all
