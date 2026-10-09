@@ -848,3 +848,10 @@ rather than an error:
     Bounded impact — the window only binds past its size, and Mistral's is 4096 against a 2048
     default context — so this was latent. It is the difference between supporting a model and
     claiming to.
+35. **Both sliding-window rules now have tests on both loaders.** `load_hf`'s mapper and
+    `load_gguf`'s metadata reader were the two places the Mistral fix touched and neither had
+    coverage. The tests assert a Mistral config windows every layer while a Gemma 2 config with
+    the same window alternates (layer 0 slides, layer 1 does not), that a config with no window
+    slides nowhere, and — for the crafted GGUF — that Mistral keeps the llama-family defaults
+    (adjacent RoPE, no GELU, no norm offset) so a future edit cannot pull it into Gemma's flags.
+    Both fail on the original behaviour. Tests: 122 → 124.
