@@ -929,3 +929,12 @@ rather than an error:
 
     Reverted: 0.2% does not pay for an extra branch, a second comparator and an order-restoring
     sort. The design stays in AGENTS.md in case a future change makes those writes matter.
+41. **Two claims of support were separated from evidence of support.** The README listed
+    "Verified end to end: Llama, Qwen2, Qwen3, Mistral, SmolLM2/3, the TinyLlama-era Llama
+    layout, Qwen2-MoE and Gemma 2". Mistral and SmolLM3 were never run on this machine, and
+    Mistral's sliding window had in fact been ignored entirely until the previous rounds — so
+    the claim was not merely optimistic. The README now splits *run on a real model here*
+    (Llama both formats, TinyLlama, Qwen2 0.5B/1.5B, Qwen3-0.6B, Qwen2-MoE, Gemma 2) from
+    *recognised but not run* (Mistral, SmolLM3), and `known_architectures`' comment says that
+    being on the list is not a statement that the architecture was exercised — nineteen are
+    listed, six were run.
