@@ -104,6 +104,28 @@ fn argValue(argv: []const [:0]const u8, name: []const u8, default: u32) u32 {
     return default;
 }
 
+/// Like `argValue`, but rejects a value below `min` with a message naming the argument.
+///
+/// Without this the failure surfaces far from its cause: `--chunk 0` compiled a width-zero
+/// kernel and reported `AneCompileFailed`, and `--max-seq 0` reported `PromptTooLong`.
+/// Neither names the flag the user got wrong.
+fn argValueAtLeast(argv: []const [:0]const u8, name: []const u8, default: u32, min: u32) u32 {
+    for (argv, 0..) |a, i| {
+        if (std.mem.eql(u8, a, name) and i + 1 < argv.len) {
+            const v = std.fmt.parseInt(u32, argv[i + 1], 10) catch {
+                sys.eprint("{s} expects a number, got \"{s}\"\n", .{ name, argv[i + 1] });
+                std.process.exit(2);
+            };
+            if (v < min) {
+                sys.eprint("{s} must be at least {d}, got {d}\n", .{ name, min, v });
+                std.process.exit(2);
+            }
+            return v;
+        }
+    }
+    return default;
+}
+
 fn cmdInfo() !void {
     sys.print("ANEDVD — Apple Neural Engine Decoupled Vandal Driver\n", .{});
     sys.print("CoreML-free ANE runtime, in Zig\n", .{});
@@ -576,7 +598,17 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         if (std.mem.eql(u8, a, "--split")) fuse = false;
         if (std.mem.eql(u8, a, "--rope-hf")) rope_hf = true;
         if (std.mem.eql(u8, a, "--rope-adjacent")) rope_adj = true;
-        if (std.mem.eql(u8, a, "--chunk") and i + 1 < argv.len) chunk = std.fmt.parseInt(u32, argv[i + 1], 10) catch chunk;
+        if (std.mem.eql(u8, a, "--chunk") and i + 1 < argv.len) {
+            const v = std.fmt.parseInt(u32, argv[i + 1], 10) catch {
+                sys.eprint("--chunk expects a number, got \"{s}\"\n", .{argv[i + 1]});
+                std.process.exit(2);
+            };
+            if (v < 1) {
+                sys.eprint("--chunk must be at least 1, got {d}\n", .{v});
+                std.process.exit(2);
+            }
+            chunk = v;
+        }
     }
 
     sys.print("loading {s}\n", .{path});
@@ -747,7 +779,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const max_tokens: u32 = argValue(argv, "--max-tokens", 48);
     const temperature = argF32(argv, "--temp", 0.0);
     const top_k: usize = argValue(argv, "--top-k", 40);
-    const chunk: u32 = argValue(argv, "--chunk", 128);
+    const chunk: u32 = argValueAtLeast(argv, "--chunk", 128, 1);
     const top_p = argF32(argv, "--top-p", 1.0);
     const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
     var fuse = true;
@@ -778,7 +810,7 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     const t_c0 = sys.nowNs();
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
-        .max_seq = argValue(argv, "--max-seq", 2048),
+        .max_seq = argValueAtLeast(argv, "--max-seq", 2048, 4),
         .verbose = true,
         .fuse_ffn = fuse,
         .chunk = chunk,
@@ -1215,9 +1247,9 @@ fn cmdServe(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     const port: u16 = @intCast(argValue(argv, "--port", 8080));
     const model_name = argStr(argv, "--name") orelse model_open.modelName(model_path);
     const system = argStr(argv, "--system");
-    const max_seq: u32 = argValue(argv, "--max-seq", 2048);
+    const max_seq: u32 = argValueAtLeast(argv, "--max-seq", 2048, 4);
     const default_max_tokens: u32 = argValue(argv, "--max-tokens", 512);
-    const chunk: u32 = argValue(argv, "--chunk", 128);
+    const chunk: u32 = argValueAtLeast(argv, "--chunk", 128, 1);
     const top_p = argF32(argv, "--top-p", 1.0);
     const rep_penalty = argF32(argv, "--repeat-penalty", 1.0);
     var fuse = true;
@@ -1342,7 +1374,7 @@ fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     };
     const system = argStr(argv, "--system");
     const max_tokens: u32 = argValue(argv, "--max-tokens", 256);
-    const chunk: u32 = argValue(argv, "--chunk", 128);
+    const chunk: u32 = argValueAtLeast(argv, "--chunk", 128, 1);
     var temperature = argF32(argv, "--temp", 0.7);
     var top_p = argF32(argv, "--top-p", 0.9);
     var rep_penalty = argF32(argv, "--repeat-penalty", 1.15);
@@ -1363,7 +1395,7 @@ fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     });
 
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
-        .max_seq = @intCast(argValue(argv, "--max-seq", 2048)),
+        .max_seq = @intCast(argValueAtLeast(argv, "--max-seq", 2048, 4)),
         .verbose = true,
         .chunk = chunk,
     });
@@ -1536,7 +1568,7 @@ fn cmdAttnBench(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void 
     // and the decode numbers above say nothing about it: the chunk path reads
     // the same K/V for every query position in the chunk, so it is far more
     // memory intensive than the single-query case.
-    const chunk: usize = argValue(argv, "--chunk", 128);
+    const chunk: usize = argValueAtLeast(argv, "--chunk", 128, 1);
     const n_q = @min(chunk, ctx);
     const q_buf = try allocator.alloc(f32, @as(usize, heads) * hd * n_q);
     defer allocator.free(q_buf);
@@ -1585,7 +1617,7 @@ fn cmdKernels(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     }
     const path = argv[2];
     const iters: u32 = argValue(argv, "--iters", 100);
-    const chunk: u32 = argValue(argv, "--chunk", 128);
+    const chunk: u32 = argValueAtLeast(argv, "--chunk", 128, 1);
 
     var loaded = try model_open.open(allocator, path, .{ .progress = false });
     defer loaded.deinit();
