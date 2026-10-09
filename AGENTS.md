@@ -129,6 +129,24 @@ zig fmt src build.zig
 * **`Tokenizer.fromGguf` and `load_gguf.viewF16` alias the mapped GGUF file.**
   The `Gguf` must outlive them; returning either from a helper that closes the
   map is a segfault waiting for first use.
+* **`swa_pattern` is hard-coded to 2 and the config key that would change it is never read.**
+  Gemma 2 alternates 1:1, so 2 is right for it — but Gemma 3 uses
+  `sliding_window_pattern = 6`, i.e. five sliding layers then one global, and the HF
+  reference computes `layer_types` as `sliding if (i + 1) % pattern` — the same shape my
+  `layerIsSliding` implements, just with a different constant. A Gemma 3 GGUF therefore gets
+  Gemma 2's pattern. This is the same fault as Mistral's window: recognised in
+  `known_architectures`, wrong in the attention mask.
+  To fix, four small pieces:
+  1. `hf.Config.sliding_window_pattern: u32 = 0` plus its JSON read, and
+     `.swa_pattern = if (c.sliding_window_pattern > 0) c.sliding_window_pattern else 2` in
+     `toModelConfig`.
+  2. `load_gguf`: read `attention.sliding_window_pattern` and assign `cfg.swa_pattern`.
+  3. Add `gemma3` to the HF architecture list — it is in the GGUF list but not the HF one, so
+     an HF Gemma 3 currently fails with "unsupported architecture" rather than loading wrongly,
+     which is at least the safe direction.
+  4. A test mirroring "Mistral windows every layer; Gemma 2 alternates": with pattern 6, layers
+     0-4 slide, layer 5 does not, layer 6 slides.
+  `gemma` (1) is in the same position and has no window at all, so it is only affected by (3).
 * **A KV cache is `max_seq` rows and nothing checked that.** `verify` used a fixed 1024-row
   context and its CPU reference a hardcoded `1024 * cfg.kvDim()`, so a 1121-token prompt
   wrote past both — and returned all-zero logits with `rel = 1.0` rather than crashing.
