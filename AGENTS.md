@@ -129,7 +129,8 @@ zig fmt src build.zig
 * **`Tokenizer.fromGguf` and `load_gguf.viewF16` alias the mapped GGUF file.**
   The `Gguf` must outlive them; returning either from a helper that closes the
   map is a segfault waiting for first use.
-* **`swa_pattern` is hard-coded to 2 and the config key that would change it is never read.**
+* **`swa_pattern` was hard-coded to 2 and the key that changes it was read nowhere — fixed in
+  round 42; what follows is the record of the fault.**
   Gemma 2 alternates 1:1, so 2 is right for it — but Gemma 3 uses
   `sliding_window_pattern = 6`, i.e. five sliding layers then one global, and the HF
   reference computes `layer_types` as `sliding if (i + 1) % pattern` — the same shape my
