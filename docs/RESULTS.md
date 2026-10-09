@@ -855,3 +855,22 @@ rather than an error:
     slides nowhere, and — for the crafted GGUF — that Mistral keeps the llama-family defaults
     (adjacent RoPE, no GELU, no norm offset) so a future edit cannot pull it into Gemma's flags.
     Both fail on the original behaviour. Tests: 122 → 124.
+36. **The sampler is candidate-bound, not pass-bound — correcting my earlier guess.** I had
+    assumed the two full-vocabulary walks (max, then collect) were the fixed cost and that
+    there was nothing worth doing in the sampler. Measuring across temperatures on
+    Qwen2.5-0.5B shows the opposite:
+
+        temp 1.0   45,226 candidates avg (max 130,865)   1.33 ms/token
+        temp 0.3       33 candidates avg (max 458)       0.13 ms/token
+
+    The cost tracks the **candidate count**, so 0.13 ms is the two full-vocab walks over
+    151,936 logits and **1.20 ms — 90% of sampling at temperature 1.0 — is candidate
+    processing**. Priority (1) is therefore not closed: cutting the candidate work is worth
+    up to ~1.2 ms/token, about 4-5% of decode on the small models.
+
+    The shape of the fix is visible in the code: pass 2 materialises every candidate into an
+    array (45k of them, ~360 KB of writes) and `selectTopK` then walks that array to keep 40,
+    when the top-k could be maintained during the first walk instead. It is not implemented
+    here — the semantics need care, `top_k = 0` bypasses the selection entirely and must keep
+    its current behaviour, and this project's two previous attempts at hand-rolled partial
+    selection were both wrong and had to be reverted.
