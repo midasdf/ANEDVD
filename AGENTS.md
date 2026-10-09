@@ -80,6 +80,12 @@ zig fmt src build.zig
   attention alone is 0.79 ms/token against a 1.74 ms/token prefill — roughly 45%, up from
   ~14% at 26 tokens, because attention is O(n²) while the ANE part is per-layer. Measure at
   the context length you care about; `anedvd attnbench` isolates it.
+* **Grouped-query attention's redundant K/V reads are free — measured, do not "optimise"
+  them.** Each K/V row is converted once per head in its group, which looks wasteful, but
+  `attnbench --kv-heads 2` against `--kv-heads 14` shows the grouped case is *faster* on
+  decode (208.4 against 220.3 us) and identical on prefill (267.90 against 268.67 us/query):
+  grouping shrinks the cache being re-read (262 KB against 1.8 MB), so the redundancy is
+  served from a resident cache while the ungrouped case streams seven times more data.
 * **Sampling is not negligible.** At temperature 1.0 the candidate cut leaves
   ~31k of 151936 logits, and ordering them was ~10% of decode (`sortUnstable`,
   not `sort`, for the top-k selection). `anedvd run` prints the cost per token.

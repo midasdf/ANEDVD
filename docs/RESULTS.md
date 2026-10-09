@@ -818,3 +818,19 @@ rather than an error:
     `model.safetensors.index.json`'s `weight_map`, a broken index, and a tensor located across
     shards) plus an end-to-end one. `--repeat` was verified in the previous round: identical
     output every iteration, since `session.reset()` runs before each.
+33. **The grouped-query "7x redundant K/V reads" cost nothing, measured.** With 14 heads over
+    2 KV heads each K/V row is converted and read once per head in its group. Hoisting that
+    conversion looked like the last optimisation left in attention, but the estimate was never
+    checked. `anedvd attnbench` varies the head counts directly, so it can be:
+
+        kv-heads=2  (group 7)    decode 208.4 us   dot 108.0   prefill 267.90 us/query
+        kv-heads=14 (group 1)    decode 220.3 us   dot 127.9   prefill 268.67 us/query
+
+    The grouped case is **faster** on decode and identical on prefill. The reason is that
+    grouping shrinks the cache it re-reads: kv-heads=2 gives a 128-element row and a 262 KB
+    cache against 896 elements and 1.8 MB for kv-heads=14, so the redundant reads are all
+    served from a resident cache while the ungrouped case streams seven times more data.
+
+    So there is no headroom here and the change should not be made. My earlier note said
+    hoisting "would not give the 7x it suggests" — the measurement says it gives nothing at
+    all, because the redundancy and the smaller cache cancel in the grouped case's favour.
