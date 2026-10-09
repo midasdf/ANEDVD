@@ -979,10 +979,18 @@ rather than an error:
 
     Checked while doing it that a small context does not break generation: `--max-seq 64` with a
     6-token prompt still prefills and decodes 4 tokens, the same as the 2048 default.
-45. **Note for whoever looks next: `run` prefills more tokens than the prompt contains.** For
-    "The capital of France is" it reports **14** tokens, while `anedvd cpu` and `anedvd layers`
-    report **5** for the same text. The difference is that `run` applies the model's chat
-    template (SmolLM2's adds ~9 tokens of `<|im_start|>` framing), so the counts are of
-    different things — not a tokenizer disagreement. Recorded because the two numbers sitting in
-    the same project look like a bug and I did not have the room to confirm the framing token by
-    token; a `run --raw`-style path or a printed template would settle it in one command.
+45. **`run` prefills more tokens than the prompt contains, and it was not a bug.** For
+    "The capital of France is" it reports **14** tokens where `anedvd cpu` and `anedvd layers`
+    report **5**. `run` always applies `formatChatFor` — there is no raw path — so it sends
+
+        <|im_start|>user
+        The capital of France is<|im_end|>
+        <|im_start|>assistant
+
+    and the two commands are counting different strings. Not a tokenizer disagreement.
+
+    The part worth recording is how long this took: `run` **prints** the formatted prompt and its
+    count — `prompt (14 tokens): <|im_start|>user ...` — on the line immediately above the
+    `prefill:` line I was reading. I had the answer on screen and grepped past it twice, then
+    wrote it up as an open question. When two numbers in one project disagree, read the output
+    around them before theorising about which is wrong.
