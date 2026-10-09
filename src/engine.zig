@@ -565,8 +565,15 @@ pub const Engine = struct {
                 try dk.writeInputColumnF16(0, 0, self.dec_in[0..inter]);
                 t0 = sys.nowNs();
                 try dk.eval();
-                self.stats.ane_eval_ns += sys.nowNs() - t0;
+                const dt_down = sys.nowNs() - t0;
+                self.stats.ane_eval_ns += dt_down;
                 self.stats.ane_evals += 1;
+                // Attribute the down projection to `ffn` as well. Without this the split
+                // path reports only the gate/up kernel against the fused path's full
+                // three-conv byte count, which inflated `ffn` to 67.6 GB/s against a real
+                // 46 GB/s and made the fused form look worse than it is.
+                self.stats.node_ns[@backingInt(Node.ffn)] += dt_down;
+                self.stats.node_evals[@backingInt(Node.ffn)] += 1;
                 try dk.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
             } else {
                 try k.ffn.readOutputColumnF16(0, 0, self.dec_out[0..hidden]);
@@ -1388,7 +1395,7 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     // that (they are used on every token).
     const moe_keep = lw.moe;
 
-    if (opts.fuse_ffn) {
+    if (opts.fuse_ffn and std.c.getenv("ANEDVD_NO_FUSED_FFN") == null) {
         if (makeFusedFfnKernel(allocator, cfg.hidden, ffn_inter, lw.gate, lw.up, lw.down, width)) |fk| {
             return .{ .qkv = qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
         } else |e| {
