@@ -969,3 +969,13 @@ rather than an error:
     lands and the prose describing the old behaviour stays. The pattern is worth naming —
     **code and the sentences about it need to be changed in the same commit**, because the
     sentence is what a reader trusts and it fails silently.
+44. **`--max-seq` was undocumented while every truncation message recommends it.** The command
+    table listed `run`, `chat` and `serve` without it, and the notes added in round 22 say "use
+    `--max-seq N` for a longer context" — so a reader following that advice had nothing to read.
+    The flag is now on all three lines and `verify` gained `--layers`, with a paragraph in Long
+    context covering the default (2048), which commands take it, that an over-long prompt is cut
+    from the front and reported rather than silent, and that the KV cache is sized to it in both
+    the engine and the CPU reference.
+
+    Checked while doing it that a small context does not break generation: `--max-seq 64` with a
+    6-token prompt still prefills and decodes 4 tokens, the same as the 2048 default.
