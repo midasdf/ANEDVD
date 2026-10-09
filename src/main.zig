@@ -1936,8 +1936,14 @@ fn cmdLayers(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         cfg.arch, cfg.layers, cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim,
     });
 
+    // Encode first and size the context to the prompt. A fixed 256 meant any longer prompt
+    // failed with a bare `error: ContextOverflow`; the engine refuses to write past its KV
+    // cache now, which is safe, but inspecting a real prompt should just work.
+    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
+    defer allocator.free(ids);
+
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
-        .max_seq = 256,
+        .max_seq = @intCast(@max(@as(usize, 256), ids.len + 8)),
         .verbose = false,
     });
     defer eng.deinit();
@@ -1946,8 +1952,6 @@ fn cmdLayers(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         sys.print("stopping after layer {d}\n", .{upto});
     }
 
-    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
-    defer allocator.free(ids);
     sys.print("prompt {d} tokens\n", .{ids.len});
     const logits = try eng.prefill(ids, 0);
     const used = try allocator.alloc(bool, logits.len);
