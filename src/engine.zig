@@ -1779,3 +1779,136 @@ test "batched prefill agrees with per-token decode on an MoE layer (needs the AN
     // check that actually pins the behaviour.
     try std.testing.expect(worst < 0.4);
 }
+
+/// Build a one-layer MoE whose routed experts are zero, so whatever the forward pass
+/// produces comes from the SHARED expert and its `sigmoid(gate . h)` scale.
+fn buildSharedExpertFixture(a: std.mem.Allocator, with_gate_lin: bool) !model.ModelWeights {
+    const cfg = model.Config{
+        .arch = "qwen2moe",
+        .hidden = 32,
+        .layers = 1,
+        .heads = 4,
+        .kv_heads = 2,
+        .head_dim = 8,
+        .inter = 24,
+        .vocab = 64,
+        .eps = 1e-5,
+        .rope_theta = 10000.0,
+        .rope_adjacent = false,
+        .num_experts = 2,
+        .experts_per_tok = 1,
+        .moe_inter = 16,
+        .shared_inter = 24,
+    };
+    var mw = model.ModelWeights{ .allocator = a, .config = cfg };
+    errdefer mw.deinit();
+    mw.embed = try a.alloc(f16, @as(usize, cfg.vocab) * cfg.hidden);
+    mw.final_norm = try a.alloc(f32, cfg.hidden);
+    mw.layers = try a.alloc(model.LayerWeights, cfg.layers);
+    @memset(mw.layers, .{});
+    fillDeterministic(mw.embed, 1, 1.0);
+    fillDeterministicF32(mw.final_norm, 2, 1.0, 0.1);
+    const lw = &mw.layers[0];
+    lw.attn_norm = try a.alloc(f32, cfg.hidden);
+    lw.ffn_norm = try a.alloc(f32, cfg.hidden);
+    lw.qkv = try a.alloc(f16, @as(usize, cfg.qkvDim()) * cfg.hidden);
+    lw.o = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.qDim());
+    fillDeterministicF32(lw.attn_norm, 100, 1.0, 0.1);
+    fillDeterministicF32(lw.ffn_norm, 200, 1.0, 0.1);
+    fillDeterministic(lw.qkv, 300, 0.3);
+    fillDeterministic(lw.o, 400, 0.3);
+    // The shared expert lives in the dense FFN slots.
+    lw.gate = try a.alloc(f16, @as(usize, cfg.shared_inter) * cfg.hidden);
+    lw.up = try a.alloc(f16, @as(usize, cfg.shared_inter) * cfg.hidden);
+    lw.down = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.shared_inter);
+    fillDeterministic(lw.gate, 500, 0.3);
+    fillDeterministic(lw.up, 600, 0.3);
+    fillDeterministic(lw.down, 700, 0.3);
+
+    var moe = model.MoeWeights{
+        .num_experts = cfg.num_experts,
+        .inter = cfg.moe_inter,
+        .hidden_dim = cfg.hidden,
+        .shared_inter = cfg.shared_inter,
+    };
+    moe.router = try a.alloc(f16, @as(usize, cfg.num_experts) * cfg.hidden);
+    moe.gate = try a.alloc(f16, @as(usize, cfg.num_experts) * cfg.moe_inter * cfg.hidden);
+    moe.up = try a.alloc(f16, @as(usize, cfg.num_experts) * cfg.moe_inter * cfg.hidden);
+    moe.down = try a.alloc(f16, @as(usize, cfg.num_experts) * cfg.hidden * cfg.moe_inter);
+    fillDeterministic(moe.router, 800, 0.5);
+    // Routed experts are ZERO: the forward pass output must come from the shared expert.
+    fillDeterministic(moe.gate, 900, 0.0);
+    fillDeterministic(moe.up, 1000, 0.0);
+    fillDeterministic(moe.down, 1100, 0.0);
+    moe.shared_gate = try a.alloc(f16, @as(usize, cfg.shared_inter) * cfg.hidden);
+    moe.shared_up = try a.alloc(f16, @as(usize, cfg.shared_inter) * cfg.hidden);
+    moe.shared_down = try a.alloc(f16, @as(usize, cfg.hidden) * cfg.shared_inter);
+    fillDeterministic(moe.shared_gate, 1200, 0.3);
+    fillDeterministic(moe.shared_up, 1300, 0.3);
+    fillDeterministic(moe.shared_down, 1400, 0.3);
+    if (with_gate_lin) {
+        // All zeros, so the pre-activation is exactly 0 and sigmoid(0) = 0.5: the shared
+        // expert must contribute at HALF weight. A forward pass that ignored the scale would
+        // use it at full weight and give a different answer.
+        moe.shared_gate_lin = try a.alloc(f16, cfg.hidden);
+        @memset(moe.shared_gate_lin, 0);
+    }
+    moe.expert_slot = cfg.moe_inter * cfg.hidden;
+    moe.expert_scratch = try a.alloc(f16, moe.expert_slot * 3);
+    fillDeterministic(moe.expert_scratch, 1600, 0.1);
+    lw.moe = moe;
+    return mw;
+}
+
+test "the shared expert's output is scaled by sigmoid(gate . h) (needs the ANE)" {
+    // This was a real bug: the scale was computed nowhere and the shared expert joined the
+    // residual at full weight. The equivalence test in this file cannot catch it, because
+    // prefill and decode would both omit it and agree with each other.
+    //
+    // With `shared_gate_lin` all zeros the scale is exactly sigmoid(0) = 0.5. Leaving the
+    // tensor empty takes the other branch, where the scale is 1.0. If the scale is applied
+    // at all, the two runs must differ; if it is ignored, they are identical.
+    if (!ane.available()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    var with = try buildSharedExpertFixture(a, true);
+    defer with.deinit();
+    var without = try buildSharedExpertFixture(a, false);
+    defer without.deinit();
+
+    const ids = [_]u32{ 3, 7, 11 };
+
+    const rt_with = try with.toRuntime(a);
+    var eng_with = try Engine.init(a, rt_with, with.layerSource(), with.headSource(rt_with.embed), .{
+        .max_seq = 32,
+        .verbose = false,
+        .chunk = 16,
+    });
+    defer eng_with.deinit();
+    const rt_without = try without.toRuntime(a);
+    var eng_without = try Engine.init(a, rt_without, without.layerSource(), without.headSource(rt_without.embed), .{
+        .max_seq = 32,
+        .verbose = false,
+        .chunk = 16,
+    });
+    defer eng_without.deinit();
+
+    var half: []f32 = &.{};
+    var full: []f32 = &.{};
+    for (ids, 0..) |id, pos| {
+        const x = try eng_with.forward(id, @intCast(pos));
+        const y = try eng_without.forward(id, @intCast(pos));
+        if (pos + 1 == ids.len) {
+            half = try a.dupe(f32, x);
+            full = try a.dupe(f32, y);
+        }
+    }
+    defer a.free(half);
+    defer a.free(full);
+
+    var worst: f32 = 0;
+    for (half, full) |h, f| worst = @max(worst, @abs(h - f));
+    // Halving the shared expert's contribution has to move the logits by a lot; the
+    // difference would be exactly 0 if the scale were ignored.
+    try std.testing.expect(worst > 0.05);
+}
