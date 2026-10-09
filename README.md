@@ -275,12 +275,20 @@ reused). In a two-turn example, turn 2 reported "prompt 44 (22 reused)".
 ## Sampling
 
 The sampler is shared by the CLI, the HTTP API and the WebUI. It applies the
-penalties first, then keeps the candidates within
-`max_logit - 20 * temperature` (anything below contributes less than e^-20 and
-cannot be drawn), sorts that much smaller set, and truncates it by `top_k` and
-then `top_p` before drawing. A single pass over the vocabulary plus a small sort
-replaces the naive O(vocabulary × k) scan, which mattered: Qwen2.5's vocabulary
-is 151 936 tokens.
+penalties first, then keeps the candidates within `max_logit - 20 * temperature`
+(anything below contributes less than e^-20 and cannot be drawn), keeps the `k`
+largest of those, and truncates by `top_p` before drawing.
+
+Two passes over the vocabulary plus a bounded selection replace the naive
+O(vocabulary × k) scan, which matters at Qwen2.5's 151 936 tokens. The numbers,
+measured rather than estimated:
+
+* the two full-vocabulary walks cost **0.13 ms/token** — that is the floor
+* at temperature 1.0 the cut leaves ~45 000 candidates, and processing them was
+  1.33 ms/token because the selection sorted all of them to keep 40
+* keeping the `k` largest and leaving the rest unordered took that to
+  **0.47 ms/token** (2.8×), and the cost tracks the candidate count, not the
+  vocabulary: at temperature 0.3 the cut leaves 33 and sampling is 0.13 ms.
 
 `--temp 0` is greedy. For small models a repetition penalty is the single
 biggest quality lever — the same prompt with `--temp 0.7 --top-p 0.9
