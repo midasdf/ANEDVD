@@ -938,3 +938,22 @@ rather than an error:
     *recognised but not run* (Mistral, SmolLM3), and `known_architectures`' comment says that
     being on the list is not a statement that the architecture was exercised — nineteen are
     listed, six were run.
+42. **Gemma 3's sliding pattern was assumed rather than read.** `swa_pattern` was hard-coded to
+    2 — correct for Gemma 2's 1:1 alternation — and `sliding_window_pattern`, the key that would
+    change it, was read nowhere. Gemma 3 repeats over six (five sliding layers, then one
+    global), and the reference rule `sliding if (i + 1) % pattern` is the shape `layerIsSliding`
+    already implements, so only the constant was wrong. One round after fixing Mistral's ignored
+    window, the same class of fault: recognised in `known_architectures`, wrong in the mask.
+
+    Both loaders now carry the pattern, with an explicit pattern overriding `swa_all`, and
+    `model.test` pins 6.
+
+    Two things I had to correct from the round that recorded this:
+
+    * I wrote that an HF Gemma 3 fails loudly. It does not — `load_hf` maps every `Gemma*` to
+      `"gemma2"` and every unrecognised architecture to `"llama"` by prefix match, with no
+      validation. The safe direction I claimed was not there.
+    * My first test called `layerIsSliding` with a hand-built config. That pins the rule but
+      not the reading of the key, and deleting the plumbing failed nothing — a check that could
+      not fail, in the round after writing about them. The test now goes through
+      `toModelConfig`, and removing the plumbing fails it (126 -> 125 passed).
