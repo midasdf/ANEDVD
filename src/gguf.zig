@@ -1779,3 +1779,34 @@ test "gguf: dequantizeRange converts in block-aligned chunks" {
     // Element offsets must be block-aligned.
     try testing.expectError(error.InvalidTensorShape, dequantizeRange(.q6_k, bin, 64, out[0..256]));
 }
+
+test "gguf: rejects a header claiming an absurd number of entries" {
+    // These two guards are what stop a crafted file from asking the parser to allocate for
+    // billions of entries before it discovers the file is 24 bytes long. Verified by hand
+    // against real files (2^40 tensors -> TooManyTensors, 2^40 metadata entries ->
+    // TooManyMetadataEntries), but they had no test, so nothing stopped a refactor from
+    // dropping them.
+    const a = testing.allocator;
+
+    var b = Builder.init(a);
+    defer b.deinit();
+    try b.header(3, 1 << 30, 0);
+    try b.buf.appendSlice(a, &(zeros(64)));
+    try testing.expectError(error.TooManyTensors, Gguf.fromBytes(a, b.buf.items));
+
+    var b2 = Builder.init(a);
+    defer b2.deinit();
+    try b2.header(3, 0, 1 << 30);
+    try b2.buf.appendSlice(a, &(zeros(64)));
+    try testing.expectError(error.TooManyMetadataEntries, Gguf.fromBytes(a, b2.buf.items));
+
+    // A count that the file could actually hold must NOT be rejected: the guard is about
+    // the count exceeding the remaining bytes, not about the count alone.
+    var b3 = Builder.init(a);
+    defer b3.deinit();
+    try b3.header(3, 0, 0);
+    try b3.padTo(32);
+    var ok = try Gguf.fromBytes(a, b3.buf.items);
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.tensorCount());
+}
