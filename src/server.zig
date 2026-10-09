@@ -40,6 +40,15 @@ pub const Server = struct {
     served_during_generation: u64 = 0,
     /// Generation requests turned away with 503 because the engine was busy.
     busy_rejections: u64 = 0,
+    /// SSE keep-alive comments written while a long prefill produced no tokens.
+    keep_alives: u64 = 0,
+    /// Nanoseconds since the last byte written to the client on the active stream.
+    /// Drives the keep-alive decision; see `streamKeepAlive`.
+    last_write_ns: i128 = 0,
+    /// The streaming response currently in flight, if any. Only one generation runs at a
+    /// time, so a single pointer is enough, and the prefill tick uses it to keep that
+    /// stream's socket warm while prefill emits nothing.
+    active_sink: ?*SseSink = null,
     /// A connection accepted mid-generation that has not sent its request yet,
     /// kept alive between generated tokens instead of being dropped.
     pending: ?http.Conn = null,
@@ -192,6 +201,11 @@ pub const Server = struct {
         try conn.beginStream(200, "OK", "text/event-stream");
         var sink = SseSink.init(self.allocator, conn, .openai, model_name, created);
         sink.server = self;
+        // Let the prefill tick find this stream and keep its socket warm; see
+        // `streamKeepAlive`.
+        self.active_sink = &sink;
+        self.last_write_ns = sys.nowNs();
+        defer self.active_sink = null;
         defer sink.deinit();
         sink.setStops(stops);
         const stats = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
@@ -210,6 +224,33 @@ pub const Server = struct {
     /// only then writes its request. Dropping it because no bytes were ready yet
     /// closes the socket under the client, which sees an empty reply — measured
     /// at a 40 ms connect-to-request delay.
+    /// How long a streaming response may go without a byte before a comment is sent.
+    ///
+    /// Prefill emits nothing until it finishes, and that window is the whole prefill: about
+    /// 90 s for a 332-token Qwen1.5-MoE prompt. Proxies and load balancers commonly drop an
+    /// idle connection after 30-60 s, which truncates the stream, and the client sees a
+    /// half-finished answer rather than an error.
+    const keep_alive_interval_ns: i128 = 5 * std.time.ns_per_s;
+
+    /// Send an SSE comment if the active stream has been silent for too long.
+    ///
+    /// A comment line (`: ...`) is ignored by every SSE client by specification, so this
+    /// cannot corrupt the response — unlike a `data:` frame, which would have to be valid
+    /// JSON and would show up as content.
+    fn streamKeepAlive(self: *Server) void {
+        const sink = self.active_sink orelse return;
+        if (!sink.conn.alive) return;
+        const now = sys.nowNs();
+        if (self.last_write_ns == 0) {
+            self.last_write_ns = now;
+            return;
+        }
+        if (now - self.last_write_ns < keep_alive_interval_ns) return;
+        sink.conn.write(": keep-alive\n\n") catch return;
+        self.last_write_ns = now;
+        self.keep_alives += 1;
+    }
+
     pub fn servicePending(self: *Server) void {
         var srv = self.listener orelse return;
         srv.setNonBlocking(true);
@@ -835,6 +876,7 @@ const SseSink = struct {
 fn prefillTick(ctx: ?*anyopaque) void {
     const self: *Server = @ptrCast(@alignCast(ctx orelse return));
     self.servicePending();
+    self.streamKeepAlive();
 }
 
 /// 503 with Retry-After for a request that needs the busy engine.
@@ -950,4 +992,28 @@ test "clampF32 and clampRepetitionPenalty produce usable values" {
     try std.testing.expectEqual(@as(f32, 1.0), clampRepetitionPenalty(std.math.nan(f32)));
     try std.testing.expectEqual(@as(f32, 1.15), clampRepetitionPenalty(1.15));
     try std.testing.expectEqual(@as(f32, 4.0), clampRepetitionPenalty(100.0));
+}
+
+test "the keep-alive timing rule fires only after the interval" {
+    // The decision itself, isolated from sockets: given "ns since the last byte", should a
+    // comment be sent? Prefill for a long prompt emits nothing for tens of seconds, and a
+    // proxy will drop an idle connection well before that.
+    const should = struct {
+        fn f(since_ns: i128) bool {
+            return since_ns >= Server.keep_alive_interval_ns;
+        }
+    }.f;
+
+    // A stream that has just written must not be spammed with comments...
+    try std.testing.expect(!should(0));
+    try std.testing.expect(!should(1 * std.time.ns_per_s));
+    try std.testing.expect(!should(Server.keep_alive_interval_ns - 1));
+    // ...and one that has been silent for longer than any proxy's idle timeout must get one.
+    try std.testing.expect(should(Server.keep_alive_interval_ns));
+    try std.testing.expect(should(30 * std.time.ns_per_s));
+    try std.testing.expect(should(90 * std.time.ns_per_s)); // a 332-token MoE prefill
+
+    // The interval has to be shorter than the shortest idle timeout a proxy commonly
+    // applies (30 s), or the comment arrives after the connection is already gone.
+    try std.testing.expect(Server.keep_alive_interval_ns < 30 * std.time.ns_per_s);
 }
