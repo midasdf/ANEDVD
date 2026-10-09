@@ -468,6 +468,8 @@ pub const Engine = struct {
     /// are harmless — and measurably free, because the weights are read once per
     /// evaluation regardless of width.
     pub fn forward(self: *Engine, token: u32, pos: u32) ![]f32 {
+        // Same bound as `prefill`: `pos` indexes a row of the KV cache.
+        if (pos >= self.max_seq) return error.ContextOverflow;
         const cfg = self.config;
         const ch = self.chunk;
         const hidden: usize = cfg.hidden;
@@ -810,6 +812,12 @@ pub const Engine = struct {
     /// the last one. This is where the weight-bandwidth-bound behaviour of the
     /// ANE pays off: a whole chunk costs the same as a single token.
     pub fn prefill(self: *Engine, ids: []const u32, start_pos: u32) ![]f32 {
+        // The KV cache holds exactly `max_seq` rows per layer. Writing past them is a heap
+        // overflow, and it does not fail loudly: `anedvd verify` with a 1121-token prompt on
+        // a 1024-token context returned all-zero logits and a rel of 1.0 rather than
+        // crashing. `generate` truncates its input so it never gets here, but `verify`,
+        // `layers` and `check` call this directly.
+        if (@as(usize, start_pos) + ids.len > self.max_seq) return error.ContextOverflow;
         const cfg = self.config;
         const ch = self.chunk;
         const hidden: usize = cfg.hidden;

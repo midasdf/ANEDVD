@@ -1167,9 +1167,10 @@ fn cmdCpu(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         allocator.free(st.k);
         allocator.free(st.v);
     }
+    const ref_seq: usize = @max(1024, ids.len + max_tokens + 8);
     for (0..L) |i| {
-        st.k[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
-        st.v[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
+        st.k[i] = try allocator.alloc(f16, ref_seq * cfg.kvDim());
+        st.v[i] = try allocator.alloc(f16, ref_seq * cfg.kvDim());
         @memset(st.k[i], 0);
         @memset(st.v[i], 0);
     }
@@ -1754,8 +1755,16 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     var ref_mw = try cloneForReference(allocator, path, layers);
     defer ref_mw.deinit();
 
+    // Encode first: the context has to be sized to the prompt. A fixed 1024 meant a longer
+    // prompt wrote past the KV cache — a 1121-token prompt returned all-zero logits with
+    // rel 1.0 instead of an error. The engine now refuses that outright, and here the
+    // context is simply made large enough.
+    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
+    defer allocator.free(ids);
+    const verify_seq: u32 = @intCast(@max(@as(usize, 1024), ids.len + 8));
+
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
-        .max_seq = 1024,
+        .max_seq = verify_seq,
         .verbose = false,
         .chunk = 128,
     });
@@ -1765,9 +1774,6 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     // [-softcap, softcap] and `rel` stops being able to distinguish a correct model from
     // a broken one: gemma-2-2b answered "Paris" correctly while verify reported MISMATCH.
     eng.pre_softcap = true;
-
-    const ids = try loaded.tokenizer.encode(allocator, prompt, true);
-    defer allocator.free(ids);
 
     // ANE prefill, and then one decode step on top of it: the two paths use
     // different kernels (a chunk-wide pass vs a single column), so both need
@@ -1787,8 +1793,11 @@ fn cmdVerify(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         allocator.free(st.v);
     }
     for (0..layers) |i| {
-        st.k[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
-        st.v[i] = try allocator.alloc(f16, 1024 * cfg.kvDim());
+        // Sized to the engine's context, not a fixed 1024: a longer prompt wrote past this
+        // buffer too, which is why the engine and the reference disagreed at 1121 tokens
+        // even after the engine was fixed.
+        st.k[i] = try allocator.alloc(f16, @as(usize, verify_seq) * cfg.kvDim());
+        st.v[i] = try allocator.alloc(f16, @as(usize, verify_seq) * cfg.kvDim());
         @memset(st.k[i], 0);
         @memset(st.v[i], 0);
     }
