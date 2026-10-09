@@ -646,3 +646,30 @@ rather than an error:
     Verified by forcing the failure on all three APIs: 400 for non-streaming, an error frame
     for streaming. An oversized `max_tokens` now returns a real answer — 11 SSE frames,
     `finish_reason: "stop"`, `prompt_tokens_dropped: 0`.
+21. **A wrong argument failed far from its cause.** `--chunk 0` compiled a width-zero kernel
+    and reported `AneCompileFailed`; `--max-seq 0` reported `PromptTooLong`. Neither names
+    the flag, and both send the reader to the wrong place. `argValueAtLeast` now rejects a
+    value below a minimum with the argument named and exit code 2, applied where `run`,
+    `serve`, `kernels` and `attnbench` read the flags. The minimums are measured: 0 is the
+    only unusable chunk width, and a max-seq below 4 cannot hold a two-token prompt.
+
+22. **Probed and found correct** (recorded so they are not re-tested):
+
+    * **KV prefix reuse** — a conversation grown by one turn reuses 22 of 38 tokens
+      (`[req] prompt 38 (22 reused, 16 new)`). Reuse correctly falls to 0 when the prompt is
+      shorter than the cache or when a different conversation intervenes.
+    * **Interleaved conversations do not corrupt each other** — A, B, A, B with temperature
+      0 gives byte-identical output for both A and B.
+    * **Malformed GGUFs are rejected safely**, with specific errors and exit 1: a random
+      file and a text file give `NotGgufFile`, a truncated model `TruncatedFile`, an empty
+      directory `NoShardsFound`, and a crafted header claiming 2^40 tensors or metadata
+      entries `TooManyTensors` / `TooManyMetadataEntries`. No crash, no large allocation.
+    * **HTTP edge cases** — `OPTIONS` 204, `HTTP/1.0`, a 5 KB URL (`404`), a 4 KB header
+      value, `Host:x` with no space, lowercase method, pipelined requests, chunked encoding
+      without a length (`400`), and invalid UTF-8 in the JSON body (`400`).
+    * **The WebUI end to end** — `/health`, `/v1/models`, the page itself (24976 bytes) and
+      its streaming chat call, whose frames assemble into valid UTF-8 content.
+    * **Immediate EOS** — a degenerate prompt (1250 repetitions of `a`) makes SmolLM2 emit
+      EOS as its first token. A cold request returns `finish_reason: "stop"` with empty
+      content, and so does the CLI (`stop: stop`, 0 tokens), so this is the model, not a
+      cache or API fault.
