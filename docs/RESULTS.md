@@ -772,3 +772,21 @@ rather than an error:
     Both now print a note naming the context size and the number of tokens dropped, only when
     something was dropped. `chat` also suggests `--max-seq N` or `/reset`, and `/reset` was
     checked to exist and to recover (the next prompt returns to 12 tokens from 87).
+29. **Both KV caches overflowed above 1024 tokens, silently.** `anedvd verify` with a
+    1121-token prompt reported all-zero logits and a rel of exactly 1.0:
+
+        prefill: max|ANE - CPU| = 3.10734e3   max|logit| = 3.107e3   rel = 1.00000e0
+        decode:  max|ANE - CPU| = 0.00000e0   max|logit| = 0.000e0
+
+    The engine's cache is `max_seq` rows and the CPU reference's was a hardcoded
+    `1024 * cfg.kvDim()`, so a longer prompt wrote past both. Neither crashed, which is why
+    this went unnoticed — it returned meaningless numbers instead, and `verify` reported
+    MISMATCH rather than saying the comparison could not be made.
+
+    `Engine.prefill`/`forward` now return `error.ContextOverflow`; `verify` encodes the prompt
+    before building the engine and sizes both contexts to fit; the `cpu` command sizes its
+    reference from the prompt plus the completion. The same 1121-token prompt then matches at
+    rel 1.20e-2 prefill and 1.53e-2 decode with equal argmax.
+
+    The consequence worth stating plainly: `verify` is the ground truth behind every numerical
+    claim in this project, and above 1024 tokens it had been comparing garbage with garbage.
