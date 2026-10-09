@@ -112,6 +112,10 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         // Mistral-style models apply their window to every layer; only Gemma 2 alternates,
         // and that is handled by `swa_pattern` defaulting to 2.
         .swa_all = !std.mem.startsWith(u8, c.arch, "Gemma"),
+        // Gemma 2 alternates 1:1; Gemma 3 repeats over six (five sliding, one global). The
+        // reference's rule is `sliding if (i + 1) % pattern`, which is the shape
+        // `layerIsSliding` already implements — only the constant differs.
+        .swa_pattern = if (c.sliding_window_pattern > 0) c.sliding_window_pattern else 2,
     };
 }
 
@@ -497,6 +501,17 @@ test "a Mistral config windows every layer, a Gemma 2 config alternates" {
     try std.testing.expect(!g.swa_all); // Gemma 2 alternates instead
     try std.testing.expect(g.layerIsSliding(0));
     try std.testing.expect(!g.layerIsSliding(1));
+
+    // The pattern must actually reach the config: a test of `layerIsSliding` alone pins the
+    // rule but not the reading of the key, so removing the plumbing would not fail anything.
+    var gemma3 = base;
+    gemma3.arch = "Gemma3ForCausalLM";
+    gemma3.sliding_window_pattern = 6;
+    const g3 = try toModelConfig(gemma3);
+    try std.testing.expectEqual(@as(u32, 6), g3.swa_pattern);
+    for (0..5) |li| try std.testing.expect(g3.layerIsSliding(@intCast(li)));
+    try std.testing.expect(!g3.layerIsSliding(5));
+    try std.testing.expect(g3.layerIsSliding(6));
 
     // A model with no window declared must not slide anywhere, whatever the architecture.
     var none = base;

@@ -119,6 +119,10 @@ pub const Config = struct {
     /// Gemma 2: sliding-window size, and the per-layer type list it alternates with.
     sliding_window: u32,
     sliding_window_size: u32,
+    /// How many layers the sliding/full pattern repeats over. Gemma 2 uses 2 (1:1); Gemma 3
+    /// uses 6 (five sliding, then one global). Absent means the architecture's default, which
+    /// only Gemma 2 has a reason to assume.
+    sliding_window_pattern: u32 = 0,
 
     /// Frees `arch`. All other fields are value types.
     pub fn deinit(self: *Config, allocator: Allocator) void {
@@ -213,6 +217,7 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
         .final_logit_softcapping = getF32(obj, &.{"final_logit_softcapping"}) orelse 0,
         .sliding_window = getU32(obj, &.{"sliding_window"}) orelse 0,
         .sliding_window_size = getU32(obj, &.{"sliding_window_size"}) orelse 0,
+        .sliding_window_pattern = getU32(obj, &.{"sliding_window_pattern"}) orelse 0,
     };
 }
 

@@ -686,3 +686,14 @@ test "Mistral windows every layer; Gemma 2 alternates" {
     try std.testing.expect(!plain.layerIsSliding(0));
     try std.testing.expect(!plain.layerIsSliding(1));
 }
+
+test "a sliding pattern of six is five sliding layers then one global" {
+    // Gemma 2 alternates 1:1 (`swa_pattern = 2`). Gemma 3 repeats over six, and the config key
+    // that says so used to be read nowhere, so a Gemma 3 model silently got Gemma 2's pattern.
+    // The reference rule is the same shape for both: `sliding if (layer + 1) % pattern`.
+    const gemma3 = Config{ .sliding_window = 1024, .swa_pattern = 6 };
+    for (0..5) |li| try std.testing.expect(gemma3.layerIsSliding(@intCast(li)));
+    try std.testing.expect(!gemma3.layerIsSliding(5)); // the sixth layer is global
+    for (6..11) |li| try std.testing.expect(gemma3.layerIsSliding(@intCast(li)));
+    try std.testing.expect(!gemma3.layerIsSliding(11));
+}

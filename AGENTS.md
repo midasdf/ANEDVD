@@ -141,12 +141,17 @@ zig fmt src build.zig
      `.swa_pattern = if (c.sliding_window_pattern > 0) c.sliding_window_pattern else 2` in
      `toModelConfig`.
   2. `load_gguf`: read `attention.sliding_window_pattern` and assign `cfg.swa_pattern`.
-  3. Add `gemma3` to the HF architecture list — it is in the GGUF list but not the HF one, so
-     an HF Gemma 3 currently fails with "unsupported architecture" rather than loading wrongly,
-     which is at least the safe direction.
+  3. `load_hf` maps every `Gemma*` architecture to `"gemma2"` and every unrecognised name to
+     `"llama"` (a prefix match, no validation), so an HF Gemma 3 does **not** fail loudly — it
+     loads and is treated as Gemma 2. I first wrote here that it fails; that was wrong.
   4. A test mirroring "Mistral windows every layer; Gemma 2 alternates": with pattern 6, layers
      0-4 slide, layer 5 does not, layer 6 slides.
   `gemma` (1) is in the same position and has no window at all, so it is only affected by (3).
+  **1, 2 and 4 are done** (round 42): the pattern is parsed from both formats, `toModelConfig`
+  uses it with 2 as the Gemma 2 default, `load_gguf` clears `swa_all` when an explicit pattern
+  is present, and `model.test` pins pattern 6 (126 tests). Piece 3 is deliberately not done: the
+  HF side has no architecture validation at all, so adding gemma3 to a list that does not exist
+  is a separate change.
 * **A KV cache is `max_seq` rows and nothing checked that.** `verify` used a fixed 1024-row
   context and its CPU reference a hardcoded `1024 * cfg.kvDim()`, so a 1121-token prompt
   wrote past both — and returned all-zero logits with `rel = 1.0` rather than crashing.

@@ -143,6 +143,14 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
             cfg.swa_all = true;
         }
     }
+    // The pattern key overrides the architecture default in both directions: Gemma 3 needs 6
+    // where Gemma 2 uses 2, and a non-Gemma model may declare one too.
+    if (g.getU32(key(&buf, arch, "attention.sliding_window_pattern"))) |pat| {
+        if (pat > 0) {
+            cfg.swa_pattern = pat;
+            cfg.swa_all = false;
+        }
+    }
 
     // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /
     // .expert_shared_count / .expert_feed_forward_length).
