@@ -104,6 +104,12 @@ pub const MappedFile = struct {
         const raw = std.c.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         if (raw == std.c.MAP_FAILED) return error.MmapFailed;
         const ptr: [*]align(std.heap.page_size_min) const u8 = @ptrCast(@alignCast(raw));
+        // NOT MADV_RANDOM, despite MoE expert access being scattered across a 9.5 GB
+        // file. Measured over four interleaved pairs of single-token runs, MADV_RANDOM
+        // LOST every pair on minor page faults (median 391208 against 383327, 0 wins of
+        // 4), so the kernel's default readahead is the better choice here — presumably
+        // because the experts a generation actually revisits are spatially clustered by
+        // layer. Recorded so it is not "fixed" again without measuring.
         return .{ .fd = fd, .data = ptr[0..size] };
     }
 
