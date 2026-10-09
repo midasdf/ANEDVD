@@ -452,3 +452,57 @@ test "a Gemma HF checkpoint needs the (1 + w) offset that a GGUF does not" {
     try std.testing.expect(!lm.use_gelu);
     try std.testing.expectEqual(@as(f32, 1.0), lm.embed_scale);
 }
+
+test "a Mistral config windows every layer, a Gemma 2 config alternates" {
+    // Both architectures declare a sliding window and the two apply it differently. The
+    // mapper used to read the window and leave `swa_pattern` at Gemma 2's 2, so Mistral got
+    // the alternating rule and windowed only half its layers.
+    const base = hf.Config{
+        .arch = "MistralForCausalLM",
+        .hidden_size = 4096,
+        .num_hidden_layers = 32,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 8,
+        .head_dim = 128,
+        .intermediate_size = 14336,
+        .vocab_size = 32000,
+        .num_experts = 0,
+        .num_experts_per_tok = 0,
+        .moe_intermediate_size = 0,
+        .shared_expert_intermediate_size = 0,
+        .norm_topk_prob = false,
+        .decoder_sparse_step = 1,
+        .mlp_only_layers = 0,
+        .attn_logit_softcapping = 0,
+        .final_logit_softcapping = 0,
+        .sliding_window = 4096,
+        .sliding_window_size = 0,
+        .rms_norm_eps = 1e-5,
+        .rope_theta = 10000.0,
+        .tie_word_embeddings = false,
+        .max_position_embeddings = 32768,
+        .bos_token_id = 1,
+        .eos_token_id = 2,
+    };
+
+    const mistral = try toModelConfig(base);
+    try std.testing.expectEqual(@as(u32, 4096), mistral.sliding_window);
+    try std.testing.expect(mistral.swa_all);
+    for (0..6) |li| try std.testing.expect(mistral.layerIsSliding(@intCast(li)));
+
+    var gemma = base;
+    gemma.arch = "Gemma2ForCausalLM";
+    const g = try toModelConfig(gemma);
+    try std.testing.expectEqual(@as(u32, 4096), g.sliding_window);
+    try std.testing.expect(!g.swa_all); // Gemma 2 alternates instead
+    try std.testing.expect(g.layerIsSliding(0));
+    try std.testing.expect(!g.layerIsSliding(1));
+
+    // A model with no window declared must not slide anywhere, whatever the architecture.
+    var none = base;
+    none.sliding_window = 0;
+    const n = try toModelConfig(none);
+    try std.testing.expectEqual(@as(u32, 0), n.sliding_window);
+    try std.testing.expect(!n.layerIsSliding(0));
+    try std.testing.expect(!n.layerIsSliding(1));
+}

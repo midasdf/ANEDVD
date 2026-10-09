@@ -821,3 +821,37 @@ test "a Gemma GGUF does NOT need the (1 + w) offset, because it is already appli
     try std.testing.expect(cfg.attn_scale > 0);
     try std.testing.expectApproxEqAbs(1.0 / @sqrt(288.0), cfg.attn_scale, 1e-5);
 }
+
+test "a Mistral GGUF's sliding window is read, not ignored" {
+    // The loader read `attention.sliding_window` only inside the gemma branch, so a Mistral
+    // file with the key attended globally over the whole context. This asserts the key is
+    // honoured and that all layers slide, which is Mistral's rule rather than Gemma 2's.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 0);
+    try putInt(&bytes, a, u64, 7); // exactly the kv pairs written below
+    try putStr(&bytes, a, "general.architecture", "mistral");
+    try putU32Kv(&bytes, a, "mistral.embedding_length", 256);
+    try putU32Kv(&bytes, a, "mistral.block_count", 2);
+    try putU32Kv(&bytes, a, "mistral.attention.head_count", 8);
+    try putU32Kv(&bytes, a, "mistral.feed_forward_length", 512);
+    try putU32Kv(&bytes, a, "mistral.attention.sliding_window", 4096);
+    try putU32Kv(&bytes, a, "mistral.vocab_size", 1024);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.sliding_window);
+    try std.testing.expect(cfg.swa_all);
+    try std.testing.expect(cfg.layerIsSliding(0));
+    try std.testing.expect(cfg.layerIsSliding(1)); // every layer, not alternating
+    // Mistral is a llama-family model: adjacent RoPE and no Gemma-specific flags.
+    try std.testing.expect(cfg.rope_adjacent);
+    try std.testing.expect(!cfg.use_gelu);
+    try std.testing.expect(!cfg.norm_unit_offset);
+}
