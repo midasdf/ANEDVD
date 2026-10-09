@@ -562,3 +562,36 @@ rather than an error:
     4 x 24 x 23.1 MB = **2.2 GB** resident. On an 8 GB machine, where an earlier eager
     materialisation mistake already produced 30 s/token through swap thrashing, the memory
     is worth more than the 11%. See `research/moe-design.md`.
+17. **The ANE has a ~103 µs fixed cost per `eval()`, and for small models that dominates
+    decode.** `anedvd bench` sweeps a 1x1 conv over square sizes, timing only
+    `kernel.eval()` (not the input write or output read):
+
+        size    weight MB    us/eval    implied GB/s
+         128      0.033      107.73        0.30
+         256      0.131      106.63        1.23
+         512      0.524      102.78        5.10
+        1024      2.097      138.80       15.11
+        2048      8.389      285.18       29.42
+        4096     33.554     1206.42       27.81
+
+    Time is **flat at 103-108 µs from size 128 to 512**, where the weights are 33 KB to
+    524 KB — too small for bandwidth to matter. So ~103 µs is a floor on a single eval,
+    independent of what it computes. Above that the marginal rate is 46-59 GB/s up to
+    size 2048. Reproduced across runs (114.72 / 106.52 / 104.63 / 136.22 / 279.68 /
+    1209.02 us).
+
+    What that means for the models, using three projections per layer plus one head eval:
+
+        model            evals/token   floor      decode       floor share
+        SmolLM2-135M         91        9.4 ms     23.2 ms         40%
+        Qwen2.5-0.5B         73        7.5 ms     30.4 ms         25%
+        Qwen3-0.6B           85        8.8 ms     36.2 ms         24%
+        Qwen2.5-1.5B         85        8.8 ms     88.0 ms         10%
+
+    **A quarter to two-fifths of small-model decode is the ANE's per-eval floor**, and the
+    only way to reduce it is fewer evals. A transformer decode cannot: qkv, attention
+    output and the FFN are sequentially dependent through the CPU attention in between, so
+    three evals per layer is the minimum. This is why SmolLM2's qkv runs at 6 GB/s while a
+    2048-wide conv reaches 30 GB/s — the kernel is fine, the shape is simply below the
+    floor's useful range. It also bounds priorities (1) and (2): the CPU-side sampler and
+    attention are already a few per cent, and the ANE side is floor- plus bandwidth-bound.
