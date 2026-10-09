@@ -100,28 +100,44 @@ simply faster than compiling a kernel for them.
 
 ## Where the CPU time actually goes (measured on the engine)
 
-`anedvd run` now prints the CPU MoE time, which the ANE node split does not show.
-On Qwen1.5-MoE-A2.7B, one token with a 10-token prompt:
+`anedvd run` prints the CPU MoE time, which the ANE node split does not show. Two
+corrections to what earlier commits in this repo claimed:
 
-  CPU MoE experts: 11386 ms/token (93% of decode+prefill)
+**The number was wrong.** The first version of that line divided the whole run's MoE
+time by the *decode* token count, folding the prompt pass into it. On a 10-token
+prompt generating 1 token that inflated it 11x: it reported 11386 ms/token. The
+corrected figure for the same run is
 
-Broken down in isolation, per layer for one token (4 experts x 3 tensors):
+  CPU MoE experts: 57.7 ms/token
+
+So decode is not 93% CPU experts; that was an artefact of the arithmetic. Reported
+properly, the ANE attention remains the larger share of decode.
+
+**The matmul was still worth vectorising.** Isolated, one layer's expert work for one
+token (4 experts x gate/up/down, from a 60-expert layer):
 
 | step | before | after |
 |---|---|---|
-| matrix multiply | 122 ms | 23 ms |
-| dequantise | 205 ms | 165 ms |
+| matrix multiply | 122 ms | 20.8 ms |
+| dequantise (streaming path only) | 205 ms | 165 ms |
 
-The matmul was scalar — one multiply-accumulate per iteration — and 0.83 GMAC per
-token at ~1 MAC/cycle predicts the ~10 s/token the engine measured. Vectorising it
-to eight lanes cut that step 5.3x, and the MoE reference still matches exactly.
+0.83 GMAC/token at one multiply-accumulate per instruction predicts ~10 s/token, so
+the scalar loop was real; eight lanes cut it ~6x, and the reference still matches to
+six decimals.
 
-**End-to-end decode barely moved (11.4 -> 9.97 s/token), and the reason matters:**
-the microbenchmark re-reads the same four experts, so their pages are hot, while the
-engine reads whatever the router picked. On this randomly-routed checkpoint that is
-a different, cold set nearly every layer. The dominant remaining cost is therefore
-dequantisation volume, not arithmetic — the same conclusion the streaming
-measurements reached from the other direction (219 MB/s cold and warm alike).
+**The remaining streaming cost is f32 -> f16 conversion, not dequantisation.** Measured
+separately over one expert (2048x1408):
+
+| step | rate |
+|---|---|
+| `dequantizeRange` to f32 | 1101 M elem/s |
+| `f32ToF16Slice` alone | 666 M elem/s |
+
+The conversion is 59% of the streaming read, and it is a hardware rate: widening the
+vector from 8 to 16, 32 or 64 lanes does not help (514, 555, 499 and 359 M elem/s
+respectively). The engine's eager path never pays it — it dequantises once at load —
+but any streaming path does, and the fix is to keep the expert in f32 and skip the
+round trip rather than to tune the loop.
 
 ## Status and verification
 
