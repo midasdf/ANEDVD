@@ -125,19 +125,35 @@ token (4 experts x gate/up/down, from a 60-expert layer):
 the scalar loop was real; eight lanes cut it ~6x, and the reference still matches to
 six decimals.
 
-**The remaining streaming cost is f32 -> f16 conversion, not dequantisation.** Measured
-separately over one expert (2048x1408):
+**Keeping experts in f32 is not the win it looks like.** Measured over one expert
+(2048x1408), the conversion dominates the READ:
 
 | step | rate |
 |---|---|
 | `dequantizeRange` to f32 | 1101 M elem/s |
 | `f32ToF16Slice` alone | 666 M elem/s |
+| `readExpertF16` (both, end to end) | 7377 us |
+| `dequantizeRange` alone, f32 out | 2613 us |
 
-The conversion is 59% of the streaming read, and it is a hardware rate: widening the
-vector from 8 to 16, 32 or 64 lanes does not help (514, 555, 499 and 359 M elem/s
-respectively). The engine's eager path never pays it — it dequantises once at load —
-but any streaming path does, and the fix is to keep the expert in f32 and skip the
-round trip rather than to tune the loop.
+so a path that dequantises straight to f32 and matmuls there looked 2.1x faster, and a
+prototype that read AND matmul'd each expert agreed (9774 us against 4581 us).
+
+**It was wrong.** Those microbenchmarks read the expert as part of the timing. Once the
+weights are resident and only the MATMUL is timed — which is what a decoding token
+does, reusing scratch across experts — f32 is 4% *slower*:
+
+| weights | 4 experts, resident |
+|---|---|
+| fp16 | 25.8 ms |
+| f32 | 26.8 ms |
+
+The f32 scratch is 34.6 MB against 17.3 MB, so the doubled footprint costs more in
+cache pressure than the skipped conversion saves. Interleaving the two in one process
+was necessary to see this: separate runs of the same binary varied 1947-2789 ms, which
+swamps the effect entirely.
+
+The vectorisation is still a hardware rate and widening it does not help (8, 16, 32 and
+64 lanes give 514, 555, 499 and 359 M elem/s).
 
 ## Status and verification
 
