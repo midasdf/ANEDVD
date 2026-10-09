@@ -504,11 +504,21 @@ quantisation rather than unified memory:
   token reads its experts out of the mapping and multiplies them in scalar code.
   [`research/moe-design.md`](research/moe-design.md) has the arithmetic, the measured
   ceilings and the levers that would move it.
-* **Not all architectures are supported.** Llama, Qwen2, Qwen3, Mistral,
-  SmolLM2/3 and the TinyLlama-era Llama layout. Anything with a different
-  attention layout (MoE routing, MLA, sliding-window variants) needs work.
-  An unrecognised `general.architecture` is accepted with a warning, since the
-  GGUF tensor names are the same — but check the output.
+* **Not all architectures are supported.** Verified end to end: Llama,
+  Qwen2, Qwen3, Mistral, SmolLM2/3, the TinyLlama-era Llama layout, Qwen2-MoE
+  and **Gemma 2** (which needs its `(1 + w)` RMSNorm, `sqrt(hidden)` embedding
+  scale, tanh-GELU FFN, both logit soft-caps, alternating sliding-window
+  attention and the "sandwich" norms — all of them implemented).
+  Anything with a different attention layout (MLA, other sliding-window
+  variants) needs work. An unrecognised `general.architecture` is accepted
+  with a warning, since the GGUF tensor names are the same — but check the
+  output.
+* **A model's norm convention can depend on the file, not the architecture.**
+  Gemma's RMSNorm is `x * (1 + w)`. An HF checkpoint stores the raw parameter and
+  needs the offset added; the GGUF converter has *already* applied it (measured:
+  `blk.0.attn_norm.weight` has mean 1.1927, the effective factor, where the raw
+  parameter would be ~0.19). Applying it twice makes the model emit a run of dots
+  instead of an answer.
 * Sampling with `top_p` on a 151936-token vocabulary costs ~1.2 ms/token at
   temperature 1.0, about 10% of decode. Measured, not assumed:
   [`docs/RESULTS.md`](docs/RESULTS.md).
