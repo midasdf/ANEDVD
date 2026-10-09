@@ -517,13 +517,10 @@ quantisation rather than unified memory:
   tanh-GELU FFN, both logit soft-caps, alternating sliding-window attention and
   the "sandwich" norms — all of them implemented).
 
-  *Recognised but not run here*: Mistral, SmolLM3 and Gemma 3, and for Gemma 3 the pattern is
-  known to be wrong rather than merely unproven — it needs `sliding_window_pattern = 6`
-  (five sliding layers, one global) while this code assumes Gemma 2's 1:1, an unread config key
-   away from correct. Their configuration is
-  parsed and unit-tested — Mistral's sliding window is applied to every layer,
-  which differs from Gemma 2's alternating rule — but no Mistral or SmolLM3
-  checkpoint was available on this machine to run end to end, so treat their
+  *Recognised but not run here*: Mistral, SmolLM3 and Gemma 3. Their configuration is parsed
+  and unit-tested — Mistral's window applies to every layer, Gemma 2's alternates 1:1, and
+  Gemma 3 repeats over six, all three now read from the config rather than assumed — but no
+  checkpoint for any of them was available on this machine to run end to end, so treat their
   status as "implemented, unproven". (This list said "verified end to end" until
   a review: Mistral's window had in fact been ignored entirely, and the config
   tests that now cover it are the fix.)
