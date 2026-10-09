@@ -225,7 +225,7 @@ pub const Server = struct {
         if (ids.len == 0) return sendError(conn, 400, "prompt encoded to zero tokens");
 
         const params = generate.Params{
-            .max_tokens = max_tokens,
+            .max_tokens = clampMaxTokens(max_tokens, ids.len, self.session.engine.max_seq),
             .sampler = .{
                 // Clamped, not passed through: 0 for top_p means "no tokens" and
                 // a repetition penalty of 0 divides by zero inside the sampler.
@@ -456,7 +456,7 @@ pub const Server = struct {
         const ids = try self.session.tokenizer.encode(a, prompt, true);
         if (ids.len == 0) return sendError(conn, 400, "prompt encoded to zero tokens");
         const params = generate.Params{
-            .max_tokens = max_tokens,
+            .max_tokens = clampMaxTokens(max_tokens, ids.len, self.session.engine.max_seq),
             .sampler = .{
                 .temperature = clampF32(temperature, 0.0, 4.0),
                 .top_p = clampF32(getFloat(root, "top_p", self.opts.default_top_p), 0.01, 1.0),
@@ -534,7 +534,7 @@ pub const Server = struct {
         if (ids.len == 0) return sendError(conn, 400, "prompt encoded to zero tokens");
 
         const params = generate.Params{
-            .max_tokens = max_tokens,
+            .max_tokens = clampMaxTokens(max_tokens, ids.len, self.session.engine.max_seq),
             .sampler = .{
                 .temperature = clampF32(temperature, 0.0, 4.0),
                 .top_p = clampF32(getFloat(root, "top_p", self.opts.default_top_p), 0.01, 1.0),
@@ -1047,6 +1047,23 @@ fn prefillTick(ctx: ?*anyopaque) void {
     self.streamKeepAlive();
 }
 
+/// Clamp an API `max_tokens` to what this engine can actually serve.
+///
+/// Asking for more than the context window used to fail deep inside `generate` with
+/// `PromptTooLong`, after the server had already committed to a response: a streaming
+/// client got `HTTP/1.1 200 OK` and `Content-Type: text/event-stream` followed by **zero
+/// bytes**, and a non-streaming client got no reply at all (measured, `http=000 bytes=0`).
+/// Neither can be distinguished from success by the client.
+///
+/// The cap keeps the prompt and leaves room for at least one generated token, so the
+/// request is always servable. A prompt that fills the context on its own still goes
+/// through the existing truncation path, which reports `prompt_tokens_dropped`.
+fn clampMaxTokens(requested: u32, prompt_len: usize, max_seq: u32) u32 {
+    const prompt: u32 = @intCast(@min(prompt_len, max_seq));
+    const room: u32 = if (prompt + 1 < max_seq) max_seq - prompt - 1 else 1;
+    return @max(1, @min(requested, room));
+}
+
 /// 503 with Retry-After for a request that needs the busy engine.
 ///
 /// Retry-After is what makes this a usable answer rather than a mystery: a
@@ -1228,4 +1245,33 @@ test "a multi-byte character split across tokens is never emitted half-formed" {
     defer out2.deinit(a);
     try appendUtf8Sanitized(&out2, a, "a\xe3\x81\x93b");
     try std.testing.expectEqualStrings("a\xe3\x81\x93b", out2.items);
+}
+
+test "clampMaxTokens always leaves a servable request" {
+    // The invariant that matters: `generate` needs `prompt + max_tokens + 1 <= max_seq` or
+    // it returns PromptTooLong, which is what produced an HTTP 200 with an empty SSE body
+    // and a non-streaming reply of nothing at all.
+    const seq: u32 = 2048;
+    const cases = [_]struct { requested: u32, prompt: usize }{
+        .{ .requested = 100000, .prompt = 12 },
+        .{ .requested = 100000, .prompt = 2047 },
+        .{ .requested = 100000, .prompt = 5000 }, // prompt longer than the context
+        .{ .requested = 10, .prompt = 12 }, // already fine, must be untouched
+        .{ .requested = 1, .prompt = 1 },
+        .{ .requested = 2046, .prompt = 1 },
+    };
+    for (cases) |c| {
+        const got = clampMaxTokens(c.requested, c.prompt, seq);
+        try std.testing.expect(got >= 1);
+        // Under the cap when it fits, and never above what was asked for.
+        try std.testing.expect(got <= @max(1, c.requested));
+        // The generate-side guard must not trip for a prompt that already fits.
+        if (c.prompt + 1 < seq) {
+            try std.testing.expect(@as(usize, got) + c.prompt + 1 <= seq);
+        }
+    }
+    // The headline case: asking for far more than the context keeps the prompt intact.
+    try std.testing.expectEqual(@as(u32, 2035), clampMaxTokens(100000, 12, seq));
+    // A request that already fits is passed through unchanged.
+    try std.testing.expectEqual(@as(u32, 10), clampMaxTokens(10, 12, seq));
 }
