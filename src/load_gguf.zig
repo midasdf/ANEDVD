@@ -452,7 +452,12 @@ pub fn loadMoeLayerStreaming(
     // all three), each big enough for the larger projection.
     const slot = @max(gate_elems, down_elems);
     moe.expert_slot = slot;
-    moe.expert_scratch = try allocator.alloc(f16, slot * 3);
+    // No fp16 scratch on a streaming layer: `loadExpertF32` is the only accessor the
+    // streaming paths use, so the fp16 buffer was 17.3 MB per layer allocated and
+    // never read (415 MB across 24 layers). It is still needed for the eager loader,
+    // which holds its experts as fp16 and uses `loadExpert`.
+    // Three slots, one per projection, because the three are live simultaneously.
+    moe.expert_scratch_f32_alt = try allocator.alloc(f32, slot * 3);
 
     moe.router = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp.weight", .{index}) catch unreachable, cfg.hidden, cfg.num_experts);
 
@@ -498,6 +503,10 @@ pub fn loadMoeLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: mode
     errdefer moe.deinit(allocator);
 
     const per_gate = @as(usize, cfg.moe_inter) * cfg.hidden;
+    // Three slots, one per projection: a zero stride made gate, up and down share
+    // slot 0, which silently multiplied the same tensor three times.
+    moe.expert_slot = per_gate;
+    moe.expert_scratch = try allocator.alloc(f16, per_gate * 3);
     moe.router = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate_inp.weight", .{index}) catch unreachable, cfg.hidden, cfg.num_experts);
     moe.gate = try allocator.alloc(f16, per_gate * cfg.num_experts);
     moe.up = try allocator.alloc(f16, per_gate * cfg.num_experts);

@@ -335,6 +335,62 @@ pub fn attentionDecode(
     }
 }
 
+/// y = W x with W as f32 [out][in]. Same layout and accumulation order as
+/// `matmulF16`, for the batched MoE path where an expert is read once as f32.
+pub fn matmulF32(out: []f32, w: []const f32, x: []const f32, out_dim: usize, in_dim: usize) void {
+    for (0..out_dim) |o| {
+        const row = w[o * in_dim ..][0..in_dim];
+        var acc: F32x = @splat(0);
+        var i: usize = 0;
+        while (i + LANES <= in_dim) : (i += LANES) {
+            const va: F32x = x[i..][0..LANES].*;
+            const vb: F32x = row[i..][0..LANES].*;
+            acc += va * vb;
+        }
+        var sum: f32 = @reduce(.Add, acc);
+        while (i < in_dim) : (i += 1) sum += row[i] * x[i];
+        out[o] = sum;
+    }
+}
+
+/// `moeExpertAccum` with f32 expert weights, for the batched prefill path.
+pub fn moeExpertAccumF32(
+    out: []f32,
+    hidden_scratch: []f32,
+    inter_scratch: []f32,
+    h: []const f32,
+    gate: []const f32,
+    up: []const f32,
+    down: []const f32,
+    inter: usize,
+    hidden: usize,
+    weight: f32,
+) void {
+    std.debug.assert(out.len >= hidden and hidden_scratch.len >= inter);
+    matmulF32(hidden_scratch[0..inter], gate, h, inter, hidden);
+    matmulF32(inter_scratch[0..inter], up, h, inter, hidden);
+    var i: usize = 0;
+    while (i < inter) : (i += 1) {
+        const g = hidden_scratch[i];
+        const u = inter_scratch[i];
+        inter_scratch[i] = (g / (1.0 + @exp(-g))) * u;
+    }
+    var o: usize = 0;
+    while (o < hidden) : (o += 1) {
+        const row = down[o * inter ..][0..inter];
+        var acc: F32x = @splat(0);
+        var k: usize = 0;
+        while (k + LANES <= inter) : (k += LANES) {
+            const va: F32x = inter_scratch[k..][0..LANES].*;
+            const vb: F32x = row[k..][0..LANES].*;
+            acc += va * vb;
+        }
+        var total: f32 = @reduce(.Add, acc);
+        while (k < inter) : (k += 1) total += row[k] * inter_scratch[k];
+        out[o] += weight * total;
+    }
+}
+
 /// y = W x with W stored as fp16 [out][in] (the ANE conv layout).
 ///
 /// Vectorised: this is the MoE hot path, and scalar it was the wall. Qwen1.5-MoE

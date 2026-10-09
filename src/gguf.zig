@@ -515,6 +515,31 @@ pub const Gguf = struct {
         }
     }
 
+    /// Dequantise ONE expert into `out` as f32, straight from the mapping.
+    ///
+    /// Used by the batched prefill path, where an expert's read is amortised over every
+    /// column in the chunk that routed to it.
+    pub fn readExpertF32(
+        self: *const Gguf,
+        name: []const u8,
+        expert: u32,
+        n_experts: u32,
+        out: []f32,
+    ) !void {
+        const t = self.tensor(name) orelse return error.TensorNotFound;
+        const per_expert: u64 = @as(u64, @intCast(out.len));
+        if (t.elemCount() != per_expert * n_experts) return error.DimensionMismatch;
+        const epb = t.ttype.blockElems() orelse return error.UnsupportedType;
+        if (per_expert % epb != 0) return error.InvalidTensorShape;
+        const bpb = t.ttype.blockBytes() orelse return error.UnsupportedType;
+        const per_bytes = per_expert / epb * bpb;
+        const start = self.tensor_data_offset + t.offset + @as(u64, expert) * per_bytes;
+        const end = start + per_bytes;
+        if (end > self.data.len) return error.TensorDataOutOfRange;
+        const src = self.data[@intCast(start)..@intCast(end)];
+        try dequantizeRange(t.ttype, src, 0, out);
+    }
+
     pub fn readF16(self: *const Gguf, allocator: Allocator, name: []const u8) ![]f16 {
         const t = self.tensor(name) orelse return error.TensorNotFound;
         const n = t.elemCount();

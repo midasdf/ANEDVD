@@ -220,6 +220,9 @@ pub const MoeWeights = struct {
     /// alias. Layout: [3][max(gate_elems, down_elems)]. One expert's worth of
     /// memory in total (about 35 MB for Qwen1.5-MoE), instead of 25 GB.
     expert_scratch: []f16 = &.{},
+    /// f32 expert scratch for the batched prefill path: one read serves every column
+    /// that chose the expert, so it is held rather than streamed per token.
+    expert_scratch_f32_alt: []f32 = &.{},
     /// [num_experts][hidden]
     router: []f16 = &.{},
     /// [num_experts][moe_inter][hidden]
@@ -252,6 +255,7 @@ pub const MoeWeights = struct {
         if (self.shared_down.len > 0) allocator.free(self.shared_down);
         if (self.shared_gate_lin.len > 0) allocator.free(self.shared_gate_lin);
         if (self.expert_scratch.len > 0) allocator.free(self.expert_scratch);
+        if (self.expert_scratch_f32_alt.len > 0) allocator.free(self.expert_scratch_f32_alt);
         // The streaming source owns its tensor names (they must outlive the loader).
         if (self.source) |src| {
             if (src.gate_name.len > 0) allocator.free(src.gate_name);
@@ -261,16 +265,24 @@ pub const MoeWeights = struct {
         self.* = .{};
     }
 
-    /// True when the experts are read from the mapping rather than held in memory.
-    pub fn streaming(self: *const MoeWeights) bool {
-        return self.source != null;
-    }
-
     /// Dequantise one expert's `which` projection into `scratch`, returning the view.
     ///
     /// `which` is 0 = gate, 1 = up, 2 = down. Only valid for a streaming source; the
     /// eager path returns the in-memory slice instead, which is why both go through
     /// these accessors rather than the engine reaching into `gate`/`up`/`down`.
+    /// Stride between projection slots, derived on demand.
+    ///
+    /// `expert_slot` was only set by the streaming loader, so on an eager layer it was
+    /// 0 and gate, up and down all wrote slot 0 — each overwriting the last. The
+    /// matmul then multiplied the same tensor three times and the logits were wrong in
+    /// a way that looked like a broken model rather than a broken stride.
+    fn slotStride(self: *const MoeWeights, scratch_len: usize) usize {
+        if (self.expert_slot > 0) return self.expert_slot;
+        const per = @as(usize, self.inter) * self.hidden_dim;
+        if (per == 0 or scratch_len < per * 3) return per;
+        return per;
+    }
+
     pub fn loadExpert(self: *const MoeWeights, e: u32, which: u2, scratch: []f16) []const f16 {
         const src = self.source orelse return switch (which) {
             0 => self.expertGate(e),
@@ -287,8 +299,7 @@ pub const MoeWeights = struct {
             else => src.gate_elems,
         };
         // Slot per projection, so the three live at once.
-        const slot = @as(usize, which) * self.expert_slot;
-        const dst = scratch[slot..][0..elems];
+        const dst = scratch[@as(usize, which) * self.slotStride(scratch.len) ..][0..elems];
         src.gguf.readExpertF16(name, e, self.num_experts, dst) catch |err| {
             // A streaming read that fails leaves the scratch zeroed rather than
             // reusing the previous expert's weights, which would be silently wrong.
@@ -297,6 +308,41 @@ pub const MoeWeights = struct {
             return dst;
         };
         return dst;
+    }
+
+    /// Dequantise one expert's `which` projection into `scratch` as f32.
+    ///
+    /// The batched prefill path uses this so an expert's read is not immediately thrown
+    /// away: it is read once and multiplied against every column that chose it. When
+    /// the layer is eager there is nothing to read, so this reports empty and the
+    /// caller uses the fp16 accessors.
+    pub fn loadExpertF32(self: *const MoeWeights, e: u32, which: u2, scratch: []f32) []const f32 {
+        const src = self.source orelse return &.{};
+        const name = switch (which) {
+            0 => src.gate_name,
+            1 => src.up_name,
+            else => src.down_name,
+        };
+        const elems = switch (which) {
+            2 => src.down_elems,
+            else => src.gate_elems,
+        };
+        // One slot per projection: a single shared slot made gate, up and down
+        // overwrite each other, so the matmul saw the same tensor three times and
+        // decode produced immediate EOS while prefill (which reads them in a
+        // different order) happened to survive.
+        const dst = scratch[@as(usize, which) * self.slotStride(scratch.len) ..][0..elems];
+        src.gguf.readExpertF32(name, e, self.num_experts, dst) catch |err| {
+            @memset(dst, 0);
+            std.debug.print("moe: expert {d} of {s} failed: {s}\n", .{ e, name, @errorName(err) });
+            return dst;
+        };
+        return dst;
+    }
+
+    /// True when the experts are read from the mapping rather than held in memory.
+    pub fn streaming(self: *const MoeWeights) bool {
+        return self.source != null;
     }
 
     /// One expert's gate slice, [inter][hidden].

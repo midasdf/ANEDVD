@@ -177,6 +177,14 @@ pub const Engine = struct {
     /// f32 copy of the layer's normalised input, for the CPU router and experts
     /// (the ANE staging buffer is fp16).
     moe_hidden: []f32 = &.{},
+    /// Chunk-level MoE batching scratch. See prefillExpertBatched.
+    moe_chunk_idx: []u32 = &.{},
+    /// f32 expert scratch for the batched prefill path, kept separate from the decode
+    /// path's so the two cannot interleave into each other's buffers.
+    moe_expert_scratch_f32_alt: []f32 = &.{},
+    moe_chunk_probs: []f32 = &.{},
+    moe_expert_cols: []u32 = &.{},
+    moe_col_out: []f32 = &.{},
     moe_gate_scratch: []f32 = &.{},
     moe_upd_scratch: []f32 = &.{},
     /// Optional routing recorder: counts how often each expert of each layer is
@@ -207,6 +215,11 @@ pub const Engine = struct {
         if (self.moe_idx.len > 0) self.allocator.free(self.moe_idx);
         if (self.moe_out.len > 0) self.allocator.free(self.moe_out);
         if (self.moe_hidden.len > 0) self.allocator.free(self.moe_hidden);
+        if (self.moe_chunk_idx.len > 0) self.allocator.free(self.moe_chunk_idx);
+        if (self.moe_expert_scratch_f32_alt.len > 0) self.allocator.free(self.moe_expert_scratch_f32_alt);
+        if (self.moe_chunk_probs.len > 0) self.allocator.free(self.moe_chunk_probs);
+        if (self.moe_expert_cols.len > 0) self.allocator.free(self.moe_expert_cols);
+        if (self.moe_col_out.len > 0) self.allocator.free(self.moe_col_out);
         if (self.moe_gate_scratch.len > 0) self.allocator.free(self.moe_gate_scratch);
         if (self.moe_upd_scratch.len > 0) self.allocator.free(self.moe_upd_scratch);
         self.allocator.free(self.x);
@@ -259,6 +272,11 @@ pub const Engine = struct {
         self.moe_idx = &.{};
         self.moe_out = &.{};
         self.moe_hidden = &.{};
+        self.moe_chunk_idx = &.{};
+        self.moe_expert_scratch_f32_alt = &.{};
+        self.moe_chunk_probs = &.{};
+        self.moe_expert_cols = &.{};
+        self.moe_col_out = &.{};
         self.moe_gate_scratch = &.{};
         self.moe_upd_scratch = &.{};
         self.route_counts = null;
@@ -320,6 +338,14 @@ pub const Engine = struct {
             self.moe_probs = try allocator.alloc(f32, @max(cfg.experts_per_tok, 1));
             self.moe_idx = try allocator.alloc(u32, @max(cfg.experts_per_tok, 1));
             self.moe_out = try allocator.alloc(f32, cfg.hidden * ch);
+            // Chunk-level batching: every column's top-k picks, flattened.
+            self.moe_chunk_idx = try allocator.alloc(u32, ch * cfg.experts_per_tok);
+            self.moe_expert_scratch_f32_alt = try allocator.alloc(f32, cfg.moe_inter * cfg.hidden);
+            self.moe_chunk_probs = try allocator.alloc(f32, ch * cfg.experts_per_tok);
+            // Columns grouped by expert, so one expert read serves them all.
+            self.moe_expert_cols = try allocator.alloc(u32, ch);
+            // Per-column expert output, accumulated across that column's experts.
+            self.moe_col_out = try allocator.alloc(f32, cfg.hidden * ch);
             self.moe_hidden = try allocator.alloc(f32, cfg.hidden);
             self.moe_gate_scratch = try allocator.alloc(f32, cfg.moe_inter);
             self.moe_upd_scratch = try allocator.alloc(f32, cfg.moe_inter);
@@ -527,25 +553,47 @@ pub const Engine = struct {
                     }
                 }
                 for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p| {
-                    // `loadExpert` reads from the mapping when the layer streams, and
-                    // returns the in-memory slice otherwise, so both paths share this
-                    // loop. The same scratch serves all three projections because each
-                    // is consumed before the next is read.
-                    const g_w = moe.loadExpert(e, 0, moe.expert_scratch);
-                    const u_w = moe.loadExpert(e, 1, moe.expert_scratch);
-                    const d_w = moe.loadExpert(e, 2, moe.expert_scratch);
-                    cpu.moeExpertAccum(
-                        self.moe_out[0..hidden],
-                        self.moe_gate_scratch[0..moe.inter],
-                        self.moe_upd_scratch[0..moe.inter],
-                        hh,
-                        g_w,
-                        u_w,
-                        d_w,
-                        moe.inter,
-                        hidden,
-                        p,
-                    );
+                    // A streaming layer reads the expert from the mapping as f32; an
+                    // eager one already has it as fp16 in memory. Both branches exist
+                    // because the two representations need different matmuls, and the
+                    // scratch differs too — using the fp16 accessor on a streaming
+                    // layer reads an empty buffer and silently multiplies by zeros.
+                    if (moe.streaming()) {
+                        if (moe.expert_scratch_f32_alt.len < moe.expert_slot * 3) {
+                            sys.eprint("[moe] BUG: f32 scratch {d} < needed {d}\n", .{ moe.expert_scratch_f32_alt.len, moe.expert_slot * 3 });
+                        }
+                        const g_w = moe.loadExpertF32(e, 0, moe.expert_scratch_f32_alt);
+                        const u_w = moe.loadExpertF32(e, 1, moe.expert_scratch_f32_alt);
+                        const d_w = moe.loadExpertF32(e, 2, moe.expert_scratch_f32_alt);
+                        cpu.moeExpertAccumF32(
+                            self.moe_out[0..hidden],
+                            self.moe_gate_scratch[0..moe.inter],
+                            self.moe_upd_scratch[0..moe.inter],
+                            hh,
+                            g_w,
+                            u_w,
+                            d_w,
+                            moe.inter,
+                            hidden,
+                            p,
+                        );
+                    } else {
+                        const g_w = moe.loadExpert(e, 0, moe.expert_scratch);
+                        const u_w = moe.loadExpert(e, 1, moe.expert_scratch);
+                        const d_w = moe.loadExpert(e, 2, moe.expert_scratch);
+                        cpu.moeExpertAccum(
+                            self.moe_out[0..hidden],
+                            self.moe_gate_scratch[0..moe.inter],
+                            self.moe_upd_scratch[0..moe.inter],
+                            hh,
+                            g_w,
+                            u_w,
+                            d_w,
+                            moe.inter,
+                            hidden,
+                            p,
+                        );
+                    }
                 }
                 for (0..hidden) |c| self.x[c * ch] += self.moe_out[c];
                 self.stats.moe_ns += sys.nowNs() - t_moe;
@@ -575,6 +623,17 @@ pub const Engine = struct {
             self.stats.first_token_passes = self.stats.tokens -| self.stats.prefill_done_tokens;
         }
         return self.logits;
+    }
+
+    /// The routing weight a column gave to `expert`, or 0 when it did not choose it.
+    ///
+    /// A column can list the same expert at most once (moeRoute picks distinct experts),
+    /// so the first match is the only match.
+    fn expertWeightFor(idx: []const u32, probs: []const f32, topk: u32, col: usize, expert: u32) f32 {
+        for (0..topk) |s| {
+            if (idx[col * topk + s] == expert) return probs[col * topk + s];
+        }
+        return 0;
     }
 
     /// RMSNorm applied per attention head (Qwen3's q_norm/k_norm), before RoPE.
@@ -770,7 +829,9 @@ pub const Engine = struct {
                             const v: f32 = @floatCast(self.out16[c * ch + j]);
                             self.x[c * ch + j] += scale * v;
                         }
-                        // Routed experts for this position.
+                        // Routing for this column only; the expert maths is batched
+                        // below so one read of an expert serves every column that
+                        // chose it. See prefillMoEExperts.
                         cpu.matmulF16(self.moe_logits[0..moe.num_experts], moe.router, hh, moe.num_experts, hd);
                         cpu.moeRoute(
                             self.moe_logits[0..moe.num_experts],
@@ -779,35 +840,85 @@ pub const Engine = struct {
                             self.moe_probs[0..cfg.experts_per_tok],
                             self.moe_idx[0..cfg.experts_per_tok],
                         );
-                        @memset(self.moe_out[0..hd], 0);
+                        for (0..cfg.experts_per_tok) |s2| {
+                            self.moe_chunk_idx[j * cfg.experts_per_tok + s2] = self.moe_idx[s2];
+                            self.moe_chunk_probs[j * cfg.experts_per_tok + s2] = self.moe_probs[s2];
+                        }
                         if (self.route_counts) |counts| {
                             self.route_tokens += 1;
                             for (self.moe_idx[0..cfg.experts_per_tok]) |e| {
                                 counts[@as(usize, li) * cfg.num_experts + e] += 1;
                             }
                         }
-                        for (self.moe_idx[0..cfg.experts_per_tok], self.moe_probs[0..cfg.experts_per_tok]) |e, p2| {
-                            // Same accessor as decode: reads from the mapping when the
-                            // layer streams. Calling expertGate() directly here indexed
-                            // the empty eager buffers and panicked
-                            // ("index out of bounds: index 158597120, len 0").
-                            const g_w = moe.loadExpert(e, 0, moe.expert_scratch);
-                            const u_w = moe.loadExpert(e, 1, moe.expert_scratch);
-                            const d_w = moe.loadExpert(e, 2, moe.expert_scratch);
-                            cpu.moeExpertAccum(
-                                self.moe_out[0..hd],
-                                self.moe_gate_scratch[0..moe.inter],
-                                self.moe_upd_scratch[0..moe.inter],
-                                hh,
-                                g_w,
-                                u_w,
-                                d_w,
-                                moe.inter,
-                                hd,
-                                p2,
-                            );
+                    }
+                    // ---- batching phase: one read per distinct expert ----
+                    // 332 tokens x top-4 x 24 layers re-read an expert for every
+                    // (token, expert) pair. Routing each chunk first and then running
+                    // an expert once over all its columns removes almost all of that:
+                    // a ~300-token prompt touches 54.9 of 60 experts per layer, so the
+                    // reads collapse from 4-per-token to at most 60-per-chunk.
+                    @memset(self.moe_col_out[0 .. hd * n], 0);
+                    const n_experts = moe.num_experts;
+                    var expert: u32 = 0;
+                    while (expert < n_experts) : (expert += 1) {
+                        var n_cols: usize = 0;
+                        for (0..n) |j| {
+                            for (0..cfg.experts_per_tok) |s2| {
+                                if (self.moe_chunk_idx[j * cfg.experts_per_tok + s2] == expert) {
+                                    self.moe_expert_cols[n_cols] = @intCast(j);
+                                    n_cols += 1;
+                                    break;
+                                }
+                            }
                         }
-                        for (0..hd) |c| self.x[c * ch + j] += self.moe_out[c];
+                        if (n_cols == 0) continue;
+                        // One read, reused for every column that chose this expert.
+                        if (moe.streaming()) {
+                            const g_w = moe.loadExpertF32(expert, 0, moe.expert_scratch_f32_alt);
+                            const u_w = moe.loadExpertF32(expert, 1, moe.expert_scratch_f32_alt);
+                            const d_w = moe.loadExpertF32(expert, 2, moe.expert_scratch_f32_alt);
+                            for (self.moe_expert_cols[0..n_cols]) |j| {
+                                const w = expertWeightFor(self.moe_chunk_idx[0 .. n * cfg.experts_per_tok], self.moe_chunk_probs[0 .. n * cfg.experts_per_tok], cfg.experts_per_tok, j, expert);
+                                if (w == 0) continue;
+                                for (0..hd) |c| self.moe_hidden[c] = @floatCast(self.in16[c * ch + j]);
+                                cpu.moeExpertAccumF32(
+                                    self.moe_col_out[j * hd ..][0..hd],
+                                    self.moe_gate_scratch[0..moe.inter],
+                                    self.moe_upd_scratch[0..moe.inter],
+                                    self.moe_hidden[0..hd],
+                                    g_w,
+                                    u_w,
+                                    d_w,
+                                    moe.inter,
+                                    hd,
+                                    w,
+                                );
+                            }
+                        } else {
+                            const g_w = moe.loadExpert(expert, 0, moe.expert_scratch);
+                            const u_w = moe.loadExpert(expert, 1, moe.expert_scratch);
+                            const d_w = moe.loadExpert(expert, 2, moe.expert_scratch);
+                            for (self.moe_expert_cols[0..n_cols]) |j| {
+                                const w = expertWeightFor(self.moe_chunk_idx[0 .. n * cfg.experts_per_tok], self.moe_chunk_probs[0 .. n * cfg.experts_per_tok], cfg.experts_per_tok, j, expert);
+                                if (w == 0) continue;
+                                for (0..hd) |c| self.moe_hidden[c] = @floatCast(self.in16[c * ch + j]);
+                                cpu.moeExpertAccum(
+                                    self.moe_col_out[j * hd ..][0..hd],
+                                    self.moe_gate_scratch[0..moe.inter],
+                                    self.moe_upd_scratch[0..moe.inter],
+                                    self.moe_hidden[0..hd],
+                                    g_w,
+                                    u_w,
+                                    d_w,
+                                    moe.inter,
+                                    hd,
+                                    w,
+                                );
+                            }
+                        }
+                    }
+                    for (0..n) |j| {
+                        for (0..hd) |c| self.x[c * ch + j] += self.moe_col_out[j * hd + c];
                     }
                     self.stats.moe_ns += sys.nowNs() - t_moe;
                 } else {
