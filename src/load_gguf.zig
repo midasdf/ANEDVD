@@ -100,7 +100,12 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     // Gemma: `(1 + w)` RMSNorm and a sqrt(hidden) embedding scale, both confirmed
     // against the reference implementation rather than guessed.
     if (std.mem.startsWith(u8, arch, "gemma")) {
-        cfg.norm_unit_offset = true;
+        // The GGUF converter has ALREADY applied Gemma's `(1 + w)` to the norm tensors.
+        // Measured: blk.0.attn_norm.weight has mean 1.1927, which is the *effective*
+        // factor (1 + w) for a converged model, where the raw HF parameter would have
+        // mean ~0.19. Applying the offset again doubles it and the model emits "."
+        // instead of an answer, so it is NOT applied for GGUF.
+        cfg.norm_unit_offset = false;
         // The GGUF stores UNSCALED embedding weights (measured: mean|w| ~ 1e-5 on
         // gemma-2-2b, where the HF standard deviation is ~0.01 and a baked-in
         // sqrt(2304) would give ~0.5), so the scale must be applied here.

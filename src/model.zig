@@ -49,6 +49,15 @@ pub const Config = struct {
     /// Gemma's RMSNorm is `(1 + w)`, not `w`. Baking the offset into the weights at
     /// load time keeps every compute path unchanged: `rmsnorm` already multiplies by
     /// the weight it is given. Confirmed against `GemmaRMSNorm.forward`.
+    ///
+    /// Whether to set this depends on the SOURCE, and getting it wrong is the difference
+    /// between "Paris" and a run of dots:
+    ///   - an HF checkpoint stores the raw parameter (mean ~0.19 on gemma-2-2b), so the
+    ///     offset must be added;
+    ///   - the GGUF converter has already applied it (measured mean 1.1927 on
+    ///     `blk.0.attn_norm.weight`, which is the effective `1 + w`), so adding it again
+    ///     doubles every norm.
+    /// `load_hf` sets it for Gemma; `load_gguf` clears it.
     norm_unit_offset: bool = false,
     /// Gemma scales the embedding by `sqrt(hidden_size)` on the way in
     /// (`GemmaTextScaledWordEmbedding`). 1.0 for every other architecture.
@@ -636,4 +645,16 @@ test "Gemma 2's sliding layers start at layer 0" {
     try std.testing.expect(!plain.layerIsSliding(1));
     const gemma1 = Config{ .sliding_window = 0, .swa_pattern = 2 };
     try std.testing.expect(!gemma1.layerIsSliding(0));
+}
+
+test "Gemma's unit-offset norm is a per-source decision" {
+    // The HF checkpoint and the GGUF differ in whether `(1 + w)` is already applied,
+    // and this one flag is the difference between a correct answer and a run of dots.
+    // The defaults must keep every non-Gemma model unaffected.
+    const plain = Config{};
+    try std.testing.expect(!plain.norm_unit_offset);
+    try std.testing.expect(!plain.use_gelu);
+    try std.testing.expectEqual(@as(f32, 1.0), plain.embed_scale);
+    try std.testing.expectEqual(@as(f32, 0), plain.attn_scale);
+    try std.testing.expectEqual(@as(f32, 0), plain.attn_logit_softcap);
 }
