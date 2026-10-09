@@ -155,6 +155,23 @@ swamps the effect entirely.
 The vectorisation is still a hardware rate and widening it does not help (8, 16, 32 and
 64 lanes give 514, 555, 499 and 359 M elem/s).
 
+## Batching experts per prefill chunk (implemented)
+
+Prefill re-read an expert for every (token, expert) pair. Since a prompt routes to
+most experts anyway — 54.9 of 60 per layer at ~300 tokens — the fix is to route the
+whole chunk first and then run each expert once over all the columns that chose it.
+
+| | before | after |
+|---|---|---|
+| prefill, 332 tokens | 148.9 / 149.6 s | 92.1 / 93.5 s |
+| CPU experts | 424.7 / 423.0 ms/token | 251.3 / 255.2 ms/token |
+
+1.61x, verified by A/B on the same prompt with two runs each. The engine's prefill now
+agrees with the CPU reference rank for rank (220, 151645, 151643, 264, 1147).
+
+Decode cannot use this: it processes one token at a time, so there is nothing to share
+an expert read with. That is why decode stays at ~2.5 s/token while prefill improved.
+
 ## Status and verification
 
 Implemented and verified for safetensors Qwen2MoE, against
@@ -254,6 +271,23 @@ engine reads whatever the router picked. On this randomly-routed checkpoint that
 a different, cold set nearly every layer. The dominant remaining cost is therefore
 dequantisation volume, not arithmetic — the same conclusion the streaming
 measurements reached from the other direction (219 MB/s cold and warm alike).
+
+## Batching experts per prefill chunk (implemented)
+
+Prefill re-read an expert for every (token, expert) pair. Since a prompt routes to
+most experts anyway — 54.9 of 60 per layer at ~300 tokens — the fix is to route the
+whole chunk first and then run each expert once over all the columns that chose it.
+
+| | before | after |
+|---|---|---|
+| prefill, 332 tokens | 148.9 / 149.6 s | 92.1 / 93.5 s |
+| CPU experts | 424.7 / 423.0 ms/token | 251.3 / 255.2 ms/token |
+
+1.61x, verified by A/B on the same prompt with two runs each. The engine's prefill now
+agrees with the CPU reference rank for rank (220, 151645, 151643, 264, 1147).
+
+Decode cannot use this: it processes one token at a time, so there is nothing to share
+an expert read with. That is why decode stays at ~2.5 s/token while prefill improved.
 
 ## Status
 
