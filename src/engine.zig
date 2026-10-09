@@ -1127,6 +1127,14 @@ pub const Engine = struct {
     }
 };
 
+/// Set when any kernel in the current `diagnose` run disagreed with the reference.
+///
+/// `check` used to print "RESULT: OK" unconditionally, so a completely wrong kernel
+/// (lm_head on gemma-2-2b: relative error 0.95) was reported on the line above it and
+/// then contradicted by the summary. A caller scripting against `check` had no signal
+/// at all.
+var kernel_check_failed: bool = false;
+
 fn reportKernel(name: []const u8, got: []const f32, ref: []const f32) void {
     var max_err: f32 = 0;
     var max_mag: f32 = 0;
@@ -1138,9 +1146,16 @@ fn reportKernel(name: []const u8, got: []const f32, ref: []const f32) void {
         if (@abs(b) > max_mag) max_mag = @abs(b);
     }
     const rel = if (max_mag > 0) max_err / max_mag else max_err;
+    const ok = rel < 0.02 and nan == 0;
+    if (!ok) kernel_check_failed = true;
     sys.print("    {s:<12} max|ANE-CPU| = {e:.5}  rel = {e:.5}  nan = {d}  -> {s}\n", .{
-        name, max_err, rel, nan, if (rel < 0.02 and nan == 0) "ok" else "BROKEN",
+        name, max_err, rel, nan, if (ok) "ok" else "BROKEN",
     });
+}
+
+/// True when the last `diagnose` run found a kernel that disagreed with the reference.
+pub fn kernelCheckFailed() bool {
+    return kernel_check_failed;
 }
 
 /// out[c] = f16(x[c * ch] * rsqrt(mean(x^2) + eps) * weight[c]) for column 0.

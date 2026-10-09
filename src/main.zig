@@ -635,6 +635,10 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     try predictNextTokens(allocator, &loaded.tokenizer, &eng, "The capital of France is");
     try predictNextTokens(allocator, &loaded.tokenizer, &eng, "2 + 2 =");
+    if (engine_mod.kernelCheckFailed()) {
+        sys.print("  RESULT: FAIL (a kernel disagrees with the CPU reference; see the lines above)\n", .{});
+        std.process.exit(1);
+    }
     sys.print("  RESULT: OK\n", .{});
 }
 
