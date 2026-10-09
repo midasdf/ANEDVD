@@ -259,6 +259,22 @@ attempt does not repeat the search:
   * Both `final_norm` vectors go through `loadNormFor` with a config derived from the same
     file, so the weights match.
   Since f16 storage accounts for 0.024% and 1.67% is observed, one of these three
-  assumptions about what each side computes at `--layers 0` must still be wrong. The next
-  step is to print the pre-norm `x[0..4]` from both sides: if those differ the fault is in
-  the embedding read, and if they match it is in the norm application.
+  assumptions about what each side computes at `--layers 0` must still be wrong.
+* **Printed the pre-norm `x` from both sides, and the embedding read is the suspect.**
+  Temporary prints in `Engine.forward` and `refForward` after the embedding loop, run with
+  `verify --layers 0`, gave for the same token:
+
+      engine  x[0]  8.876953e-1   x[1] -3.944092e-1   x[2] 3.058594e0   x[3] -2.244242e1
+      ref     x[0]  8.876953e-1   x[1] -3.944092e-1   x[2] 3.058594e0   x[3]  9.865723e-1
+
+  The first three channels agree to the last printed digit and the fourth does not, and no
+  norm runs before this point, so the difference is in the embedding write rather than the
+  final-norm application.
+
+  **Caveat on the evidence, which is why this is a pointer rather than a conclusion.** The
+  engine printed three lines (three `forward` calls) and `x[0]` and `x[3]` were identical
+  across all three while `x[1]` and `x[2]` varied with the token. A channel that never changes
+  looks like an index problem in the print itself (`self.x[3 * ch]` assumes the buffer stride
+  is `ch`). Verify the indices before trusting the per-channel comparison: print all four
+  values with their addresses or against a buffer whose stride is known, and confirm the
+  engine's `x` is laid out with stride `ch` for the decode path.
