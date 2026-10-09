@@ -65,8 +65,16 @@ pub const Loaded = struct {
     }
 };
 
-fn isGguf(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".gguf");
+/// A `.gguf` file, whatever the case of the extension.
+///
+///
+/// Case-sensitive matching sent `Model.GGUF` down the HuggingFace-directory path,
+/// where it failed with a bare `NotDir` — the kind of error that sends you looking
+/// at the filesystem rather than at the extension.
+pub fn isGguf(path: []const u8) bool {
+    if (path.len < 5) return false;
+    const ext = path[path.len - 5 ..];
+    return std.ascii.eqlIgnoreCase(ext, ".gguf");
 }
 
 fn applyRopeOverrides(cfg: *model.Config, opts: Options) void {
@@ -184,6 +192,23 @@ pub fn modelName(path: []const u8) []const u8 {
         return base[0 .. base.len - ext.len];
     }
     return if (base.len == 0) path else base;
+}
+
+test "isGguf accepts any case and rejects near misses" {
+    // Case-sensitive matching sent `Model.GGUF` down the HF-directory path, where it
+    // failed with a bare `NotDir` instead of loading.
+    try std.testing.expect(isGguf("m.gguf"));
+    try std.testing.expect(isGguf("m.GGUF"));
+    try std.testing.expect(isGguf("m.Gguf"));
+    try std.testing.expect(isGguf("/a/b/model.GGUF"));
+    try std.testing.expect(!isGguf("m.gguf.bak"));
+    try std.testing.expect(!isGguf("gguf"));
+    try std.testing.expect(!isGguf("m.ggu"));
+    try std.testing.expect(!isGguf(""));
+    try std.testing.expect(!isGguf("dir/"));
+    // A directory that merely contains "gguf" is not a gguf file.
+    try std.testing.expect(!isGguf("model-gguf"));
+    try std.testing.expect(!isGguf("a.ggufs"));
 }
 
 test "model name derivation" {

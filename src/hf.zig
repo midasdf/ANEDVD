@@ -62,6 +62,16 @@ pub const Error = error{
     NoShardsFound,
 };
 
+/// A `.safetensors` file, whatever the case of the extension.
+///
+/// Case-sensitive matching skipped `MODEL.SAFETENSORS` silently and then reported
+/// "no shards found", which points at the directory rather than at the file that is
+/// sitting right there.
+fn hasSafetensorsExt(name: []const u8) bool {
+    if (name.len < 12) return false;
+    return std.ascii.eqlIgnoreCase(name[name.len - 12 ..], ".safetensors");
+}
+
 pub const Config = struct {
     /// e.g. `"LlamaForCausalLM"`, `"Qwen2ForCausalLM"`.
     arch: []const u8,
@@ -258,7 +268,7 @@ pub fn findShards(allocator: Allocator, dir: []const u8) ![][]const u8 {
     var it = d.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind == .directory) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (!hasSafetensorsExt(entry.name)) continue;
         try names.append(allocator, try joinPath(allocator, dir, entry.name));
     }
     if (names.items.len == 0) return Error.NoShardsFound;
@@ -287,7 +297,7 @@ fn shardsFromIndex(allocator: Allocator, dir: []const u8, bytes: []const u8) ![]
         const value = kv.value_ptr.*;
         if (value != .string) return Error.InvalidShardIndex;
         const file = value.string;
-        if (!std.mem.endsWith(u8, file, ".safetensors")) continue;
+        if (!hasSafetensorsExt(file)) continue;
         var seen = false;
         for (names.items) |existing| {
             if (std.mem.eql(u8, std.fs.path.basename(existing), std.fs.path.basename(file))) {
@@ -909,4 +919,13 @@ test "end-to-end: config.json + index.json + BF16/F16 shards" {
 
     // A tensor that exists in no shard yields null, not an error.
     try testing.expectEqual(@as(?[]f32, null), try findTensorInShards(allocator, shards, "lm_head.weight"));
+}
+
+test "hasSafetensorsExt accepts any case and rejects near misses" {
+    try std.testing.expect(hasSafetensorsExt("model.safetensors"));
+    try std.testing.expect(hasSafetensorsExt("model.SAFETENSORS"));
+    try std.testing.expect(hasSafetensorsExt("model.SafeTensors"));
+    try std.testing.expect(!hasSafetensorsExt("model.safetensors.bak"));
+    try std.testing.expect(!hasSafetensorsExt("model.safetensor"));
+    try std.testing.expect(!hasSafetensorsExt(""));
 }

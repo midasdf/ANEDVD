@@ -1715,7 +1715,7 @@ fn compareLogits(a: []const f32, b: []const f32) LogitDiff {
 /// it is used, which is how this was found).
 fn openTokenizer(allocator: std.mem.Allocator, path: []const u8, guard: *?*gguf.Gguf) !tokenizer_mod.Tokenizer {
     guard.* = null;
-    if (std.mem.endsWith(u8, path, ".gguf")) {
+    if (model_open.isGguf(path)) {
         const g = try allocator.create(gguf.Gguf);
         errdefer allocator.destroy(g);
         g.* = try gguf.Gguf.load(allocator, path);
@@ -1740,7 +1740,7 @@ fn closeTokenizerGuard(allocator: std.mem.Allocator, guard: ?*gguf.Gguf) void {
 /// the CPU reference. Re-opening the file is simplest and keeps the two paths
 /// from sharing any buffer. Works for both model formats.
 fn cloneForReference(allocator: std.mem.Allocator, path: []const u8, cap: usize) !model_mod.ModelWeights {
-    var mw = if (std.mem.endsWith(u8, path, ".gguf")) blk: {
+    var mw = if (model_open.isGguf(path)) blk: {
         var g = try gguf.Gguf.load(allocator, path);
         defer g.deinit();
         break :blk try load_gguf.loadWeights(allocator, &g, false);
