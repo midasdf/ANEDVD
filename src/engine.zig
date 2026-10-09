@@ -85,6 +85,12 @@ pub const Stats = struct {
     prefill_done_evals: [4]u64 = @splat(0),
     prefill_done_moe_ns: u64 = 0,
     prefill_done_ane_ns: u64 = 0,
+    /// ANE node time of the FIRST decode step only, and its pass count. It differs
+    /// sharply from the remaining steps and not in a fixed direction (13x slower on
+    /// Qwen1.5-MoE, slightly faster on SmolLM2), so it is reported separately rather
+    /// than averaged in — which overstated the MoE figure 3.6x on a 6-token run.
+    first_token_node_ns: [4]u64 = @splat(0),
+    first_token_passes: u64 = 0,
     pf_attn_ns: u64 = 0,
     pf_norm_ns: u64 = 0,
     pf_stage_ns: u64 = 0,
@@ -561,6 +567,13 @@ pub const Engine = struct {
 
         self.stats.total_ns += sys.nowNs() - t_start;
         self.stats.tokens += 1;
+        // Snapshot the first decode step on its own, so the steady state can be
+        // reported without the cold-start ramp folded in.
+        if (self.stats.first_token_passes == 0 and self.stats.prefill_done_tokens > 0) {
+            const pd_ns = self.stats.prefill_done_node_ns;
+            for (0..4) |i| self.stats.first_token_node_ns[i] = self.stats.node_ns[i] -| pd_ns[i];
+            self.stats.first_token_passes = self.stats.tokens -| self.stats.prefill_done_tokens;
+        }
         return self.logits;
     }
 

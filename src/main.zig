@@ -929,12 +929,40 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
                 return now -| then;
             }
         }.sub;
-        sys.print("ANE per-token split (decode only): qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{
-            @as(f64, @floatFromInt(dn(eng.stats.node_ns[0], eng.stats.prefill_done_node_ns[0]))) / 1e6 / t,
-            @as(f64, @floatFromInt(dn(eng.stats.node_ns[1], eng.stats.prefill_done_node_ns[1]))) / 1e6 / t,
-            @as(f64, @floatFromInt(dn(eng.stats.node_ns[2], eng.stats.prefill_done_node_ns[2]))) / 1e6 / t,
-            @as(f64, @floatFromInt(dn(eng.stats.node_ns[3], eng.stats.prefill_done_node_ns[3]))) / 1e6 / t,
-        });
+        // The first decode step differs sharply from the rest, and not in a fixed
+        // direction: on Qwen1.5-MoE it is 13x slower (its layers 0-4 take 45-79 ms
+        // each the first time against ~1.7 ms after), while on SmolLM2 it is FASTER
+        // than the average. So these are reported as "first step" and "remaining
+        // steps" rather than as cold and warm, which would claim more than is known.
+        // Mixing the two is what overstated the MoE figure 3.6x on a 6-token run.
+        const first_step = eng.stats.first_token_node_ns;
+        const first_tot = eng.stats.first_token_passes;
+        if (first_tot > 0) {
+            const ft: f64 = @floatFromInt(first_tot);
+            sys.print("ANE first decode step: qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{
+                @as(f64, @floatFromInt(first_step[0])) / 1e6 / ft,
+                @as(f64, @floatFromInt(first_step[1])) / 1e6 / ft,
+                @as(f64, @floatFromInt(first_step[2])) / 1e6 / ft,
+                @as(f64, @floatFromInt(first_step[3])) / 1e6 / ft,
+            });
+        }
+        // The remaining steps: decode total minus the first step, over the rest. With a
+        // single decoded token there is nothing else to report, so say that rather
+        // than presenting the first step as if it were typical.
+        const first_passes = eng.stats.first_token_passes;
+        const first_rest = eng.stats.first_token_node_ns;
+        const rest_passes = tot -| first_passes;
+        if (rest_passes == 0) {
+            sys.print("ANE per-token split: only one decode step ran, so the line above IS the per-token cost\n", .{});
+        } else {
+            const st: f64 = @floatFromInt(rest_passes);
+            sys.print("ANE per-token split (remaining steps): qkv {d:.2} ms, o {d:.2} ms, ffn {d:.2} ms, lm_head {d:.2} ms\n", .{
+                @as(f64, @floatFromInt(dn(eng.stats.node_ns[0], eng.stats.prefill_done_node_ns[0]) -| first_rest[0])) / 1e6 / st,
+                @as(f64, @floatFromInt(dn(eng.stats.node_ns[1], eng.stats.prefill_done_node_ns[1]) -| first_rest[1])) / 1e6 / st,
+                @as(f64, @floatFromInt(dn(eng.stats.node_ns[2], eng.stats.prefill_done_node_ns[2]) -| first_rest[2])) / 1e6 / st,
+                @as(f64, @floatFromInt(dn(eng.stats.node_ns[3], eng.stats.prefill_done_node_ns[3]) -| first_rest[3])) / 1e6 / st,
+            });
+        }
         sys.print("  qkv staging: write {d:.2} ms, read {d:.2} ms per token\n", .{
             @as(f64, @floatFromInt(eng.stats.qkv_write_ns)) / 1e6 / t,
             @as(f64, @floatFromInt(eng.stats.qkv_read_ns)) / 1e6 / t,
