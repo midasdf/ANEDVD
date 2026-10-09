@@ -802,3 +802,19 @@ rather than an error:
     metadata rather than crashing outright. The test covers all four boundaries — exactly
     filling the context, one token past it, a late start position (`prefill(ids, 6)` with four
     tokens needs row ten of an eight-row cache), and `forward` at `pos == max_seq`.
+31. **`--ab` named nothing when it ran out of context.** It prefills the raw prompt, unlike
+    the generation path which truncates, so a prompt longer than `--max-seq` hit the new guard
+    and printed a bare `error: ContextOverflow`. It now says
+
+        prompt is 330 tokens but the context is 64; raise it with --max-seq N
+
+    and exits 2. The overflow surfaces in the sequential `forward` loop rather than at
+    `prefill`, which is where the catch had to go — the `prefill` catch written first was dead
+    code.
+
+32. **Probed this round and found correct:** `anedvd selftest` (rel 9.68e-4, PASS), `anedvd
+    probe` (rel 3.60e-4, CORRECT), and the sharded-HF path, which turns out to have four
+    dedicated tests (fallback to every `*.safetensors` sorted, preference for
+    `model.safetensors.index.json`'s `weight_map`, a broken index, and a tensor located across
+    shards) plus an end-to-end one. `--repeat` was verified in the previous round: identical
+    output every iteration, since `session.reset()` runs before each.
