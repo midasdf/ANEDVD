@@ -689,3 +689,25 @@ rather than an error:
 
     Tests: 113 → 116. `main.zig`, `load_gguf.zig` and `gguf.zig` gained their first
     coverage of these paths.
+24. **CPU attention becomes the dominant prefill cost at long context — correcting an
+    earlier claim.** I recorded that "prefill CPU is only 8% of prefill time" from a
+    20-token measurement. That is true only for short prompts. Measured on Qwen2.5-0.5B:
+
+        prompt     prefill        attn        all CPU     attention share
+          26 tok   0.17 s       0.24 ms/tok   0.99 ms/tok       ~14%
+         194 tok   0.28 s       0.45 ms/tok   0.70 ms/tok       ~48%
+         374 tok   0.65 s       0.79 ms/tok   1.06 ms/tok       **45% of prefill**
+
+    `anedvd attnbench` at ctx 1024 breaks the cost down further: decode attention is
+    135.3 µs, of which the Q·K dot is 64.2 (47%), softmax 21.4 (16%) and the A·V plus the
+    rest 49.7 (37%); prefill is 171.5 µs per query at 896 past keys.
+
+    That works out to 14-18 G element/s for the dot and the A·V step, so the inner loops are
+    already running at a reasonable rate — the cost is the O(n²) work itself, not a bad
+    inner loop. There *is* a structural redundancy worth knowing about: with grouped-query
+    attention (14 heads over 2 KV heads) each K/V row is converted and read seven times, once
+    per head in its group. Hoisting that would cut the conversions by 7x, but because the
+    loops are already at 14-18 G/s rather than load-bound, the realistic gain is a fraction of
+    the dot and A·V steps — not the 7x the redundancy suggests. Left unimplemented rather
+    than changed on an estimate; the numbers above are what a real attempt should be judged
+    against.

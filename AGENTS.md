@@ -76,6 +76,10 @@ zig fmt src build.zig
   thousands of loaded kernels and the ANE pool holds a few dozen. Attention stays on
   the ANE; the experts stream from the mapping. `research/moe-design.md` has the
   arithmetic, the verified forward pass and the measured (bad) speed.
+* **"CPU is a small part of prefill" is only true for short prompts.** At 374 tokens CPU
+  attention alone is 0.79 ms/token against a 1.74 ms/token prefill — roughly 45%, up from
+  ~14% at 26 tokens, because attention is O(n²) while the ANE part is per-layer. Measure at
+  the context length you care about; `anedvd attnbench` isolates it.
 * **Sampling is not negligible.** At temperature 1.0 the candidate cut leaves
   ~31k of 151936 logits, and ordering them was ~10% of decode (`sortUnstable`,
   not `sort`, for the top-k selection). `anedvd run` prints the cost per token.
