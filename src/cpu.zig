@@ -885,7 +885,9 @@ test "attentionDecode fast paths match a brute-force reference" {
 test "attentionPrefill fast paths match attentionDecode" {
     // Same idea for the batched path at the head dimensions the real models use.
     const a = std.testing.allocator;
-    inline for (.{ 64, 128 }) |head_dim| {
+    // 256 is gemma-2's head_dim and was not covered here before; the real model
+    // disagreed with the CPU reference at exactly that size.
+    inline for (.{ 64, 128, 256 }) |head_dim| {
         const heads: u32 = 4;
         const kv_heads: u32 = 2;
         const hd: usize = head_dim;
