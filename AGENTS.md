@@ -247,3 +247,18 @@ attempt does not repeat the search:
 * The depth sweep reproduces exactly with the current binary (0.45360 vs 0.46882e-1 for
   `--layers 0` and `1`), so the earlier figures were not affected by the KV-cache overflow
   fixed in rounds 23-25: those runs used a 6-token prompt, far below any context limit.
+* **Ruled out by reading the code, so a next attempt can start further along.** At
+  `--layers 0` the whole path is embed -> final_norm -> head, and both sides should be
+  identical apart from the head input being f16 in the engine:
+  * `viewF16` rejects anything that is not f16 (`if (t.ttype != .f16) return null`), and
+    gemma-2-2b's embedding is Q6_K, so the engine falls back to `loadLinear` exactly as the
+    reference does. Same dequantiser, same values.
+  * `rmsnormColumn` (engine) and `cpu.rmsnorm` (reference) compute the same expression —
+    same `acc`, same `inv`, same `x * inv * w` — the only difference being the strided read
+    and the f16 output, which is 0.024%.
+  * Both `final_norm` vectors go through `loadNormFor` with a config derived from the same
+    file, so the weights match.
+  Since f16 storage accounts for 0.024% and 1.67% is observed, one of these three
+  assumptions about what each side computes at `--layers 0` must still be wrong. The next
+  step is to print the pre-norm `x[0..4]` from both sides: if those differ the fault is in
+  the embedding read, and if they match it is in the norm application.
