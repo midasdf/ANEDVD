@@ -629,3 +629,20 @@ rather than an error:
     before a connection is handed to `readRequest`, and by using four parking slots with a
     stalled connection — never a fresh arrival — evicted when they are full. Verified with
     three stalled connections parked: `/health` answered 4/4 instead of 3/3 timeouts.
+20. **A generation failure looked like success to the client.** Two separate faults, both
+    found by probing a live server:
+
+    * `max_tokens` larger than the context failed inside `generate` with `PromptTooLong`,
+      after the server had committed to a response. Streaming clients got `200 OK` with
+      `Content-Type: text/event-stream` and **zero bytes**; non-streaming clients got **no
+      reply at all** (`http=000 bytes=0`). `clampMaxTokens` now caps the request at what the
+      engine can serve, keeping the prompt and leaving room for at least one token, and is
+      applied to all three generation routes.
+    * Every route propagated a `generate` error out of the handler, so any *other* failure
+      had the same effect. Non-streaming routes now return a real 400; streaming routes
+      write an error frame in their own dialect (`data: {"error":...}` for OpenAI,
+      `event: error` for Anthropic), because the 200 is already on the wire by then.
+
+    Verified by forcing the failure on all three APIs: 400 for non-streaming, an error frame
+    for streaming. An oversized `max_tokens` now returns a real answer — 11 SSE frames,
+    `finish_reason: "stop"`, `prompt_tokens_dropped: 0`.

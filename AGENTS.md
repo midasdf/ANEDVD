@@ -106,6 +106,13 @@ zig fmt src build.zig
   other client until the timeout expired. `hasCompleteRequest` (FIONREAD + MSG_PEEK) now
   gates it, and there are four parking slots rather than one. Probe this class of bug with
   a raw socket: claim more than you send, then check that other clients still get answers.
+* **A failure after the response has started has no status left to use.** Headers go out
+  before prefill so a long prompt never looks like a dead server, which means a later
+  `generate` error can only be reported in-band. Every route used to propagate it out of
+  the handler: non-streaming closed with no reply at all, streaming left a `200 OK` with an
+  empty body that a client cannot tell from success. Both now report properly. Also clamp
+  what you accept — `max_tokens` above the context produced exactly that silent 200.
+  Probe by forcing the failure path, not by reading the code.
 * **Test the server with two requests, not one.** Both server bugs found so
   far were invisible to single-request tests: a stale-KV bug that returned
   zero tokens on the second identical request, and a request silently
