@@ -834,3 +834,17 @@ rather than an error:
     So there is no headroom here and the change should not be made. My earlier note said
     hoisting "would not give the 7x it suggests" — the measurement says it gives nothing at
     all, because the redundancy and the smaller cache cancel in the grouped case's favour.
+34. **Mistral was listed as supported while its sliding window was ignored.** `known_architectures`
+    names mistral; the sliding-window plumbing only ever ran for Gemma. `load_gguf` read
+    `attention.sliding_window` inside the gemma branch and nowhere else, so a Mistral GGUF
+    attended **globally** rather than within its window. The HF side read the window but left
+    `swa_pattern` at 2, applying **Gemma 2's alternating pattern** and windowing only half of
+    Mistral's layers.
+
+    The rules really do differ, per llama.cpp: `set_swa_pattern` is
+    `is_swa[il] = n_pattern == 0 || ...`, so `n_pattern == 0` means every layer slides
+    (Mistral), where Gemma 2 alternates. `Config.swa_all` now carries it.
+
+    Bounded impact — the window only binds past its size, and Mistral's is 4096 against a 2048
+    default context — so this was latent. It is the difference between supporting a model and
+    claiming to.
