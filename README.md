@@ -262,6 +262,11 @@ Decode on Qwen2.5-0.5B, fused FFN, ReleaseFast:
 | 512 | 26.8 |
 | 1024 | 19.4 |
 
+Those are single numbers, and this machine is noisy. Re-measuring the 16-token row with
+`--repeat 3` on the current build gives a mean of 30.4 — consistent — but a range of
+**23.0 to 35.1**. Treat the table as the shape of the curve rather than as a target, and use
+`--repeat` for any comparison you intend to act on.
+
 Multi-turn chat does not re-prefill what is already cached: a transcript only
 appends, so `generate.Session` keeps the KV cache and prefills just the new
 suffix (`anedvd chat` and the server log both report how many prompt tokens were
