@@ -271,10 +271,21 @@ attempt does not repeat the search:
   norm runs before this point, so the difference is in the embedding write rather than the
   final-norm application.
 
-  **Caveat on the evidence, which is why this is a pointer rather than a conclusion.** The
-  engine printed three lines (three `forward` calls) and `x[0]` and `x[3]` were identical
-  across all three while `x[1]` and `x[2]` varied with the token. A channel that never changes
-  looks like an index problem in the print itself (`self.x[3 * ch]` assumes the buffer stride
-  is `ch`). Verify the indices before trusting the per-channel comparison: print all four
-  values with their addresses or against a buffer whose stride is known, and confirm the
-  engine's `x` is laid out with stride `ch` for the decode path.
+  **The print indices are correct**, checked afterwards: `self.x` is allocated
+  `hidden * ch` (`src/engine.zig`), so `self.x[3 * ch]` really is channel 3 of column 0, and
+  the reference's `x[3]` is the same element. So the per-channel comparison stands: channels
+  0-2 identical, channel 3 different.
+
+  **What is left, and why this was deprioritised.** Both sides load the embedding with the
+  same call — `viewF16` rejects gemma's Q6_K tensor so the engine falls back to
+  `loadLinear(allocator, g, "token_embd.weight", cfg.hidden, cfg.vocab)`, which is exactly
+  what `loadWeights` does — so the values should be identical and channel 3 should match.
+  Something in that chain is still not what it looks like, and the next step is to compare the
+  embedding rows directly (print `embed[token * hidden + 0..4]` from both sides before any
+  scaling) rather than through `x`.
+
+  This has no user-visible effect: gemma-2-2b answers correctly ("The capital of France is
+  **Paris**", "2 + 2 = 4", the chat template), `check` passes on a real prompt token, and the
+  engine's prefill and decode agree exactly. It is a numerical discrepancy with the CPU
+  reference in a model that works. After seven rounds on it, the remaining value is in the
+  record above rather than in more searching.
