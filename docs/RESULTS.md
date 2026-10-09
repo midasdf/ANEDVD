@@ -543,3 +543,22 @@ rather than an error:
     `lm_head ... rel = 9.45e-1 -> BROKEN` and then contradicted it two lines later, so a
     script reading only the summary saw success. `reportKernel` now records failures and
     `check` prints FAIL and exits 1.
+15. **MADV_RANDOM on the model mapping makes things worse, not better.** MoE expert access
+    is scattered across a 9.5 GB file, which looks like the textbook case for disabling
+    readahead. Measured over four interleaved pairs of single-token runs, counting minor
+    page faults:
+
+        MADV_RANDOM: 395442 383096 426033 386974   median 391208
+        default:     394916 380089 385354 381300   median 383327
+        wins for MADV_RANDOM: 0 of 4
+
+    It loses every pair. The experts a generation revisits are evidently clustered by
+    layer, so readahead is closer to right than random advice. `sys.zig` records this so it
+    is not "fixed" again without measuring.
+
+16. **A 4-slot expert LRU per layer is not worth its memory here.** `anedvd route` on a
+    32-token generation measures 42.5 of 60 experts distinct per layer, and a 4-slot LRU
+    hits 55% of selections. That saves ~264 ms of a ~2500 ms/token decode (**11%**) for
+    4 x 24 x 23.1 MB = **2.2 GB** resident. On an 8 GB machine, where an earlier eager
+    materialisation mistake already produced 30 s/token through swap thrashing, the memory
+    is worth more than the 11%. See `research/moe-design.md`.
