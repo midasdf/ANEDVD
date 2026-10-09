@@ -1301,3 +1301,35 @@ test "sigmoid saturates instead of overflowing" {
     try std.testing.expect(sigmoid(-1000.0) >= 0.0);
     try std.testing.expect(sigmoid(-1000.0) < 1e-30);
 }
+
+test "rmsnorm with a unit-offset weight matches the Gemma formula" {
+    // Gemma normalises as `x * inv * (1 + w)`. Baking `1 + w` into the weights at load
+    // time makes the existing rmsnorm correct, and this pins that equivalence from the
+    // definition rather than by inspection.
+    const a = std.testing.allocator;
+    const n = 8;
+    const x = [_]f32{ 0.5, -1.25, 2.0, 0.0, 0.75, -0.5, 1.5, -2.0 };
+    const w = [_]f32{ 0.1, 0.9, -0.3, 0.5, 1.0, 0.0, -0.7, 0.25 };
+
+    const got = try a.alloc(f32, n);
+    defer a.free(got);
+    const want = try a.alloc(f32, n);
+    defer a.free(want);
+
+    rmsnorm(got, &x, &w, 1e-6);
+    var acc: f32 = 0;
+    for (x) |v| acc += v * v;
+    const inv = 1.0 / @sqrt(acc / @as(f32, @floatFromInt(n)) + 1e-6);
+    for (want, x, w) |*o, xi, wi| o.* = xi * inv * (1.0 + wi);
+
+    var differs = false;
+    for (got, want) |g, e| if (@abs(g - e) > 1e-6) {
+        differs = true;
+    };
+    try std.testing.expect(differs);
+
+    var w_off: [n]f32 = undefined;
+    for (&w_off, w) |*o, wi| o.* = 1.0 + wi;
+    rmsnorm(got, &x, &w_off, 1e-6);
+    for (got, want) |g, e| try std.testing.expectApproxEqAbs(e, g, 1e-6);
+}

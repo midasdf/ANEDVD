@@ -685,7 +685,10 @@ pub const Engine = struct {
 
             for (0..n) |j| {
                 const row = self.embed[@as(usize, ids[done + j]) * hidden ..][0..hidden];
-                for (0..hidden) |c| self.x[c * ch + j] = @floatCast(row[c]);
+                for (0..hidden) |c| {
+                    const e: f32 = @floatCast(row[c]);
+                    self.x[c * ch + j] = e * cfg.embed_scale;
+                }
             }
             for (n..ch) |j| {
                 for (0..hidden) |c| self.x[c * ch + j] = 0;

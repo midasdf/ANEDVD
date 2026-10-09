@@ -45,6 +45,15 @@ pub const Config = struct {
     /// any real model; layers past bit 63 are treated as sparse.
     mlp_only_mask: u64 = 0,
 
+    // ------------------------------------------------------------------ Gemma
+    /// Gemma's RMSNorm is `(1 + w)`, not `w`. Baking the offset into the weights at
+    /// load time keeps every compute path unchanged: `rmsnorm` already multiplies by
+    /// the weight it is given. Confirmed against `GemmaRMSNorm.forward`.
+    norm_unit_offset: bool = false,
+    /// Gemma scales the embedding by `sqrt(hidden_size)` on the way in
+    /// (`GemmaTextScaledWordEmbedding`). 1.0 for every other architecture.
+    embed_scale: f32 = 1.0,
+
     /// True when this layer runs the sparse block rather than a dense MLP.
     pub fn layerIsSparse(self: Config, layer: u32) bool {
         if (self.num_experts == 0) return false;

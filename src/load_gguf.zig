@@ -97,6 +97,12 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     };
     cfg.tie_embeddings = g.tensor("output.weight") == null;
     cfg.rope_adjacent = ropeIsAdjacent(arch);
+    // Gemma: `(1 + w)` RMSNorm and a sqrt(hidden) embedding scale, both confirmed
+    // against the reference implementation rather than guessed.
+    if (std.mem.startsWith(u8, arch, "gemma")) {
+        cfg.norm_unit_offset = true;
+        cfg.embed_scale = @sqrt(@as(f32, @floatFromInt(cfg.hidden)));
+    }
 
     // MoE metadata (llama.cpp: <arch>.expert_count / .expert_used_count /
     // .expert_shared_count / .expert_feed_forward_length).
@@ -208,6 +214,15 @@ fn loadNorm(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u8,
     return v;
 }
 
+/// Load an RMSNorm, applying Gemma's `(1 + w)` convention when the model uses it.
+fn loadNormFor(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u8, n: u32, cfg: model.Config) ![]f32 {
+    const v = try loadNorm(allocator, g, name, n);
+    if (cfg.norm_unit_offset) {
+        for (v) |*x| x.* += 1.0;
+    }
+    return v;
+}
+
 pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: bool) !model.ModelWeights {
     const cfg = try loadConfig(g);
     var mw = model.ModelWeights{ .allocator = allocator, .config = cfg };
@@ -221,7 +236,7 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
     if (progress) sys.print("loading weights: {d} layers, hidden {d}, heads {d}/{d}, inter {d}, vocab {d}\n", .{ cfg.layers, cfg.hidden, cfg.heads, cfg.kv_heads, cfg.inter, cfg.vocab });
 
     mw.embed = try loadLinear(allocator, g, "token_embd.weight", cfg.hidden, cfg.vocab);
-    mw.final_norm = try loadNorm(allocator, g, "output_norm.weight", cfg.hidden);
+    mw.final_norm = try loadNormFor(allocator, g, "output_norm.weight", cfg.hidden, cfg);
     if (g.tensor("output.weight") != null) {
         mw.lm_head = try loadLinear(allocator, g, "output.weight", cfg.hidden, cfg.vocab);
     }
@@ -234,8 +249,8 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         if (progress and (i % 4 == 0 or i + 1 == cfg.layers)) {
             sys.print("  layer {d}/{d}\n", .{ i + 1, cfg.layers });
         }
-        lw.attn_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden);
-        lw.ffn_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden);
+        lw.attn_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+        lw.ffn_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
 
         const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{li}) catch unreachable, cfg.hidden, cfg.qDim());
         defer allocator.free(q);
@@ -252,8 +267,8 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         lw.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
         // Qwen3: per-head q/k normalisation, needed by the CPU reference too.
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
-            lw.q_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
-            lw.k_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+            lw.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
+            lw.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
         }
 
         // Qwen2 (and a few others) add biases to the attention projections.
@@ -312,14 +327,14 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
         rt.embed = try loadLinear(allocator, g, "token_embd.weight", cfg.hidden, cfg.vocab);
         rt.embed_owned = true;
     }
-    rt.final_norm = try loadNorm(allocator, g, "output_norm.weight", cfg.hidden);
+    rt.final_norm = try loadNormFor(allocator, g, "output_norm.weight", cfg.hidden, cfg);
     rt.norms = try allocator.alloc(model.Norm, cfg.layers);
     @memset(rt.norms, .{});
     var buf: [128]u8 = undefined;
     for (rt.norms, 0..) |*n, i| {
         const li: u32 = @intCast(i);
-        n.attn = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden);
-        n.ffn = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden);
+        n.attn = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+        n.ffn = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable) != null) {
             const bq = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.bias", .{li}) catch unreachable);
             defer allocator.free(bq);
@@ -339,8 +354,8 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
         }
         // Qwen3 normalises each head's q/k before RoPE.
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
-            n.q_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim);
-            n.k_norm = try loadNorm(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim);
+            n.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
+            n.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
         }
     }
     return rt;

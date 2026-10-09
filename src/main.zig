@@ -324,7 +324,11 @@ fn refForward(
     const shared_out = try allocator.alloc(f32, hidden);
     defer allocator.free(shared_out);
 
-    for (0..hidden) |i| x[i] = @floatCast(mw.embed[@as(usize, token) * hidden + i]);
+    // Gemma scales the embedding by sqrt(hidden_size); 1.0 for every other model.
+    for (0..hidden) |i| {
+        const e: f32 = @floatCast(mw.embed[@as(usize, token) * hidden + i]);
+        x[i] = e * cfg.embed_scale;
+    }
 
     for (mw.layers[0..@min(layers, mw.layers.len)], 0..) |*lw, li| {
         cpu.rmsnorm(h, x, lw.attn_norm, cfg.eps);
