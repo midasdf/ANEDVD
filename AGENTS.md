@@ -95,6 +95,14 @@ zig fmt src build.zig
 * **`Tokenizer.fromGguf` and `load_gguf.viewF16` alias the mapped GGUF file.**
   The `Gguf` must outlive them; returning either from a helper that closes the
   map is a segfault waiting for first use.
+* **A KV cache is `max_seq` rows and nothing checked that.** `verify` used a fixed 1024-row
+  context and its CPU reference a hardcoded `1024 * cfg.kvDim()`, so a 1121-token prompt
+  wrote past both — and returned all-zero logits with `rel = 1.0` rather than crashing.
+  `Engine.prefill`/`forward` now return `error.ContextOverflow`, and every caller that takes
+  an arbitrary prompt sizes its context from it (`verify`, `layers`); `generate` truncates.
+  If you add a command that calls the engine directly with a user-supplied prompt, size the
+  context to it. `verify` is the ground truth for every numerical claim here, so a silent
+  overflow above its context made those claims unverifiable rather than obviously wrong.
 * **The ANE fails silently.** A wrong weight-blob offset, a transposed weight or
   a mis-strided IOSurface all *compile and run* and return plausible numbers.
   Always validate a new kernel against a CPU matmul (`anedvd check`).
