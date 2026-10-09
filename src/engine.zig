@@ -471,8 +471,12 @@ pub const Engine = struct {
         const inter: usize = cfg.inter;
         const t_start = sys.nowNs();
 
+        // Apply the architecture's embedding scale (Gemma: sqrt(hidden)). The prefill
+        // path does this, and leaving it out here made decode start from a differently
+        // scaled activation than prefill — the model then emitted "." for every step.
         for (0..hidden) |c| {
-            self.x[c * ch] = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+            const e: f32 = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+            self.x[c * ch] = e * cfg.embed_scale;
         }
 
         for (self.kernels, 0..) |*k, li| {
