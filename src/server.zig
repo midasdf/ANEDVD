@@ -182,7 +182,15 @@ pub const Server = struct {
             try b.print("{{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion\",\"created\":{d},\"model\":\"", .{ created, created });
             try jsonString(&b, model_name);
             try b.print("\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"", .{});
-            try jsonString(&b, collector.text.items);
+            // Non-streaming: the whole text goes out at once, so a character left
+            // partial by a token-boundary split or a max_tokens cut has no next token
+            // to complete it. Replace those bytes instead of emitting invalid UTF-8.
+            {
+                var clean: std.ArrayList(u8) = .empty;
+                defer clean.deinit(self.allocator);
+                try appendUtf8Sanitized(&clean, self.allocator, collector.text.items);
+                try jsonString(&b, clean.items);
+            }
             try b.print("\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_dropped\":{d}}}}}", .{
                 finishReason(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens, stats.prompt_tokens + stats.completion_tokens, stats.prompt_tokens_dropped,
             });
@@ -377,7 +385,15 @@ pub const Server = struct {
             try b.print("{{\"id\":\"cmpl-{d}\",\"object\":\"text_completion\",\"created\":{d},\"model\":\"", .{ created, created });
             try jsonString(&b, model_name);
             try b.print("\",\"choices\":[{{\"text\":\"", .{});
-            try jsonString(&b, collector.text.items);
+            // Non-streaming: the whole text goes out at once, so a character left
+            // partial by a token-boundary split or a max_tokens cut has no next token
+            // to complete it. Replace those bytes instead of emitting invalid UTF-8.
+            {
+                var clean: std.ArrayList(u8) = .empty;
+                defer clean.deinit(self.allocator);
+                try appendUtf8Sanitized(&clean, self.allocator, collector.text.items);
+                try jsonString(&b, clean.items);
+            }
             try b.print("\",\"index\":0,\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_dropped\":{d}}}}}", .{
                 finishReason(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens, stats.prompt_tokens + stats.completion_tokens, stats.prompt_tokens_dropped,
             });
@@ -448,7 +464,15 @@ pub const Server = struct {
             try b.print("{{\"id\":\"{s}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"", .{msg_id});
             try jsonString(&b, model_name);
             try b.print("\",\"content\":[{{\"type\":\"text\",\"text\":\"", .{});
-            try jsonString(&b, collector.text.items);
+            // Non-streaming: the whole text goes out at once, so a character left
+            // partial by a token-boundary split or a max_tokens cut has no next token
+            // to complete it. Replace those bytes instead of emitting invalid UTF-8.
+            {
+                var clean: std.ArrayList(u8) = .empty;
+                defer clean.deinit(self.allocator);
+                try appendUtf8Sanitized(&clean, self.allocator, collector.text.items);
+                try jsonString(&b, clean.items);
+            }
             try b.print("\"}}],\"stop_reason\":\"{s}\",\"stop_sequence\":null,\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d}}}}}", .{
                 anthropicStop(stats.stop_reason), stats.prompt_tokens, stats.completion_tokens,
             });
@@ -732,14 +756,61 @@ const Style = enum { openai, openai_legacy, anthropic };
 /// ends). Returns the emit slice plus whether a stop sequence was found.
 const HoldbackResult = struct { emit: []const u8, hit_stop: bool };
 
+/// Length of the longest prefix of `b` that is complete UTF-8.
+///
+/// A token boundary can fall inside a multi-byte character, so `pending` can end with a
+/// truncated sequence — `e3 81` is the start of a three-byte character, and emitting it
+/// produces a JSON body no strict client will parse. Measured against a live server:
+/// a Japanese prompt returned a body that failed `bytes.decode("utf-8")` at the truncation.
+/// Holding the partial tail back until the next token completes it keeps every frame valid.
+fn utf8CompleteLen(b: []const u8) usize {
+    var i: usize = 0;
+    var complete: usize = 0;
+    while (i < b.len) {
+        const n = std.unicode.utf8ByteSequenceLength(b[i]) catch {
+            i += 1; // invalid lead byte: the caller replaces it
+            continue;
+        };
+        if (i + n > b.len) return complete; // truncated multi-byte sequence
+        if (std.unicode.utf8ValidateSlice(b[i..][0..n])) {
+            i += n;
+            complete = i;
+        } else {
+            i += 1;
+        }
+    }
+    return complete;
+}
+
+/// Append `b`, replacing any byte that is not part of a valid UTF-8 sequence with U+FFFD.
+///
+/// Used where there is no next token to complete a partial character: the end of a
+/// non-streaming response, and the final flush of a stream. A generation cut short by
+/// `max_tokens` can genuinely end mid-character.
+fn appendUtf8Sanitized(out: *std.ArrayList(u8), allocator: std.mem.Allocator, b: []const u8) !void {
+    var i: usize = 0;
+    while (i < b.len) {
+        const n = std.unicode.utf8ByteSequenceLength(b[i]) catch 0;
+        if (n > 0 and i + n <= b.len and std.unicode.utf8ValidateSlice(b[i..][0..n])) {
+            try out.appendSlice(allocator, b[i..][0..n]);
+            i += n;
+        } else {
+            try out.appendSlice(allocator, "\u{FFFD}");
+            i += 1;
+        }
+    }
+}
+
 fn holdbackStep(pending: []const u8, stops: []const []const u8, holdback: usize) HoldbackResult {
     for (stops) |s| {
         if (std.mem.indexOf(u8, pending, s)) |idx| {
-            return .{ .emit = pending[0..idx], .hit_stop = true };
+            // Never cut a stop sequence, and never emit a partial character before it.
+            return .{ .emit = pending[0..utf8CompleteLen(pending[0..idx])], .hit_stop = true };
         }
     }
     if (pending.len > holdback) {
-        return .{ .emit = pending[0 .. pending.len - holdback], .hit_stop = false };
+        const want = pending[0 .. pending.len - holdback];
+        return .{ .emit = want[0..utf8CompleteLen(want)], .hit_stop = false };
     }
     return .{ .emit = pending[0..0], .hit_stop = false };
 }
@@ -819,7 +890,13 @@ const SseSink = struct {
 
     fn flushPending(self: *SseSink) !void {
         if (self.pending.items.len > 0 and !self.hit_stop) {
-            try self.frameText(self.pending.items);
+            // End of stream: a partial character left by a token-boundary split or by a
+            // max_tokens cut cannot be completed now, so replace it rather than sending
+            // bytes that are not valid UTF-8.
+            var clean: std.ArrayList(u8) = .empty;
+            defer clean.deinit(self.allocator);
+            try appendUtf8Sanitized(&clean, self.allocator, self.pending.items);
+            try self.frameText(clean.items);
             self.pending.clearRetainingCapacity();
         }
     }
@@ -1016,4 +1093,48 @@ test "the keep-alive timing rule fires only after the interval" {
     // The interval has to be shorter than the shortest idle timeout a proxy commonly
     // applies (30 s), or the comment arrives after the connection is already gone.
     try std.testing.expect(Server.keep_alive_interval_ns < 30 * std.time.ns_per_s);
+}
+
+test "a multi-byte character split across tokens is never emitted half-formed" {
+    // Measured against a live server before this was handled: a Japanese prompt returned a
+    // body that failed `bytes.decode("utf-8")` at a truncated three-byte sequence
+    // (`e3 81`), so no strict JSON client could parse it.
+    const a = std.testing.allocator;
+
+    // A three-byte character (こ = e3 81 93) split as "e3" then "81 93".
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(a);
+
+    try pending.appendSlice(a, "\xe3");
+    var step = holdbackStep(pending.items, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 0), step.emit.len);
+
+    try pending.appendSlice(a, "\x81\x93");
+    step = holdbackStep(pending.items, &.{}, 0);
+    try std.testing.expectEqualStrings("\xe3\x81\x93", step.emit);
+
+    // A four-byte character (😀 = f0 9f 98 80) split three ways.
+    var four: std.ArrayList(u8) = .empty;
+    defer four.deinit(a);
+    for ([_][]const u8{ "\xf0", "\x9f\x98", "\x80" }) |piece| {
+        try four.appendSlice(a, piece);
+        const s = holdbackStep(four.items, &.{}, 0);
+        if (four.items.len < 4) {
+            try std.testing.expectEqual(@as(usize, 0), s.emit.len);
+        } else {
+            try std.testing.expectEqualStrings("\xf0\x9f\x98\x80", s.emit);
+        }
+    }
+
+    // At the end of a stream a partial character is replaced, not sent raw.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendUtf8Sanitized(&out, a, "ok\xe3");
+    try std.testing.expectEqualStrings("ok\xef\xbf\xbd", out.items);
+
+    // Valid text passes through untouched, including a complete multi-byte character.
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(a);
+    try appendUtf8Sanitized(&out2, a, "a\xe3\x81\x93b");
+    try std.testing.expectEqualStrings("a\xe3\x81\x93b", out2.items);
 }
