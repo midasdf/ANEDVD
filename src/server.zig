@@ -243,7 +243,9 @@ pub const Server = struct {
             var collector = Collector.init(self.allocator);
             collector.server = self;
             defer collector.deinit();
-            const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
+            const stats = self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit }) catch |e| {
+                return sendError(conn, 400, @errorName(e));
+            };
 
             self.logStats(stats);
             var b = Buf.init(self.allocator);
@@ -285,7 +287,10 @@ pub const Server = struct {
         defer self.active_sink = null;
         defer sink.deinit();
         sink.setStops(stops);
-        const stats = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
+        const stats = self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit }) catch |e| {
+            streamError(conn, .openai, @errorName(e));
+            return;
+        };
         self.logStats(stats);
         if (!conn.alive) return;
         return sink.finishOpenAi(stats);
@@ -469,7 +474,9 @@ pub const Server = struct {
             var collector = Collector.init(self.allocator);
             collector.server = self;
             defer collector.deinit();
-            const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
+            const stats = self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit }) catch |e| {
+                return sendError(conn, 400, @errorName(e));
+            };
 
             var b = Buf.init(self.allocator);
             defer b.deinit();
@@ -505,7 +512,10 @@ pub const Server = struct {
         sink.server = self;
         defer sink.deinit();
         sink.setStops(stops);
-        _ = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
+        _ = self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit }) catch |e| {
+            streamError(conn, sink.style, @errorName(e));
+            return;
+        };
         if (!conn.alive) return;
         return sink.finishOpenAiLegacy();
     }
@@ -548,7 +558,9 @@ pub const Server = struct {
             var collector = Collector.init(self.allocator);
             collector.server = self;
             defer collector.deinit();
-            const stats = try self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit });
+            const stats = self.session.generate(ids, params, .{ .ctx = &collector, .func = collectEmit }) catch |e| {
+                return sendError(conn, 400, @errorName(e));
+            };
 
             var b = Buf.init(self.allocator);
             defer b.deinit();
@@ -586,7 +598,10 @@ pub const Server = struct {
         sink.message_id = msg_id;
         sink.setStops(stops);
         try sink.anthropicPrelude();
-        const stats = try self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit });
+        const stats = self.session.generate(ids, params, .{ .ctx = &sink, .func = sseEmit }) catch |e| {
+            streamError(conn, .anthropic, @errorName(e));
+            return;
+        };
         if (!conn.alive) return;
         return sink.finishAnthropic(stats);
     }
@@ -1058,6 +1073,30 @@ fn prefillTick(ctx: ?*anyopaque) void {
 /// The cap keeps the prompt and leaves room for at least one generated token, so the
 /// request is always servable. A prompt that fills the context on its own still goes
 /// through the existing truncation path, which reports `prompt_tokens_dropped`.
+/// Tell a streaming client that generation failed after the 200 was already sent.
+///
+/// Headers go out before prefill (so a long prompt cannot look like a dead server), which
+/// means a later failure has no HTTP status left to use. Without this the client receives
+/// `200 OK` and then a truncated or empty stream, which is indistinguishable from success —
+/// exactly what an oversized `max_tokens` produced before it was clamped.
+fn streamError(conn: *http.Conn, style: Style, message: []const u8) void {
+    var js = JsonSink{ .conn = conn };
+    switch (style) {
+        .anthropic => {
+            js.write("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"") catch return;
+        },
+        else => {
+            js.write("data: {\"error\":{\"message\":\"") catch return;
+        },
+    }
+    js.string(message) catch return;
+    switch (style) {
+        .anthropic => js.write("\"}}\n\n") catch return,
+        else => js.write("\",\"type\":\"server_error\"}}\n\n") catch return,
+    }
+    js.flush() catch {};
+}
+
 fn clampMaxTokens(requested: u32, prompt_len: usize, max_seq: u32) u32 {
     const prompt: u32 = @intCast(@min(prompt_len, max_seq));
     const room: u32 = if (prompt + 1 < max_seq) max_seq - prompt - 1 else 1;
