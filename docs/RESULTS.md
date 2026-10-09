@@ -727,3 +727,22 @@ rather than an error:
     experts in a different order in fp16. The argmax assertion is the check that actually
     pins the behaviour. Worth noting for anyone reading a future measurement here: my first
     figure of 0.0078 was the *first element outside tolerance*, not the worst difference.
+26. **The shared expert's `sigmoid(gate . h)` scale now has a test that can fail on it.** This
+    was a real bug once — the scale was computed nowhere and the shared expert joined the
+    residual at full weight — and neither of the existing checks could catch it: the
+    prefill-vs-decode equivalence test would have both paths omit it and agree, and `verify`
+    shares the code with the engine, so its CPU reference omits it too. The independent check
+    was `tools/moe_reference.py`, run by hand.
+
+    The new test is differential rather than numeric. With `shared_gate_lin` all zeros the
+    pre-activation is exactly 0, so the scale is sigmoid(0) = 0.5 and the shared expert must
+    contribute at half weight; leaving the tensor empty takes the other branch, where the
+    scale is 1.0. Applied correctly the two runs differ; ignored they are byte-identical.
+    Routed experts are zeroed so only the shared path contributes.
+
+    Breaking each path in turn shows the pair now covers both:
+
+        decode scale removed   -> the new test fails
+        prefill scale removed  -> the MoE equivalence test fails
+
+    Tests: 119 → 120. README's stale "76 tests" line is corrected too.
