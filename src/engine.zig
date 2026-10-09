@@ -812,9 +812,9 @@ pub const Engine = struct {
 
         var done: usize = 0;
         while (done < ids.len) {
-            // Let the server answer /health and /v1/models while a long prompt
-            // is still being prefilled.
-            if (self.prefill_tick) |tick| tick(self.prefill_tick_ctx);
+            // The tick is fired per layer inside the loop below, which also covers the
+            // start of every chunk; firing it here as well would just duplicate the first
+            // call of each iteration.
             const n = @min(ch, ids.len - done);
             const base_pos: u32 = start_pos + @as(u32, @intCast(done));
 
@@ -831,6 +831,13 @@ pub const Engine = struct {
 
             for (self.kernels, 0..) |*k, li| {
                 const norm = &self.norms[li];
+
+                // Also tick once per layer, not only once per chunk. A chunk of a MoE
+                // model is ~9 s of CPU work (128 tokens x 4 experts x 24 layers), so
+                // chunk-level ticking left /health unanswered for that long — measured at
+                // 14.8 s on a 400-token prompt. A tick is a handful of syscalls (tens of
+                // microseconds) against ~0.4 s of layer work.
+                if (self.prefill_tick) |tick| tick(self.prefill_tick_ctx);
 
                 // ---- qkv projection for the whole chunk ----
                 const tn = sys.nowNs();
@@ -1527,10 +1534,14 @@ test "the staging buffers cover the vocabulary" {
     }
 }
 
-test "prefill calls the tick hook once per chunk (needs the ANE)" {
-    // The hook is what lets the server answer /health during a long prefill:
-    // without it a 6.4 s prefill left the server unresponsive for its whole
-    // duration. Assert it fires once per chunk, not once per request.
+test "prefill calls the tick hook per layer, not merely per chunk (needs the ANE)" {
+    // The hook is what lets the server answer /health during a long prefill.
+    //
+    // It used to fire once per chunk. A chunk of a MoE model is ~9 s of CPU work
+    // (128 tokens x 4 experts x 24 layers), so /health went unanswered for that long —
+    // measured at 14.8 s on a 400-token prompt. It now fires per layer too, and this test
+    // fails if that is removed again: with one layer and three chunks the old contract
+    // gave exactly 3 ticks and the new one gives 6.
     if (!ane.available()) return error.SkipZigTest;
     const a = std.testing.allocator;
 
@@ -1590,10 +1601,12 @@ test "prefill calls the tick hook once per chunk (needs the ANE)" {
     eng.prefill_tick = Ctx.tick;
     eng.prefill_tick_ctx = &ticks;
 
-    // 20 tokens at chunk 8 is 3 chunks (8 + 8 + 4).
+    // 20 tokens at chunk 8 is 3 chunks (8 + 8 + 4) and 1 layer each, so 6 ticks. Assert the
+    // layer count is honoured rather than pinning the exact number, so adding layers to
+    // this fixture does not silently weaken the check.
     const ids = try a.alloc(u32, 20);
     defer a.free(ids);
     @memset(ids, 1);
     _ = try eng.prefill(ids, 0);
-    try std.testing.expectEqual(@as(usize, 3), ticks);
+    try std.testing.expectEqual(@as(usize, 3 * cfg.layers), ticks);
 }
