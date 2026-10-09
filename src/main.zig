@@ -959,6 +959,14 @@ fn cmdRun(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
         @as(f64, @floatFromInt(stats.prefill_ane_ns)) / 1e9,
         @as(f64, @floatFromInt(stats.prefill_ns -| stats.prefill_ane_ns)) / 1e9,
     });
+    // Say so when the prompt had to be cut. Otherwise the line above just reports a smaller
+    // number than the user's prompt, with nothing explaining the difference.
+    if (stats.prompt_tokens_dropped > 0) {
+        sys.print("note: prompt exceeded the {d}-token context; dropped the first {d} of {d} tokens.\n", .{
+            eng.max_seq, stats.prompt_tokens_dropped, stats.prompt_tokens_sent,
+        });
+        sys.print("note: use --max-seq N for a longer context.\n", .{});
+    }
     sys.print("decode: {d} tokens in {d:.2} s ({d:.1} tok/s; ANE {d:.0}%, CPU {d:.0}%)\n", .{
         stats.completion_tokens,
         @as(f64, @floatFromInt(stats.decode_ns)) / 1e9,
@@ -1500,6 +1508,16 @@ fn cmdChat(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
             stats.prompt_tokens,
             stats.prefill_reused,
         });
+        // Say so when the conversation has outgrown the context. Without this the only
+        // symptom is that the beginning is silently forgotten and `reused` drops to 0, so
+        // every later turn re-prefills the whole prompt — slower and slower, with nothing
+        // explaining why. The server already reports this in `usage` and its log.
+        if (stats.prompt_tokens_dropped > 0) {
+            sys.print("  note: the conversation exceeded the {d}-token context, so the first {d} tokens were dropped.\n", .{
+                eng.max_seq, stats.prompt_tokens_dropped,
+            });
+            sys.print("  note: use --max-seq N for a longer context, or /reset to start over.\n", .{});
+        }
     }
     sys.print("bye\n", .{});
 }
