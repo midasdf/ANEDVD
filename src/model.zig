@@ -67,6 +67,19 @@ pub const Config = struct {
     attn_logit_softcap: f32 = 0,
     /// The same cap applied to the final logits; 0 disables.
     final_logit_softcap: f32 = 0,
+    /// Per-Layer Embeddings: the width of the per-layer input vector. Gemma 4 is 256. 0 means
+    /// the architecture has none, which is every other model here.
+    ple_dim: u32 = 0,
+    /// The vocabulary of the per-layer embedding table, which may differ from `vocab`.
+    ple_vocab: u32 = 0,
+    /// The RoPE base for sliding layers when it differs from `rope_theta`. Gemma 4 uses 1e6 on
+    /// its global layers and 1e4 on its sliding ones; 0 means one base for every layer.
+    rope_theta_swa: f32 = 0,
+    /// A per-layer output scale (`blk.N.layer_output_scale`) exists and must be applied.
+    layer_output_scale: bool = false,
+    /// A fifth norm per layer (`blk.N.post_norm`) exists. Gemma 4 has it; no other architecture
+    /// here does.
+    post_norm: bool = false,
     /// How many of the LAST layers share K/V with earlier ones instead of computing their own.
     /// Gemma 4 E2B shares 20 of its 35. A shared layer attends with its own queries but reads
     /// the keys and values of the last non-shared layer of the same attention type.
@@ -140,6 +153,12 @@ pub const Config = struct {
 
     pub fn qDim(self: Config) u32 {
         return self.heads * self.head_dim;
+    }
+
+    /// The RoPE base a particular layer uses.
+    pub fn layerRopeTheta(self: Config, layer: u32) f32 {
+        if (self.rope_theta_swa > 0 and self.layerIsSliding(layer)) return self.rope_theta_swa;
+        return self.rope_theta;
     }
 
     /// The first layer that shares K/V rather than computing it. 0 when none do.
@@ -869,4 +888,18 @@ test "a shared layer borrows K/V from the last non-shared layer of the same type
     const plain = Config{ .layers = 26 };
     try std.testing.expectEqual(@as(u32, 26), plain.firstKvSharedLayer());
     for ([_]u32{ 0, 1, 25 }) |li| try std.testing.expectEqual(li, plain.kvDonor(li));
+}
+
+test "the RoPE base can differ per layer type" {
+    // Gemma 4: 1e6 on its global layers, 1e4 on its sliding ones. Applying one base everywhere
+    // would rotate the sliding layers at the wrong frequency.
+    var cfg = Config{ .rope_theta = 1_000_000.0, .rope_theta_swa = 10_000.0, .sliding_window = 512, .swa_explicit = true };
+    cfg.swa_layers[0] = 0b01; // layer 0 slides
+    try std.testing.expectEqual(@as(f32, 10_000.0), cfg.layerRopeTheta(0));
+    try std.testing.expectEqual(@as(f32, 1_000_000.0), cfg.layerRopeTheta(1));
+
+    // One base for all layers is every other model here.
+    const plain = Config{ .rope_theta = 10000.0 };
+    try std.testing.expectEqual(@as(f32, 10000.0), plain.layerRopeTheta(0));
+    try std.testing.expectEqual(@as(f32, 10000.0), plain.layerRopeTheta(7));
 }

@@ -187,6 +187,25 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
             cfg.swa_all = true;
         }
     }
+    // Per-Layer Embeddings (Gemma 4). `embedding_length_per_layer_input` is the width of the
+    // per-layer vector; the table it indexes is `per_layer_token_embd.weight`, whose own
+    // vocabulary is read from the metadata when present and otherwise follows `vocab`.
+    cfg.ple_dim = g.getU32(key(&buf, arch, "embedding_length_per_layer_input")) orelse 0;
+    if (cfg.ple_dim > 0) {
+        cfg.ple_vocab = g.getU32(key(&buf, arch, "vocab_size_per_layer_input")) orelse cfg.vocab;
+        // `per_layer_token_embd` and `per_layer_model_proj` are separate tables, and the layers
+        // carry `inp_gate`/`proj`; the file says so plainly.
+        cfg.layer_output_scale = g.tensor("blk.0.layer_output_scale.weight") != null;
+        cfg.post_norm = g.tensor("blk.0.post_norm.weight") != null;
+    }
+    // The sliding layers may rotate at a different base (Gemma 4: 1e4 against 1e6).
+    if (g.getF32(key(&buf, arch, "rope.freq_base_swa"))) |b| {
+        if (b > 0 and b != cfg.rope_theta) cfg.rope_theta_swa = b;
+    }
+    // Gemma 4 sets its attention scale to 1 and relies on its Q/K norms; the ordinary
+    // 1/sqrt(head_dim) would shrink every score.
+    if (std.mem.eql(u8, arch, "gemma4")) cfg.attn_scale = 1.0;
+
     // How many of the last layers share K/V instead of computing it (Gemma 4 E2B: 20 of 35).
     // Verified against the official GGUF: layers 0-14 carry `blk.N.attn_k.weight` and
     // `blk.N.attn_v.weight` and layers 15-34 do not, while every layer keeps `attn_q`.

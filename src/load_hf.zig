@@ -126,6 +126,16 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         // one and `head_dim_swa` the sliding one, so the two swap when both are present.
         .head_dim_swa = if (c.global_head_dim > 0) c.head_dim else 0,
         .kv_shared_layers = c.num_kv_shared_layers,
+        // PLE. The per-layer tables and the per-layer `inp_gate`/`proj` only exist when this is
+        // non-zero, so it is also the flag for `layer_output_scale` and the fifth norm.
+        .ple_dim = c.hidden_size_per_layer_input,
+        .ple_vocab = if (c.vocab_size_per_layer_input > 0) c.vocab_size_per_layer_input else c.vocab_size,
+        .layer_output_scale = c.hidden_size_per_layer_input > 0,
+        .post_norm = c.hidden_size_per_layer_input > 0,
+        // Gemma 4 rotates its sliding layers at 1e4 against 1e6 for the global ones, and sets
+        // the attention scale to 1 because its Q/K norms carry the scaling.
+        .rope_theta_swa = if (std.mem.startsWith(u8, c.arch, "Gemma4")) 10_000.0 else 0,
+        .attn_scale = if (std.mem.startsWith(u8, c.arch, "Gemma4")) 1.0 else 0,
     };
 }
 
@@ -467,7 +477,7 @@ test "a Gemma HF checkpoint needs the (1 + w) offset that a GGUF does not" {
     try std.testing.expectEqual(@as(f32, 1.0), lm.embed_scale);
 }
 
-test "a Mistral config windows every layer, a Gemma 2 config alternates" {
+test "the loader maps what each architecture needs: windows, head dims, PLE" {
     // Both architectures declare a sliding window and the two apply it differently. The
     // mapper used to read the window and leave `swa_pattern` at Gemma 2's 2, so Mistral got
     // the alternating rule and windowed only half its layers.
@@ -511,6 +521,26 @@ test "a Mistral config windows every layer, a Gemma 2 config alternates" {
     try std.testing.expect(!g.swa_all); // Gemma 2 alternates instead
     try std.testing.expect(g.layerIsSliding(0));
     try std.testing.expect(!g.layerIsSliding(1));
+
+    // Gemma 4's PLE: the per-layer embedding width and the flags that come with it. Driven
+    // through toModelConfig, so deleting the mapping fails rather than nothing.
+    var ple = base;
+    ple.arch = "Gemma4ForConditionalGeneration";
+    ple.hidden_size_per_layer_input = 256;
+    ple.vocab_size_per_layer_input = 262144;
+    const cp = try toModelConfig(ple);
+    try std.testing.expectEqual(@as(u32, 256), cp.ple_dim);
+    try std.testing.expectEqual(@as(u32, 262144), cp.ple_vocab);
+    try std.testing.expect(cp.layer_output_scale); // Gemma 4 ships it
+    try std.testing.expect(cp.post_norm); // and a fifth norm
+    try std.testing.expectEqual(@as(f32, 1.0), cp.attn_scale); // Q/K norms carry the scaling
+    try std.testing.expectEqual(@as(f32, 10_000.0), cp.rope_theta_swa);
+    // A model without PLE must not pick any of it up, which is every other architecture.
+    const cq = try toModelConfig(base);
+    try std.testing.expectEqual(@as(u32, 0), cq.ple_dim);
+    try std.testing.expect(!cq.layer_output_scale);
+    try std.testing.expect(!cq.post_norm);
+    try std.testing.expectEqual(@as(f32, 0), cq.rope_theta_swa);
 
     // Gemma 4's two head dimensions. HF calls the sliding one `head_dim` (256) and the global
     // one `global_head_dim` (512); Config's `head_dim` is the global/default one, so they swap.
