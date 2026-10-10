@@ -53,19 +53,48 @@ them would be attached to every request.
   prints that command's exact input schema. Use them instead of guessing flags.
 * Control output size instead of dumping it: `--format json` (default),
   `--token-limit <n>`, `--token-count`, `--filter-output a.b,c[0,3]`.
-* Deep native analysis needs Hopper, Ghidra, or IDA. **None is installed on
-  this machine**, so check `rea providers` before promising pseudocode. These
-  work with no provider: `inspect-macho`, `inspect-signature`, `inspect-plist`,
-  `demangle-swift`, `trace-dylib-resolution`, `decode-interface-builder`,
+* Deep native analysis runs through **Ghidra 12.1.4** (installed 2026-10-10,
+  `brew install ghidra`). `rea` on PATH in this profile is a wrapper at
+  `~/.local/bin/rea` that supplies the two variables REA requires —
+  `GHIDRA_INSTALL_DIR=/opt/homebrew/opt/ghidra/libexec` and the keg-only
+  `JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home` —
+  so `rea decompile`, `rea function` and `rea search --kind procedures` work
+  without any setup. Hopper and IDA are still absent; `rea doctor --provider
+  ghidra` is the readiness check.
+* **Mach-O procedure names keep the leading underscore** in Ghidra: pass
+  `_ane_helper`, not `ane_helper` (a bare name fails with `invalid_request`).
+  Use `rea search <path> <pattern> --kind procedures` to get the exact name or
+  address first.
+* **A universal (fat) Mach-O is refused** with `architecture_unsupported`;
+  "analyze a thinned Mach-O slice instead". Get the exact slice names with
+  `lipo -archs <file>` (`aned` is `x86_64 arm64e arm64e.x1` — no plain `arm64`)
+  and thin first: `lipo -thin arm64e <fat> -output <thin>`.
+* Every CLI call is a new process, so Ghidra re-imports and re-analyzes on each
+  one. Pass the same `--snapshot <file>` to every command on one target to reuse
+  the analysis instead of paying for it per query.
+* These work with no provider at all: `inspect-macho`, `inspect-signature`,
+  `inspect-plist`, `trace-dylib-resolution`, `decode-interface-builder`,
   `inspect-keyed-archive`, `inspect-asset-catalog`,
   `analyze-javascript-application`, `inspect-binary-layout`.
+* `rea observe-native-calls` (LLDB) records function entries with integer
+  arguments and backtraces, but its results are **racy**: on one test binary 6 of
+  8 runs recorded every expected hit, one recorded 5, and one recorded nothing
+  while leaving the target stopped for the whole window. Re-run before
+  concluding a function is never called, and read `coverage.status` — a
+  zero-event result is inconclusive, not negative evidence.
 * Results are Evidence records with an `evidence_id`, a subject digest, and
   explicit unknowns. Keep them in files and cite the IDs; the CLI does not
   retain them between calls unless `--snapshot` is used.
 
 ## Install layout and updating
 
-* CLI: `npm install --global rea-agents@6.3.0` (`/opt/homebrew/bin/rea`).
+* CLI: `npm install --global rea-agents@6.3.0` installs `/opt/homebrew/bin/rea`.
+  `~/.local/bin/rea` (first in PATH) is a **wrapper** that adds
+  `GHIDRA_INSTALL_DIR` and `JAVA_HOME` and execs it; explicit variables still win.
+  Remove the wrapper to get the bare CLI back.
+* Providers: Ghidra 12.1.4 via `brew install ghidra` (pulls the keg-only
+  `openjdk@21`); Hopper/IDA are not installed. Nothing else is needed for the
+  provider-free operations.
 * Skills live in **two roots** and must stay in step: this repository's
   `.agents/skills/` (project root, wins for sessions opened here) and
   `~/.dsh/skills/` (user root, makes them visible in every other workspace).

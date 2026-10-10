@@ -393,14 +393,20 @@ fn refForward(
         const l_hd: usize = cfg.layerHeadDim(@intCast(li));
         const l_q_dim: usize = cfg.layerQDim(@intCast(li));
         const l_kv_dim: usize = cfg.layerKvDim(@intCast(li));
-        const l_qkv_dim: usize = l_q_dim + 2 * l_kv_dim;
+        // From the MATRIX, not computed: a K/V-sharing layer's qkv is Q-only because the
+        // checkpoint has no K/V weights for it, and asking for q + 2*kv read past the end of the
+        // matrix and segfaulted. The engine does the same through `LayerKernels.qkv_rows`.
+        const l_qkv_dim: usize = lw.qkv.len / hidden;
+        // A shared layer also has no K or V to split out.
+        const has_kv: bool = l_qkv_dim > l_q_dim;
         const l_theta: f32 = cfg.layerRopeTheta(@intCast(li));
         cpu.rmsnorm(h, x, lw.attn_norm, cfg.eps);
         matmulF16(qkv, lw.qkv, h, @intCast(l_qkv_dim), hidden);
         if (lw.qkv_bias) |b| cpu.addInPlace(qkv, b);
         const q = qkv[0..l_q_dim];
-        const kk = qkv[l_q_dim..][0..l_kv_dim];
-        const vv = qkv[l_q_dim + l_kv_dim ..][0..l_kv_dim];
+        // Empty slices on a shared layer, whose qkv matrix is Q-only.
+        const kk = if (has_kv) qkv[l_q_dim..][0..l_kv_dim] else qkv[0..0];
+        const vv = if (has_kv) qkv[l_q_dim + l_kv_dim ..][0..l_kv_dim] else qkv[0..0];
         // Qwen3 normalises each head's q/k before RoPE; the reference has to do
         // the same or `verify` reports a mismatch that is the reference's fault.
         if (lw.q_norm) |w| {
@@ -415,18 +421,24 @@ fn refForward(
                 cpu.rmsnorm(v, v, w, cfg.eps);
             }
         }
+        // RoPE on the keys only when this layer has any: a K/V-sharing layer keeps its own
+        // queries and borrows the donor's cache, so there is nothing to rotate or to write.
         if (cfg.rope_adjacent) {
             cpu.ropeAdjacent(q, cfg.heads, @intCast(l_hd), pos, l_theta);
-            cpu.ropeAdjacent(kk, cfg.kv_heads, @intCast(l_hd), pos, l_theta);
+            if (has_kv) cpu.ropeAdjacent(kk, cfg.kv_heads, @intCast(l_hd), pos, l_theta);
         } else {
             cpu.rope(q, cfg.heads, @intCast(l_hd), pos, l_theta);
-            cpu.rope(kk, cfg.kv_heads, @intCast(l_hd), pos, l_theta);
+            if (has_kv) cpu.rope(kk, cfg.kv_heads, @intCast(l_hd), pos, l_theta);
         }
-        for (0..l_kv_dim) |i| {
-            st.k[li][@as(usize, pos) * l_kv_dim + i] = @floatCast(kk[i]);
-            st.v[li][@as(usize, pos) * l_kv_dim + i] = @floatCast(vv[i]);
+        if (has_kv) {
+            for (0..l_kv_dim) |i| {
+                st.k[li][@as(usize, pos) * l_kv_dim + i] = @floatCast(kk[i]);
+                st.v[li][@as(usize, pos) * l_kv_dim + i] = @floatCast(vv[i]);
+            }
         }
-        cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, @intCast(l_hd), scores, .{
+        // A shared layer attends against the donor's cache, exactly as the engine does.
+        const donor: usize = cfg.kvDonor(@intCast(li));
+        cpu.attentionDecode(attn, q, st.k[donor], st.v[donor], pos + 1, cfg.heads, cfg.kv_heads, @intCast(l_hd), scores, .{
             .logit_softcap = cfg.attn_logit_softcap,
             .scale = cfg.attn_scale,
             .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,

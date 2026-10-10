@@ -262,8 +262,35 @@ The MCP server is deliberately **not** registered: 6.3.0 advertises 139 tools an
 ~573 KB of model-visible input schemas, and `dsh-mcp-client` has no allowlist, so
 every request would carry all of them. Apple static analysis needs no provider
 (`rea inspect-macho`, `inspect-signature` — it returns `entitlements`,
-`trace-dylib-resolution`, `demangle-swift`); `rea decompile` / `rea function`
-need Hopper, Ghidra or IDA, and none is installed — check `rea providers` first.
+`trace-dylib-resolution`, `demangle-swift`).
+
+**Ghidra 12.1.4 is installed** (`brew install ghidra`, which also brings the
+keg-only `openjdk@21`). REA does not auto-discover Ghidra and needs both
+variables, so `~/.local/bin/rea` — first in PATH — supplies them and execs
+`/opt/homebrew/bin/rea`; an explicit environment still wins:
+
+    GHIDRA_INSTALL_DIR=/opt/homebrew/opt/ghidra/libexec
+    JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+
+Verified after that: `rea doctor --provider ghidra` healthy (9/9 scope checks),
+`rea search --kind procedures` and `rea decompile` return real Ghidra output.
+Two traps:
+
+* **Mach-O procedure names keep the leading underscore** — Ghidra knows
+  `_ane_helper`, so `rea decompile <path> ane_helper` fails with
+  `invalid_request`; drop the name only for provider-free tools.
+* **A universal binary is rejected**: `architecture_unsupported` — "analyze a
+  thinned Mach-O slice instead". `aned` is x86_64 + arm64, so thin it first
+  (`lipo -thin arm64 /usr/libexec/aned -output /tmp/aned-arm64`). Every CLI call
+  is a new process, so a big binary pays Ghidra's import again unless the command
+  is given `--snapshot <file>`.
+
+`rea observe-native-calls` (LLDB, provider-free) works and records entries with
+integer arguments and backtraces, but it is **racy on this machine**: 6 of 8 runs
+on one binary recorded all 6 expected hits, one recorded 5, and one recorded
+nothing and left the target stopped for the whole window. A zero-event result is
+inconclusive — re-run before concluding a function is never called, and read
+`coverage.status`.
 
 ## Gemma 2 works (rounds 8-10)
 
