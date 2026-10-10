@@ -1077,3 +1077,27 @@ rather than an error:
 
     What would settle it: run `check` on gemma-2-2b as the first ANE work after a fresh boot,
     and again after loading three or four models, and compare. That is one command each.
+49. **Gemma 4 support, step 3 of 6 done: per-layer head dimensions.** The last structural piece
+    before the two that remain. Sliding layers are 256 and global layers 512, so neither the KV
+    cache (`max_seq * kvDim`, uniform) nor the qkv/o projection widths could stay single-valued.
+
+    The engine now binds `l_hd`/`kv_dim`/`q_dim` inside both layer loops, `ropeAndCache` takes
+    the head dimension instead of reading `cfg.head_dim`, `Engine.init` allocates each layer's
+    K/V rows from `cfg.layerKvDim(i)`, the one-layer-at-a-time buffers are sized to the `max*`
+    widths, and `buildLayerKernels` takes the layer index. `diagnose` takes the layer it
+    describes rather than assuming layer 0.
+
+    Both loaders carry it, under names that disagree: GGUF's `key_length` is the global 512 and
+    `key_length_swa` the sliding 256, while HF's `global_head_dim` is the global 512 and
+    `head_dim` the *sliding* 256 — the reverse. Two tests drive the mapping, and removing both
+    reads fails them (132 -> 130).
+
+    Two things worth keeping from the round this nearly went wrong in:
+
+    * The engine half was parked for a round because `check` on gemma-2-2b said `lm_head
+      BROKEN`. It was not the change: the same source passed and then failed, and the failure
+      signature — `rel = 1.21667e1`, `head input |x| = 163.5754` — is byte-for-byte what the
+      unchanged committed code produced. **`check` on the 2B model is not a pass/fail gate on
+      this machine**; the small models and `verify` are, and they stayed green throughout.
+    * Re-testing on the next round with the right gates took one command. Parked work plus a
+      written-down verification plan beats shipping a change whose evidence is a flaky check.
