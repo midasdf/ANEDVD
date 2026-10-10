@@ -1165,3 +1165,24 @@ rather than an error:
     `query_pre_attn_scalar`), V has a norm with **no learned weight**, and the RoPE base differs
     per layer type (1e6 global against 1e4 sliding — the GGUF carries `rope.freq_base` and
     `rope.freq_base_swa`, which are read but not yet used per layer).
+53. **Gemma 4 step 5, in pieces: what is read, what is applied.** The layer set carries two things
+    no other architecture here has — a fifth norm (`post_norm`) and a per-layer
+    `layer_output_scale` — plus PLE's tables and a per-layer RoPE base. Done so far:
+
+    * **Config and both loaders** carry `ple_dim`/`ple_vocab`, `layer_output_scale`, `post_norm`,
+      `rope_theta_swa` and `attn_scale = 1.0`. The two flags are read by *looking for the
+      tensors* (`blk.0.layer_output_scale.weight`, `blk.0.post_norm.weight`) rather than
+      inferred from the architecture name.
+    * **The per-layer RoPE base is applied**: `ropeAndCache` and `ropeQueryOnly` call
+      `cfg.layerRopeTheta(li)`, so sliding layers rotate at 1e4 and global ones at 1e6. Nothing
+      moves for any other model because `rope_theta_swa == 0` there.
+
+    Not applied yet: the PLE lookup and its `inp_gate`/`proj`, the fifth norm, and the output
+    scale. Those are the rest of step 5.
+
+    Two process notes, both mine. The PLE assertions first landed inside the Mistral/Gemma test,
+    where they ran and passed under a name that did not mention them — coverage that cannot be
+    found is coverage that will be lost, so that test is renamed for what it checks. And the
+    commit message for the RoPE change went through an **unquoted** heredoc, so the shell ate
+    every backticked identifier and left a sentence with holes in it; a quoted delimiter is what
+    prevents that.
