@@ -403,17 +403,36 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
             lw.post_ffw_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_ffw_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
         }
 
-        const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{li}) catch unreachable, cfg.hidden, cfg.qDim());
-        defer allocator.free(q);
-        const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{li}) catch unreachable, cfg.hidden, cfg.kvDim());
-        defer allocator.free(k);
-        const v = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.weight", .{li}) catch unreachable, cfg.hidden, cfg.kvDim());
-        defer allocator.free(v);
+        // Per layer, because a sliding layer may have a different head dimension from a global
+        // one (Gemma 4: 256 against 512).
+        const l_q: u32 = @intCast(cfg.layerQDim(li));
+        const l_kv: u32 = @intCast(cfg.layerKvDim(li));
+        const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{li}) catch unreachable, cfg.hidden, l_q);
+        // `q` is deliberately NOT `defer`-freed: on a shared layer it becomes `lw.qkv` and on
+        // an ordinary one it is copied into the q||k||v matrix below and freed explicitly.
+        // Deferring as well was a double free, and it corrupted the heap on the first model
+        // that went through this path — verify reported MISMATCH for SmolLM2.
 
-        lw.qkv = try allocator.alloc(f16, q.len + k.len + v.len);
-        @memcpy(lw.qkv[0..q.len], q);
-        @memcpy(lw.qkv[q.len..][0..k.len], k);
-        @memcpy(lw.qkv[q.len + k.len ..][0..v.len], v);
+        if (cfg.isKvShared(li)) {
+            // A shared layer has no K/V weights of its own: the checkpoint omits
+            // `blk.N.attn_k.weight` and `attn_v.weight` entirely (verified against the official
+            // Gemma 4 E2B GGUF — layers 0-14 carry them, 15-34 do not). It attends with its own
+            // queries against an earlier layer's cache, so only Q is loaded and the qkv matrix
+            // is Q-only.
+            lw.qkv = q; // ownership moves into the layer; no K/V to append
+        } else {
+            const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{li}) catch unreachable, cfg.hidden, l_kv);
+            defer allocator.free(k);
+            const v = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.weight", .{li}) catch unreachable, cfg.hidden, l_kv);
+            defer allocator.free(v);
+
+            const both = try allocator.alloc(f16, q.len + k.len + v.len);
+            @memcpy(both[0..q.len], q);
+            @memcpy(both[q.len..][0..k.len], k);
+            @memcpy(both[q.len + k.len ..][0..v.len], v);
+            allocator.free(q);
+            lw.qkv = both;
+        }
 
         lw.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
         // Qwen3: per-head q/k normalisation, needed by the CPU reference too.

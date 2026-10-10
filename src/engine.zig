@@ -44,6 +44,9 @@ pub const Options = struct {
 
 const LayerKernels = struct {
     qkv: ane.Kernel,
+    /// Rows the qkv kernel produces: `q + 2*kv` for a normal layer, `q` alone for one that
+    /// borrows another layer's K/V (Gemma 4's shared tail), whose checkpoint has no K/V weights.
+    qkv_rows: u32,
     o: ane.Kernel,
     /// Fused: [hidden] -> [hidden]. Split: [hidden] -> [2*inter] (gate || up).
     /// For a sparse MoE layer this kernel computes the SHARED expert, which every
@@ -508,18 +511,24 @@ pub const Engine = struct {
             self.stats.node_ns[@backingInt(Node.qkv)] += dt_qkv;
             self.stats.node_evals[@backingInt(Node.qkv)] += 1;
             const tr = sys.nowNs();
-            try k.qkv.readOutputColumnF16(0, 0, self.dec_out[0..cfg.qkvDim()]);
+            try k.qkv.readOutputColumnF16(0, 0, self.dec_out[0..k.qkv_rows]);
             self.stats.qkv_read_ns += sys.nowNs() - tr;
-            for (0..cfg.qkvDim()) |c| self.qkv[c * ch] = @floatCast(self.dec_out[c]);
+            for (0..k.qkv_rows) |c| self.qkv[c * ch] = @floatCast(self.dec_out[c]);
             if (norm.qkv_bias) |b| {
                 for (b, 0..) |v, c| self.qkv[c * ch] += v;
             }
 
             gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, 0);
-            gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, 0);
-            gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, 0);
-            self.ropeAndCache(li, pos, cfg, kv_dim, l_hd);
-            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, l_hd, self.scores, .{
+            if (cfg.isKvShared(@intCast(li))) {
+                self.ropeQueryOnly(li, pos, cfg, l_hd);
+            } else {
+                gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, 0);
+                gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, 0);
+                self.ropeAndCache(li, pos, cfg, kv_dim, l_hd);
+            }
+            // A shared layer attends with its own queries against the donor's keys and values.
+            const donor: usize = cfg.kvDonor(@intCast(li));
+            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[donor], self.v_cache[donor], pos + 1, cfg.heads, cfg.kv_heads, l_hd, self.scores, .{
                 .logit_softcap = cfg.attn_logit_softcap,
                 .scale = cfg.attn_scale,
                 .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
@@ -795,6 +804,19 @@ pub const Engine = struct {
         }
     }
 
+    /// Q norm and rotary only, for a layer that borrows another layer's K/V. Its own keys
+    /// do not exist: no weights were loaded for them, so there is nothing to normalise, rotate
+    /// or store.
+    fn ropeQueryOnly(self: *Engine, li: usize, pos: u32, cfg: model.Config, hd: u32) void {
+        const norm = &self.norms[li];
+        if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, hd, w, cfg.eps);
+        if (cfg.rope_adjacent) {
+            cpu.ropeAdjacent(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
+        } else {
+            cpu.rope(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
+        }
+    }
+
     fn ropeAndCache(self: *Engine, li: usize, pos: u32, cfg: model.Config, kv_dim: usize, hd: u32) void {
         const norm = &self.norms[li];
         if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, hd, w, cfg.eps);
@@ -874,7 +896,7 @@ pub const Engine = struct {
                 try k.qkv.eval();
                 self.stats.ane_eval_ns += sys.nowNs() - t0;
                 self.stats.ane_evals += 1;
-                const qkv_len = @as(usize, cfg.qkvDim()) * ch;
+                const qkv_len = @as(usize, k.qkv_rows) * ch;
                 try k.qkv.readOutputF16(0, self.out16[0..qkv_len]);
                 const tc = sys.nowNs();
                 for (0..qkv_len) |i| self.qkv[i] = @floatCast(self.out16[i]);
@@ -892,9 +914,13 @@ pub const Engine = struct {
                 for (0..n) |j| {
                     const pos = base_pos + @as(u32, @intCast(j));
                     gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, j);
-                    gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, j);
-                    gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, j);
-                    self.ropeAndCache(li, pos, cfg, kv_dim, l_hd);
+                    if (cfg.isKvShared(@intCast(li))) {
+                        self.ropeQueryOnly(li, pos, cfg, l_hd);
+                    } else {
+                        gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, j);
+                        gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, j);
+                        self.ropeAndCache(li, pos, cfg, kv_dim, l_hd);
+                    }
                     scatterColumn(self.qkv[0..], self.sq[0..q_dim], ch, j);
                 }
                 self.stats.pf_rope_ns += sys.nowNs() - tr0;
@@ -908,8 +934,8 @@ pub const Engine = struct {
                     self.qkv[0..],
                     ch,
                     1,
-                    self.k_cache[li],
-                    self.v_cache[li],
+                    self.k_cache[cfg.kvDonor(@intCast(li))],
+                    self.v_cache[cfg.kvDonor(@intCast(li))],
                     @as(usize, base_pos) + n,
                     n,
                     base_pos,
@@ -1412,7 +1438,10 @@ fn makeFusedFfnKernel(
 fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.Matrices, layer: u32, opts: Options, width: u32) !LayerKernels {
     // Both projections are sized from THIS layer's head dimension, which for Gemma 4 differs
     // between sliding and global layers.
-    const l_qkv: u32 = @intCast(cfg.layerQkvDim(layer));
+    // Taken from the matrices rather than computed: a shared layer's qkv matrix is Q-only
+    // because the checkpoint has no K/V weights for it, so `qkv.len / hidden` is the width the
+    // kernel must have. For every ordinary layer this is `layerQkvDim`.
+    const l_qkv: u32 = @intCast(lw.qkv.len / cfg.hidden);
     const l_q: u32 = @intCast(cfg.layerQDim(layer));
     var qkv = try makeConvKernel(allocator, cfg.hidden, l_qkv, lw.qkv, "qkv", width);
     errdefer qkv.deinit();
@@ -1439,7 +1468,7 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
 
     if (opts.fuse_ffn and std.c.getenv("ANEDVD_NO_FUSED_FFN") == null) {
         if (makeFusedFfnKernel(allocator, cfg.hidden, ffn_inter, lw.gate, lw.up, lw.down, width)) |fk| {
-            return .{ .qkv = qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
+            return .{ .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
         } else |e| {
             if (opts.verbose) {
                 sys.print("    fused FFN rejected ({s}: {s}); falling back to split kernels\n", .{ @errorName(e), ane.lastError() });
@@ -1455,7 +1484,7 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     errdefer gu_k.deinit();
     var down_k = try makeConvKernel(allocator, ffn_inter, cfg.hidden, lw.down, "down", width);
     errdefer down_k.deinit();
-    return .{ .qkv = qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep };
+    return .{ .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep };
 }
 
 // ---------------------------------------------------------------------------
