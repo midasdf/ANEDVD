@@ -74,6 +74,13 @@ pub const Config = struct {
     /// and layer 1 is global. Getting this backwards produces real words in the wrong
     /// order rather than obvious garbage.
     swa_pattern: u32 = 2,
+    /// An explicit per-layer sliding list, used when the model ships one instead of a
+    /// repeating pattern (Gemma 4's `layer_types`). Bit `l` of `swa_layers[l / 64]` set means
+    /// layer `l` uses the window. Checked before `swa_all` and `swa_pattern`; 128 layers is
+    /// the ceiling, which is twice the largest model this has been pointed at.
+    swa_explicit: bool = false,
+    swa_layers: [2]u64 = .{ 0, 0 },
+
     /// Every layer uses the sliding window rather than alternating. Mistral is the case:
     /// llama.cpp calls `set_swa_pattern(0, ..)`, whose rule is `n_pattern == 0 || ...`, so
     /// all layers slide. Applying Gemma 2's alternating pattern to Mistral would window only
@@ -103,6 +110,14 @@ pub const Config = struct {
     /// Writing this as `layer % 2 != 0` inverts every layer.
     pub fn layerIsSliding(self: Config, layer: u32) bool {
         if (self.sliding_window == 0) return false;
+        // An explicit list wins over both other rules: Gemma 4 ships one and it is the only
+        // thing that describes its pattern, which is not a repeating length.
+        if (self.swa_explicit) {
+            if (layer >= 128) return false;
+            const word: u6 = @intCast(layer / 64);
+            const bit: u6 = @intCast(layer % 64);
+            return (self.swa_layers[word] >> bit) & 1 != 0;
+        }
         if (self.swa_all) return true; // Mistral: llama.cpp's `n_pattern == 0` case
         if (self.swa_pattern == 0) return false;
         return (layer + 1) % self.swa_pattern != 0;
@@ -696,4 +711,29 @@ test "a sliding pattern of six is five sliding layers then one global" {
     try std.testing.expect(!gemma3.layerIsSliding(5)); // the sixth layer is global
     for (6..11) |li| try std.testing.expect(gemma3.layerIsSliding(@intCast(li)));
     try std.testing.expect(!gemma3.layerIsSliding(11));
+}
+
+test "an explicit per-layer list overrides both the pattern and swa_all" {
+    // Gemma 4 ships `layer_types` as a list rather than a repeating length, and its first
+    // layers read [sliding x4, full, sliding x4, full, ...] — which no modulo describes.
+    var cfg = Config{ .sliding_window = 512, .swa_explicit = true };
+    // bit l set => layer l slides
+    cfg.swa_layers[0] = 0b01111; // layers 0-3 sliding, layer 4 full
+    for (0..4) |li| try std.testing.expect(cfg.layerIsSliding(@intCast(li)));
+    try std.testing.expect(!cfg.layerIsSliding(4));
+    try std.testing.expect(!cfg.layerIsSliding(5));
+
+    // It wins over the other two rules, both of which would answer differently here.
+    cfg.swa_all = true;
+    try std.testing.expect(!cfg.layerIsSliding(4));
+    cfg.swa_pattern = 2;
+    try std.testing.expect(!cfg.layerIsSliding(4));
+
+    // No window at all still means nothing slides, whatever the list says.
+    var none = Config{ .swa_explicit = true };
+    none.swa_layers[0] = 0xFFFF_FFFF_FFFF_FFFF;
+    try std.testing.expect(!none.layerIsSliding(0));
+
+    // Beyond the 128-layer ceiling it must answer rather than read past the array.
+    try std.testing.expect(!cfg.layerIsSliding(200));
 }

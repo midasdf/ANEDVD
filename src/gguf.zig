@@ -289,6 +289,17 @@ pub const Value = union(ValueType) {
             else => null,
         };
     }
+
+    /// A GGUF array of bools, as `attention.sliding_window_pattern` carries for Gemma 4.
+    pub fn asBoolArray(self: Value) ?[]const bool {
+        return switch (self) {
+            .array => |a| switch (a.data) {
+                .boolean => |b| b,
+                else => null,
+            },
+            else => null,
+        };
+    }
 };
 
 pub const Kv = struct {

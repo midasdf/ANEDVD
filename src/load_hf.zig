@@ -116,6 +116,9 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         // reference's rule is `sliding if (i + 1) % pattern`, which is the shape
         // `layerIsSliding` already implements — only the constant differs.
         .swa_pattern = if (c.sliding_window_pattern > 0) c.sliding_window_pattern else 2,
+        // An explicit `layer_types` list beats both the pattern and `swa_all`.
+        .swa_explicit = c.swa_explicit,
+        .swa_layers = c.swa_layers,
     };
 }
 
@@ -501,6 +504,21 @@ test "a Mistral config windows every layer, a Gemma 2 config alternates" {
     try std.testing.expect(!g.swa_all); // Gemma 2 alternates instead
     try std.testing.expect(g.layerIsSliding(0));
     try std.testing.expect(!g.layerIsSliding(1));
+
+    // `layer_types` as Gemma 4 ships it: an explicit per-layer list, [sliding x4, full, ...],
+    // which no modulo describes. Driven through toModelConfig, not through layerIsSliding
+    // directly, so deleting the plumbing fails rather than nothing.
+    var g4 = base;
+    g4.arch = "Gemma4ForConditionalGeneration";
+    g4.sliding_window = 512;
+    g4.swa_explicit = true;
+    g4.swa_layers[0] = 0b0001_1111; // layers 0-4 sliding, layer 5 full
+    const c4 = try toModelConfig(g4);
+    try std.testing.expect(c4.swa_explicit);
+    try std.testing.expect(c4.layerIsSliding(0));
+    try std.testing.expect(c4.layerIsSliding(3));
+    try std.testing.expect(!c4.layerIsSliding(5)); // and it beats the pattern and swa_all
+    try std.testing.expect(!c4.swa_all);
 
     // The pattern must actually reach the config: a test of `layerIsSliding` alone pins the
     // rule but not the reading of the key, so removing the plumbing would not fail anything.

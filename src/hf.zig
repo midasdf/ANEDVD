@@ -123,6 +123,10 @@ pub const Config = struct {
     /// uses 6 (five sliding, then one global). Absent means the architecture's default, which
     /// only Gemma 2 has a reason to assume.
     sliding_window_pattern: u32 = 0,
+    /// Packed `layer_types`: bit `l` set means layer `l` uses sliding attention, and
+    /// `swa_explicit` says whether the list was present at all.
+    swa_explicit: bool = false,
+    swa_layers: [2]u64 = .{ 0, 0 },
 
     /// Frees `arch`. All other fields are value types.
     pub fn deinit(self: *Config, allocator: Allocator) void {
@@ -185,7 +189,7 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
         break :blk hidden_size / num_attention_heads;
     };
 
-    return .{
+    var c: Config = .{
         .arch = arch_name,
         .hidden_size = hidden_size,
         .num_hidden_layers = num_hidden_layers,
@@ -219,6 +223,27 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
         .sliding_window_size = getU32(obj, &.{"sliding_window_size"}) orelse 0,
         .sliding_window_pattern = getU32(obj, &.{"sliding_window_pattern"}) orelse 0,
     };
+
+    // `layer_types` is Gemma 3/4's explicit per-layer list: "sliding_attention" or
+    // "full_attention", one entry per layer. It describes patterns no modulo does (Gemma 4's
+    // is [sliding x4, full, sliding x4, full, ...] and repeats over five), so it is kept as a
+    // mask rather than being reduced to a length. Held as bits, not as the parsed strings,
+    // because the JSON arena does not outlive this call.
+    if (obj.get("layer_types")) |v| {
+        if (v == .array) {
+            for (v.array.items, 0..) |item, li| {
+                if (li >= 128) break;
+                const name = switch (item) {
+                    .string => |s2| s2,
+                    else => continue,
+                };
+                if (!std.mem.startsWith(u8, name, "sliding")) continue;
+                c.swa_explicit = true;
+                c.swa_layers[li / 64] |= @as(u64, 1) << @intCast(li % 64);
+            }
+        }
+    }
+    return c;
 }
 
 fn resolveArch(allocator: Allocator, obj: std.json.ObjectMap) ![]const u8 {

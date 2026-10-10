@@ -183,11 +183,26 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
         }
     }
     // The pattern key overrides the architecture default in both directions: Gemma 3 needs 6
-    // where Gemma 2 uses 2, and a non-Gemma model may declare one too.
-    if (g.getU32(key(&buf, arch, "attention.sliding_window_pattern"))) |pat| {
-        if (pat > 0) {
-            cfg.swa_pattern = pat;
+    // where Gemma 2 uses 2, and a non-Gemma model may declare one too. Two shapes exist: a
+    // repeating length (Gemma 2/3) and an explicit per-layer list (Gemma 4, whose
+    // `sliding_window_pattern` is an array of bools matching HF's `layer_types` one for one —
+    // `true` means that layer slides).
+    if (g.getValue(key(&buf, arch, "attention.sliding_window_pattern"))) |v| {
+        if (v.asBoolArray()) |flags| {
+            cfg.swa_explicit = true;
             cfg.swa_all = false;
+            if (flags.len > 128) {
+                sys.eprint("warning: {d} sliding-window flags, only the first 128 are used.\n", .{flags.len});
+            }
+            for (flags, 0..) |slides, li| {
+                if (!slides or li >= 128) continue;
+                cfg.swa_layers[li / 64] |= @as(u64, 1) << @intCast(li % 64);
+            }
+        } else if (v.asU32()) |pat| {
+            if (pat > 0) {
+                cfg.swa_pattern = pat;
+                cfg.swa_all = false;
+            }
         }
     }
 
@@ -959,4 +974,49 @@ test "a gemma4 GGUF is refused rather than loaded as llama" {
     const cfg2 = try loadConfig(&g2);
     try std.testing.expectEqual(@as(u32, 2304), cfg2.hidden);
     try std.testing.expect(!cfg2.swa_all); // Gemma 2 alternates, it does not slide everywhere
+}
+
+test "a per-layer sliding list is read from a GGUF bool array" {
+    // Gemma 4 writes `attention.sliding_window_pattern` as an array of bools, one per layer,
+    // matching HF's `layer_types`. The repeating-length form (Gemma 2/3) is a scalar, and both
+    // shapes have to reach `Config` — this drives the array one, since `gemma4` itself is
+    // refused until the rest of the architecture is implemented.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    const flags = [_]bool{ true, true, false, true, true };
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 0);
+    try putInt(&bytes, a, u64, 8);
+    try putStr(&bytes, a, "general.architecture", "llama");
+    try putU32Kv(&bytes, a, "llama.embedding_length", 256);
+    try putU32Kv(&bytes, a, "llama.block_count", 5);
+    try putU32Kv(&bytes, a, "llama.attention.head_count", 4);
+    try putU32Kv(&bytes, a, "llama.feed_forward_length", 512);
+    try putU32Kv(&bytes, a, "llama.vocab_size", 1024);
+    try putU32Kv(&bytes, a, "llama.attention.sliding_window", 512);
+    {
+        // name + type 9 (array) + element type 7 (bool) + count + payload
+        const name = "llama.attention.sliding_window_pattern";
+        try putInt(&bytes, a, u64, name.len);
+        try bytes.appendSlice(a, name);
+        try putInt(&bytes, a, u32, 9);
+        try putInt(&bytes, a, u32, 7);
+        try putInt(&bytes, a, u64, flags.len);
+        for (flags) |f| try bytes.append(a, @intFromBool(f));
+    }
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expect(cfg.swa_explicit);
+    try std.testing.expect(cfg.layerIsSliding(0));
+    try std.testing.expect(cfg.layerIsSliding(1));
+    try std.testing.expect(!cfg.layerIsSliding(2)); // the false in the list
+    try std.testing.expect(cfg.layerIsSliding(3));
+    // The scalar window and the array coexist: swa_all must not also be set.
+    try std.testing.expect(!cfg.swa_all);
 }
