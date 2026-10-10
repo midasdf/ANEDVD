@@ -324,10 +324,25 @@ pub const Runtime = struct {
     /// [hidden]
     final_norm: []f32 = &.{},
     norms: []Norm = &.{},
+    /// PLE (Gemma 4 only). `ple_proj` is `[layers * ple_dim][hidden]`, the model projection
+    /// applied to the token embedding; `ple_norm` is `[ple_dim]`. Empty when the model has no
+    /// per-layer embeddings.
+    ple_proj: []f16 = &.{},
+    ple_norm: []f32 = &.{},
+    /// The per-layer embedding table's bytes, as a slice of the mapped file, plus its type.
+    ///
+    /// The table is 23.5e9 parameters on E2B and one row is used per token, so it is neither
+    /// loaded nor copied: the engine dequantises the row it needs. That means this aliases the
+    /// mapping exactly as `embed` may, and carries the same requirement — the `Gguf` must outlive
+    /// the engine.
+    ple_table: []const u8 = &.{},
+    ple_table_type: u32 = 0,
 
     pub fn deinit(self: *Runtime) void {
         if (self.embed.len > 0 and self.embed_owned) self.allocator.free(self.embed);
         if (self.final_norm.len > 0) self.allocator.free(self.final_norm);
+        if (self.ple_proj.len > 0) self.allocator.free(self.ple_proj);
+        if (self.ple_norm.len > 0) self.allocator.free(self.ple_norm);
         for (self.norms) |n| {
             if (n.attn.len > 0) self.allocator.free(n.attn);
             if (n.ffn.len > 0) self.allocator.free(n.ffn);

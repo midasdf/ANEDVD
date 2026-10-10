@@ -557,6 +557,21 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
         rt.embed_owned = true;
     }
     rt.final_norm = try loadNormFor(allocator, g, "output_norm.weight", cfg.hidden, cfg);
+    // PLE (Gemma 4). The projection is loaded in full — 35*256 by 1536 is 27 MB of fp16 — but the
+    // embedding table is only aliased: it is 23.5e9 parameters and one row is used per token, so
+    // the engine dequantises rows out of the mapping instead.
+    if (cfg.ple_dim > 0) {
+        const proj_rows: u32 = cfg.layers * cfg.ple_dim;
+        rt.ple_proj = try loadLinear(allocator, g, "per_layer_model_proj.weight", cfg.hidden, proj_rows);
+        rt.ple_norm = try loadNormFor(allocator, g, "per_layer_proj_norm.weight", cfg.ple_dim, cfg);
+        if (g.tensor("per_layer_token_embd.weight")) |t| {
+            rt.ple_table = g.tensorBytes(t) catch &.{};
+            rt.ple_table_type = @backingInt(t.ttype);
+        } else {
+            sys.eprint("gguf: the model declares a per-layer input width but has no per_layer_token_embd.weight.\n", .{});
+            return Error.MissingTensor;
+        }
+    }
     rt.norms = try allocator.alloc(model.Norm, cfg.layers);
     @memset(rt.norms, .{});
     var buf: [128]u8 = undefined;
