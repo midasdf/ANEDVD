@@ -100,14 +100,6 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     // Refuse before any key is looked up: these architectures are missing dimensions the
     // loader itself assumes, so the lookup would fail on a missing key with a message about
     // the key rather than about the architecture.
-    for (unsupported_architectures) |u| {
-        if (std.mem.eql(u8, arch, u.name) and std.c.getenv("ANEDVD_TRY_GEMMA4") == null) {
-            sys.eprint("error: \"{s}\" is recognised but not implemented yet.\n", .{arch});
-            sys.eprint("  It needs {s}.\n", .{u.why});
-            sys.eprint("  Loading it as llama would produce fluent nonsense, so this is refused.\n", .{});
-            return Error.UnsupportedArchitecture;
-        }
-    }
 
     var cfg = model.Config{ .arch = arch };
     // Name the missing key. A bare `MissingTensor` from a config read sends the reader
@@ -428,6 +420,19 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
 
     mw.embed = try loadLinear(allocator, g, "token_embd.weight", cfg.hidden, cfg.vocab);
     mw.final_norm = try loadNormFor(allocator, g, "output_norm.weight", cfg.hidden, cfg);
+    // PLE, so the CPU reference computes the same model the engine does. Without this the
+    // reference skips PLE entirely and reports its own answer as the truth.
+    if (cfg.ple_dim > 0) {
+        const proj_rows: u32 = cfg.layers * cfg.ple_dim;
+        mw.ple_proj = try loadLinear(allocator, g, "per_layer_model_proj.weight", cfg.hidden, proj_rows);
+        mw.ple_norm = try loadNormFor(allocator, g, "per_layer_proj_norm.weight", cfg.ple_dim, cfg);
+        const t = g.tensor("per_layer_token_embd.weight") orelse {
+            sys.eprint("gguf: the model declares a per-layer input width but has no per_layer_token_embd.weight.\n", .{});
+            return Error.MissingTensor;
+        };
+        mw.ple_table = g.tensorBytes(t) catch &.{};
+        mw.ple_table_type = @backingInt(t.ttype);
+    }
     if (g.tensor("output.weight") != null) {
         mw.lm_head = try loadLinear(allocator, g, "output.weight", cfg.hidden, cfg.vocab);
     }
@@ -1108,7 +1113,7 @@ test "a Mistral GGUF's sliding window is read, not ignored" {
     try std.testing.expect(!cfg.norm_unit_offset);
 }
 
-test "a gemma4 GGUF is refused rather than loaded as llama" {
+test "a gemma4 GGUF loads, with the geometry its metadata declares" {
     // Gemma 4 differs from llama in ways that cannot be guessed: per-layer head dims and FFN
     // widths, an explicit per-layer sliding/full list, KV sharing and per-layer input
     // embeddings. "Treat it like llama" would run and produce fluent nonsense, so the loader
@@ -1120,8 +1125,9 @@ test "a gemma4 GGUF is refused rather than loaded as llama" {
     try putInt(&bytes, a, u32, 0x4655_4747);
     try putInt(&bytes, a, u32, 3);
     try putInt(&bytes, a, u64, 0);
-    try putInt(&bytes, a, u64, 8); // exactly the pairs written below
+    try putInt(&bytes, a, u64, 9); // exactly the pairs written below (count them after writing)
     try putStr(&bytes, a, "general.architecture", "gemma4");
+    try putU32Kv(&bytes, a, "gemma4.vocab_size", 1024);
     try putU32Kv(&bytes, a, "gemma4.embedding_length", 1536);
     try putU32Kv(&bytes, a, "gemma4.block_count", 35);
     try putU32Kv(&bytes, a, "gemma4.attention.head_count", 8);
@@ -1133,7 +1139,15 @@ test "a gemma4 GGUF is refused rather than loaded as llama" {
 
     var g = try gguf.Gguf.fromBytes(a, bytes.items);
     defer g.deinit();
-    try std.testing.expectError(Error.UnsupportedArchitecture, loadConfig(&g));
+    // Gemma 4 is IMPLEMENTED now, so the same file must load rather than be refused. This
+    // assertion is the inverse of the one it replaces: while the steps were being built the
+    // refusal was what kept a half-applied path from producing output, and it is gone because
+    // the CPU path answers correctly on the real checkpoint.
+    const g4 = try loadConfig(&g);
+    try std.testing.expectEqual(@as(u32, 1536), g4.hidden);
+    try std.testing.expectEqual(@as(u32, 35), g4.layers);
+    try std.testing.expectEqual(@as(u32, 512), g4.head_dim);
+    try std.testing.expectEqual(@as(u32, 512), g4.sliding_window);
 
     // A nearby name that shares no such difference must still take the ordinary path, so this
     // test cannot pass merely by refusing everything beginning with "gemma".

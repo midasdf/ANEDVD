@@ -675,10 +675,18 @@ pub const ModelWeights = struct {
     layers: []LayerWeights = &.{},
     /// Set by `headSource` so a tied head can alias the runtime embedding.
     head_embed: []const f16 = &.{},
+    /// PLE (Gemma 4 only), needed by the CPU reference as much as by the engine: without it the
+    /// reference computes a different model. `ple_table` aliases the mapping like `embed` may.
+    ple_proj: []f16 = &.{},
+    ple_norm: []f32 = &.{},
+    ple_table: []const u8 = &.{},
+    ple_table_type: u32 = 0,
 
     pub fn deinit(self: *ModelWeights) void {
         if (self.embed.len > 0) self.allocator.free(self.embed);
         if (self.final_norm.len > 0) self.allocator.free(self.final_norm);
+        if (self.ple_proj.len > 0) self.allocator.free(self.ple_proj);
+        if (self.ple_norm.len > 0) self.allocator.free(self.ple_norm);
         if (self.lm_head) |h| self.allocator.free(h);
         for (self.layers) |*l| l.deinit(self.allocator);
         if (self.layers.len > 0) self.allocator.free(self.layers);

@@ -352,6 +352,34 @@ fn refForward(
     // matrix. That was the segfault a debug build finally located, at the gate matmul.
     const inter: usize = cfg.inter;
 
+    // PLE (Gemma 4): every layer's per-layer vector for this token, computed once, exactly as
+    // `Engine.preparePle` does — the table row dequantised out of the mapping, the model
+    // projection of this token's own scaled embedding, and `cpu.plePrepare` for the three
+    // constants. Skipped entirely for every model without per-layer embeddings.
+    var ple_in: []f32 = &.{};
+    defer if (ple_in.len > 0) allocator.free(ple_in);
+    var ple_scr: []f32 = &.{};
+    defer if (ple_scr.len > 0) allocator.free(ple_scr);
+    var ple_tmp: []f32 = &.{};
+    defer if (ple_tmp.len > 0) allocator.free(ple_tmp);
+    if (cfg.ple_dim > 0) {
+        const rows: usize = @as(usize, cfg.layers) * cfg.ple_dim;
+        ple_in = try allocator.alloc(f32, rows);
+        const row = try allocator.alloc(f32, rows);
+        defer allocator.free(row);
+        const pout = try allocator.alloc(f32, rows);
+        defer allocator.free(pout);
+        ple_scr = try allocator.alloc(f32, cfg.ple_dim);
+        ple_tmp = try allocator.alloc(f32, hidden);
+        const emb = try allocator.alloc(f32, hidden);
+        defer allocator.free(emb);
+        for (0..hidden) |c| emb[c] = @as(f32, @floatCast(mw.embed[@as(usize, token) * hidden + c])) * cfg.embed_scale;
+        const ttype: gguf.GgmlType = @fromBackingInt(@intCast(mw.ple_table_type));
+        gguf.dequantizeRange(ttype, mw.ple_table, @as(u64, token) * rows, row) catch @memset(row, 0);
+        matmulF16(pout, mw.ple_proj, emb, rows, hidden);
+        cpu.plePrepare(ple_in, row, pout, mw.ple_norm, cfg.layers, cfg.ple_dim, cfg.hidden, cfg.eps, ple_scr);
+    }
+
     const x = try allocator.alloc(f32, hidden);
     defer allocator.free(x);
     const h = try allocator.alloc(f32, hidden);
@@ -497,6 +525,16 @@ fn refForward(
             matmulF16(proj, lw.down, act, hidden, @intCast(l_inter));
             if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
             cpu.addInPlace(x, proj);
+        }
+        // PLE, then the layer's output scale — the reference's order, matching the engine.
+        if (lw.ple_gate) |gate_w| {
+            const off: usize = @as(usize, li) * cfg.ple_dim;
+            cpu.pleBlock(x, ple_in[off..][0..cfg.ple_dim], gate_w, lw.ple_proj.?, lw.ple_post_norm.?, ple_scr, ple_tmp, cfg.eps);
+        }
+        if (lw.layer_output_scale) |sc| {
+            if (sc != 1.0) {
+                for (x) |*v| v.* *= sc;
+            }
         }
     }
     cpu.rmsnorm(h, x, mw.final_norm, cfg.eps);
