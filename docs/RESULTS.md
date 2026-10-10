@@ -1265,3 +1265,35 @@ rather than an error:
     load, which is what has kept that safe: nothing half-applied can produce output. The 3.35 GB
     checkpoint is downloading now; the first real test will be `anedvd check` and `verify` against
     the CPU reference, which is what has caught every previous mistake in this project.
+57. **Gemma 4 on a real checkpoint: four faults, and what stopped the run.**
+
+    Downloading the official QAT GGUF (3.35 GB) and running it found four things that the
+    metadata, the reference implementation and 137 unit tests could not:
+
+    1. `known_architectures` had no "gemma4" — the very list I added `gemma4` to in the *comment*
+       and forgot in the array.
+    2. The tokenizer refused the file: `tokenizer.ggml.model = "gemma4"`, and only
+       `llama`/`gpt2`/`bpe` were accepted. The Gemma family names its SentencePiece variant rather
+       than calling it "llama".
+    3. The shared-KV tail has **no `attn_k_norm.weight`** either — layers 15-34 omit
+       `attn_k`, `attn_v` *and* `attn_k_norm`, so the loader's unconditional read failed with a
+       bare `TensorNotFound`.
+    4. **`loadLayer` had none of the per-layer work.** There are two GGUF weight loaders:
+       `loadWeights` (eager; `verify`, `cpu`) and `loadLayer` (streaming; `layers`, `run`, `chat`,
+       `serve`). Every change for per-layer head dimensions, Q-only shared layers and PLE went
+       into the first. The first real load therefore failed with
+       `attn_q.weight has 3145728 elements, expected 6291456 (1536x4096)` — layer 0 is sliding at
+       256 a head and the streaming path still asked for the global 512.
+
+    The general lesson: **I changed the loader I was looking at, not every loader there is**, and
+    the tests all exercise the one I had already done.
+
+    The run then stopped for a different reason: after the process was killed during the load, the
+    machine's ANE program pool was left degraded. `selftest` (a two-layer synthetic model) still
+    passes, but any real model — 30 or 35 layers, tens of kernels — now stalls at the first layer's
+    kernel compilation, with no error and no stray process to kill. Memory is fine: 66% free, swap
+    500 MB. This is the machine-wide pool noted in AGENTS.md, and the remedy is a reboot rather
+    than anything this code can do.
+
+    So: the file now parses, the tokenizer accepts it and the load gets past configuration — but a
+    complete forward pass has still not run.
