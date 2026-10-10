@@ -1031,3 +1031,26 @@ rather than an error:
     built per layer), per-layer head dims (touches the KV allocation), KV sharing (touches the
     attention path), PLE (a new embedding table plus a projection per layer), and the
     multimodal wrapper.
+47. **Gemma 4 support, steps 1-2 of 6 done.** Working from the metadata read out of the official
+    QAT GGUF header (finding 46), in the order recorded there:
+
+    * **Step 1, the per-layer sliding list.** `layer_types` is a list, not a repeating length
+      (E2B reads `[sliding x4, full, ...]`, and it repeats over five), so `Config.swa_pattern`
+      could not express it. `Config` now carries `swa_explicit` plus a 128-bit `swa_layers` mask,
+      and `layerIsSliding` consults it before `swa_all` and `swa_pattern`. `load_gguf` accepts
+      `attention.sliding_window_pattern` as either an array of bools (Gemma 4) or the scalar
+      length it already handled; `hf.Config` parses `layer_types` into the same mask, as bits
+      rather than strings because the JSON arena does not outlive `loadConfig`.
+
+    * **Step 2, per-layer FFN widths.** Gemma 4's layers are `[6144 x15, 12288 x20, ...]` and it
+      declares that as an array, which the scalar read returned null on — so the load failed on
+      a missing key before anything else could go wrong. `interFromMetadata` now takes the max
+      (what the scratch buffers need) and each layer's width comes from its own tensor via
+      `tensorOutDim`, the same "shapes are authoritative" rule already used for MoE experts. The
+      engine takes `lw.gate.len / hidden` for the FFN kernel, which is the layer's width for a
+      dense layer and the shared expert's for a sparse one, so the MoE branch is unchanged.
+
+    Steps 3-5 remain and are the structural ones: per-layer head dims (512 on global layers, 256
+    on sliding — the KV cache is allocated uniformly as `max_seq * kvDim` today), KV sharing
+    across 20 layers, and PLE. `gemma4` is still refused at load, with the message now naming
+    only those three.
