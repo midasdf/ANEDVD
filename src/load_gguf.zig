@@ -317,6 +317,30 @@ fn interFromMetadata(g: *const gguf.Gguf, buf: []u8, arch: []const u8) ?u32 {
     return if (max == 0) null else max;
 }
 
+/// One token's row of Gemma 4's per-layer embedding table, dequantised on demand.
+///
+/// The table is `[layers * ple_dim][ple_vocab]` — 35*256 by 262144 on E2B, which is 23.5e9
+/// parameters and most of the model file. Only one row is used per token, so it is read and
+/// dequantised rather than loaded; `dequantizeRange` is what makes that possible without a
+/// second copy of the dequantisers.
+pub fn loadPleRow(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.Config, token: u32) ![]f32 {
+    const t = g.tensor("per_layer_token_embd.weight") orelse {
+        sys.eprint("gguf: no per_layer_token_embd.weight, but the model declares a per-layer input width.\n", .{});
+        return Error.MissingTensor;
+    };
+    const row_len: u64 = @as(u64, cfg.layers) * cfg.ple_dim;
+    if (t.dims.len < 2 or t.dims[0] != row_len) {
+        sys.eprint("gguf: per_layer_token_embd.weight has dims {any}, expected [{d}][ple_vocab].\n", .{ t.dims, row_len });
+        return Error.DimensionMismatch;
+    }
+    if (token >= cfg.ple_vocab) return Error.DimensionMismatch;
+    const out = try allocator.alloc(f32, @intCast(row_len));
+    errdefer allocator.free(out);
+    const bytes = try g.tensorBytes(t);
+    try gguf.dequantizeRange(t.ttype, bytes, @as(u64, token) * row_len, out);
+    return out;
+}
+
 /// The `out_dim` a 2-D tensor actually has, given its `in_dim`. Shapes are authoritative: a
 /// model may declare one `feed_forward_length` and use several.
 fn tensorOutDim(g: *const gguf.Gguf, name: []const u8, in_dim: u32) ?u32 {
@@ -1210,4 +1234,65 @@ test "gemma4's second head dimension is read from key_length_swa" {
     try std.testing.expectEqual(@as(usize, 256), sliding.layerKvDim(0));
     try std.testing.expectEqual(@as(usize, 512), sliding.layerKvDim(1));
     try std.testing.expectEqual(@as(u32, 8 * 512), sliding.maxQDim());
+}
+
+test "a PLE row is read on demand, not the whole table" {
+    // The real table is 23.5e9 parameters; only one row per token is ever used. This checks the
+    // row arithmetic and that the row's own values come back, with a 2-layer, ple_dim-3 table of
+    // four tokens written as plain f32.
+    const a = std.testing.allocator;
+    const layers: u32 = 2;
+    const ple_dim: u32 = 3;
+    const vocab_ple: u32 = 4;
+    const row_len: u64 = layers * ple_dim;
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 1); // one tensor
+    // Eight pairs below. Declaring seven silently truncated the last one, so `ple_vocab` fell
+    // back to `vocab` and the test failed with "expected 4, found 8" — the count has to match or
+    // the last key is simply not there.
+    try putInt(&bytes, a, u64, 8);
+    try putStr(&bytes, a, "general.architecture", "llama");
+    try putU32Kv(&bytes, a, "llama.embedding_length", 8);
+    try putU32Kv(&bytes, a, "llama.block_count", layers);
+    try putU32Kv(&bytes, a, "llama.attention.head_count", 2);
+    try putU32Kv(&bytes, a, "llama.feed_forward_length", 16);
+    try putU32Kv(&bytes, a, "llama.vocab_size", 8);
+    try putU32Kv(&bytes, a, "llama.embedding_length_per_layer_input", ple_dim);
+    try putU32Kv(&bytes, a, "llama.vocab_size_per_layer_input", vocab_ple);
+    try putTensor(&bytes, a, "per_layer_token_embd.weight", &[_]u64{ row_len, vocab_ple }, 0, 0);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    // The data section: row `t` holds 1*row_len + t for every element, so the row is identifiable.
+    for (0..vocab_ple) |t| {
+        for (0..row_len) |i| {
+            const v: f32 = @floatFromInt(row_len + t * 100 + i);
+            try putInt(&bytes, a, u32, @bitCast(v));
+        }
+    }
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expectEqual(ple_dim, cfg.ple_dim);
+    try std.testing.expectEqual(vocab_ple, cfg.ple_vocab);
+
+    const row2 = try loadPleRow(a, &g, cfg, 2);
+    defer a.free(row2);
+    try std.testing.expectEqual(@as(usize, row_len), row2.len);
+    for (row2, 0..) |v, i| {
+        const expect: f32 = @floatFromInt(row_len + 200 + i);
+        try std.testing.expectEqual(expect, v);
+    }
+
+    // Row 0 differs from row 2, so the arithmetic is not returning one row for every token.
+    const row0 = try loadPleRow(a, &g, cfg, 0);
+    defer a.free(row0);
+    try std.testing.expect(row0[0] != row2[0]);
+
+    // A token past the table is refused rather than reading past it.
+    try std.testing.expectError(Error.DimensionMismatch, loadPleRow(a, &g, cfg, vocab_ple));
 }
