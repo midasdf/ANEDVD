@@ -81,7 +81,7 @@ pub const unsupported_architectures = [_]struct { name: []const u8, why: []const
 const neox_archs = [_][]const u8{
     "qwen2",  "qwen2moe", "qwen2vl",  "qwen3", "qwen3moe",
     "phi3",   "gptneox",  "stablelm", "gemma", "gemma2",
-    "gemma3", "olmo",     "olmo2",
+    "gemma3", "gemma4",   "olmo",     "olmo2",
 };
 
 pub fn ropeIsAdjacent(arch: []const u8) bool {
@@ -478,7 +478,9 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
             lw.qkv = both;
         }
 
-        lw.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
+        // The LAYER's q width, not the config's: layer 0 of Gemma 4 is a sliding layer and its
+        // o projection takes 8*256 = 2048, where the global layers take 8*512 = 4096.
+        lw.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{li}) catch unreachable, l_q, cfg.hidden);
         // Per-Layer Embeddings (Gemma 4). The three tensors are present on every layer, shared
         // ones included, and only when the model declares a per-layer input width.
         if (cfg.ple_dim > 0) {

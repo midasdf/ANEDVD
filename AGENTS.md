@@ -5,6 +5,14 @@ the Apple Neural Engine, in Zig. Started
 2026-10-08 on an A18 Pro / macOS 27.0.1 machine. Read `README.md` first; the
 measurements live in `docs/RESULTS.md`.
 
+## Response language
+
+**Answer the user in Japanese.** Everything the user reads — explanations,
+plans, progress notes, questions, and final answers — is written in Japanese,
+whatever language the code, commits or repository docs use. Code, identifiers,
+file contents and command output stay as they are (English), unless the user
+asks for something else.
+
 ## Project
 
 | File | Role |
@@ -238,6 +246,24 @@ missing executable stops the whole provider; the profile patch is the last
 layer, so overrides here win; new plugins need an `insert:` patch entry (a bare
 `- id:` only overrides an existing row); changes reach newly created
 agents/sessions only.
+
+## REA (reverse engineering)
+
+REA is installed as a **CLI only** — `rea` (rea-agents 6.3.0, pinned at
+`/opt/homebrew/bin/rea`), with its workflow skill in `.agents/skills/`:
+
+* `reverse-engineer-anything` — copied from the installed package (version-matched).
+* `rea-on-dsh` — how to drive REA from here: the MCP-tool → CLI-command mapping,
+  `--snapshot` instead of an open session, output-size flags, and an instruction
+  to skip `rea setup --client <other agent>` (DSH is not one of REA's clients).
+  Read it before any REA work.
+
+The MCP server is deliberately **not** registered: 6.3.0 advertises 139 tools and
+~573 KB of model-visible input schemas, and `dsh-mcp-client` has no allowlist, so
+every request would carry all of them. Apple static analysis needs no provider
+(`rea inspect-macho`, `inspect-signature` — it returns `entitlements`,
+`trace-dylib-resolution`, `demangle-swift`); `rea decompile` / `rea function`
+need Hopper, Ghidra or IDA, and none is installed — check `rea providers` first.
 
 ## Gemma 2 works (rounds 8-10)
 

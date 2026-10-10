@@ -66,9 +66,13 @@ them would be attached to every request.
 ## Install layout and updating
 
 * CLI: `npm install --global rea-agents@6.3.0` (`/opt/homebrew/bin/rea`).
-* Workflow skill: `.agents/skills/reverse-engineer-anything/`, copied from the
-  installed package's `skills/` directory so the instructions match the CLI.
-* REA releases almost daily. Update deliberately: install the new exact
-  version, then re-copy the skill from the new package —
-  `cp -R "$(npm root -g)/rea-agents/skills/reverse-engineer-anything" .agents/skills/` —
-  and re-check the tool count before considering MCP again.
+* Skills live in **two roots** and must stay in step: this repository's
+  `.agents/skills/` (project root, wins for sessions opened here) and
+  `~/.dsh/skills/` (user root, makes them visible in every other workspace).
+  Both were copied from the installed package's `skills/` directory so the
+  instructions match the CLI.
+* REA releases almost daily. Update deliberately: install the new exact version,
+  then re-copy both skills from the new package —
+  `cp -R "$(npm root -g)/rea-agents/skills/reverse-engineer-anything" .agents/skills/`
+  and the same into `~/.dsh/skills/` — and re-check the tool count before
+  considering MCP again.
