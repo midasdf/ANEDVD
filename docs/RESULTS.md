@@ -1408,3 +1408,27 @@ rather than an error:
     Counting the whole feature: 76 tests became 137, nine real faults were found — four of them
     only by running the real file, and one only by a debug build — and every existing model is
     unchanged throughout.
+63. **E4B cannot be verified on this machine, and the reason is arithmetic rather than code.** Two
+    attempts:
+
+    * `unsloth/gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf` (3.22 GB) loads and then fails with
+      `error: UnsupportedType` — an Unsloth "dynamic" quant mixes quantisation types, and
+      `gguf.zig` implements fifteen of them, not all. The file was deleted rather than kept.
+    * A standard Q4_0 E4B exists (`ggml-org/gemma-4-E4B-it-GGUF`, 4.59 GB), but it would not run
+      here either. The CPU reference loads **every layer eagerly**, and E4B's per-layer weights
+      are:
+
+          inter = 10240   qkv 26.2 + o 21.0 + ffn 157.3 MB/layer ->  8.6 GB for 42 layers
+          inter = 20480   qkv 26.2 + o 21.0 + ffn 314.6 MB/layer -> 15.2 GB for 42 layers
+
+      against 8 GB of RAM. E4B's layers are 10240 or 20480 wide (`use_double_wide_mlp`), so it is
+      8.6 GB at best.
+
+    The streaming engine path would fit — that is exactly what it is for — but it builds ANE
+    kernels, and this machine's ANE program pool has been degraded since a Gemma 4 load was killed
+    mid-way. So E4B is blocked on a reboot either way, and the honest statement is that **E2B's
+    text inference is verified and E4B's is not**.
+
+    Worth noting for whoever picks this up: none of the nine faults found in this feature were
+    E2B-specific. They were all in the shared loader, the shared reference or the shared engine,
+    so E4B should need the same code — the only untested thing about it is its own geometry.
