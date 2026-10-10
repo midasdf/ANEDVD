@@ -57,6 +57,12 @@ const LayerKernels = struct {
     ffn: ane.Kernel,
     ffn_split: bool,
     down: ?ane.Kernel = null,
+    /// PLE (Gemma 4). `ple_gate` is `[ple_dim][hidden]`, `ple_proj` is `[hidden][ple_dim]` and
+    /// `ple_post_norm` is `[hidden]`. Moved in from the layer's Matrices like the experts are,
+    /// and null for every model without per-layer embeddings.
+    ple_gate: ?[]f16 = null,
+    ple_proj: ?[]f16 = null,
+    ple_post_norm: ?[]f32 = null,
     /// Routed experts of a MoE layer, run on the CPU. The ANE cannot hold a kernel
     /// per expert (see research/moe-design.md), and only k of them are used per
     /// token, so they are read and multiplied here instead.
@@ -182,6 +188,15 @@ pub const Engine = struct {
     /// Separate from `out16` because that is sized `stage * chunk` for activations and
     /// multiplying the vocabulary into it wasted 78 MB.
     head_out: []f16 = &.{},
+    /// PLE (Gemma 4), all empty for every other model. `ple_emb` holds the token's scaled
+    /// embedding, `ple_row` the dequantised table row, `ple_proj_out` the model projection of
+    /// `ple_emb`, and `ple_in` the combined per-layer vectors `pleBlock` consumes.
+    ple_emb: []f32 = &.{},
+    ple_row: []f32 = &.{},
+    ple_proj_out: []f32 = &.{},
+    ple_in: []f32 = &.{},
+    ple_scr: []f32 = &.{},
+    ple_tmp: []f32 = &.{},
     /// Contiguous scratch for one column's q/k/v/attention vectors.
     sq: []f32,
     sk: []f32,
@@ -229,7 +244,16 @@ pub const Engine = struct {
             if (k.down) |*d| d.deinit();
             // Routed experts were moved in from the layer's Matrices.
             if (k.moe) |*m| m.deinit(self.allocator);
+            if (k.ple_gate) |g| self.allocator.free(g);
+            if (k.ple_proj) |g| self.allocator.free(g);
+            if (k.ple_post_norm) |g| self.allocator.free(g);
         }
+        if (self.ple_emb.len > 0) self.allocator.free(self.ple_emb);
+        if (self.ple_row.len > 0) self.allocator.free(self.ple_row);
+        if (self.ple_proj_out.len > 0) self.allocator.free(self.ple_proj_out);
+        if (self.ple_in.len > 0) self.allocator.free(self.ple_in);
+        if (self.ple_scr.len > 0) self.allocator.free(self.ple_scr);
+        if (self.ple_tmp.len > 0) self.allocator.free(self.ple_tmp);
         self.head_kernel.deinit();
         for (self.head_extra[0..self.head_extra_built]) |*k| k.deinit();
         if (self.head_extra.len > 0) self.allocator.free(self.head_extra);
@@ -348,6 +372,9 @@ pub const Engine = struct {
             // The routed experts were moved into the kernels; do not let the deferred
             // deinit free them.
             m.moe = null;
+            m.ple_gate = null;
+            m.ple_proj = null;
+            m.ple_post_norm = null;
             built += 1;
         }
         if (opts.verbose) sys.print("  lm head: loading weights + compiling ANE kernel ({d} -> {d})\n", .{ cfg.hidden, cfg.vocab });
@@ -443,6 +470,16 @@ pub const Engine = struct {
         self.dec_out = try allocator.alloc(f16, stage);
         self.head_in = try allocator.alloc(f16, cfg.hidden);
         self.sandwich = try allocator.alloc(f32, cfg.hidden);
+        // PLE (Gemma 4). All empty for every other model.
+        if (cfg.ple_dim > 0) {
+            const rows: usize = @as(usize, cfg.layers) * cfg.ple_dim;
+            self.ple_emb = try allocator.alloc(f32, cfg.hidden);
+            self.ple_row = try allocator.alloc(f32, rows);
+            self.ple_proj_out = try allocator.alloc(f32, rows);
+            self.ple_in = try allocator.alloc(f32, rows);
+            self.ple_scr = try allocator.alloc(f32, cfg.ple_dim);
+            self.ple_tmp = try allocator.alloc(f32, cfg.hidden);
+        }
         self.head_out = try allocator.alloc(f16, cfg.vocab);
         const vec = @max(cfg.maxQDim(), @max(cfg.maxKvDim(), cfg.inter));
         self.sq = try allocator.alloc(f32, vec);
@@ -1482,10 +1519,15 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     // frees `lw` as soon as these kernels are built, and the experts have to outlive
     // that (they are used on every token).
     const moe_keep = lw.moe;
+    // PLE travels with the kernels the same way; the caller nulls the layer's copies so the
+    // deferred deinit does not free them twice.
+    const ple_keep = lw.ple_gate;
+    const plep_keep = lw.ple_proj;
+    const plen_keep = lw.ple_post_norm;
 
     if (opts.fuse_ffn and std.c.getenv("ANEDVD_NO_FUSED_FFN") == null) {
         if (makeFusedFfnKernel(allocator, cfg.hidden, ffn_inter, lw.gate, lw.up, lw.down, width)) |fk| {
-            return .{ .out_scale = lw.layer_output_scale orelse 1.0, .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
+            return .{ .out_scale = lw.layer_output_scale orelse 1.0, .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep, .ple_gate = ple_keep, .ple_proj = plep_keep, .ple_post_norm = plen_keep };
         } else |e| {
             if (opts.verbose) {
                 sys.print("    fused FFN rejected ({s}: {s}); falling back to split kernels\n", .{ @errorName(e), ane.lastError() });
@@ -1501,7 +1543,7 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     errdefer gu_k.deinit();
     var down_k = try makeConvKernel(allocator, ffn_inter, cfg.hidden, lw.down, "down", width);
     errdefer down_k.deinit();
-    return .{ .out_scale = lw.layer_output_scale orelse 1.0, .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep };
+    return .{ .out_scale = lw.layer_output_scale orelse 1.0, .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep, .ple_gate = ple_keep, .ple_proj = plep_keep, .ple_post_norm = plen_keep };
 }
 
 // ---------------------------------------------------------------------------
