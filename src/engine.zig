@@ -809,24 +809,27 @@ pub const Engine = struct {
     /// or store.
     fn ropeQueryOnly(self: *Engine, li: usize, pos: u32, cfg: model.Config, hd: u32) void {
         const norm = &self.norms[li];
+        // Per layer: Gemma 4 rotates its sliding layers at a different base from its global ones.
+        const theta = cfg.layerRopeTheta(@intCast(li));
         if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, hd, w, cfg.eps);
         if (cfg.rope_adjacent) {
-            cpu.ropeAdjacent(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
+            cpu.ropeAdjacent(self.sq, cfg.heads, hd, pos, theta);
         } else {
-            cpu.rope(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
+            cpu.rope(self.sq, cfg.heads, hd, pos, theta);
         }
     }
 
     fn ropeAndCache(self: *Engine, li: usize, pos: u32, cfg: model.Config, kv_dim: usize, hd: u32) void {
         const norm = &self.norms[li];
+        const theta = cfg.layerRopeTheta(@intCast(li));
         if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, hd, w, cfg.eps);
         if (norm.k_norm) |w| applyHeadNorm(self.sk[0..kv_dim], cfg.kv_heads, hd, w, cfg.eps);
         if (cfg.rope_adjacent) {
-            cpu.ropeAdjacent(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
-            cpu.ropeAdjacent(self.sk[0..kv_dim], cfg.kv_heads, hd, pos, cfg.rope_theta);
+            cpu.ropeAdjacent(self.sq, cfg.heads, hd, pos, theta);
+            cpu.ropeAdjacent(self.sk[0..kv_dim], cfg.kv_heads, hd, pos, theta);
         } else {
-            cpu.rope(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
-            cpu.rope(self.sk[0..kv_dim], cfg.kv_heads, hd, pos, cfg.rope_theta);
+            cpu.rope(self.sq, cfg.heads, hd, pos, theta);
+            cpu.rope(self.sk[0..kv_dim], cfg.kv_heads, hd, pos, theta);
         }
         const krow = self.k_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim];
         const vrow = self.v_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim];
