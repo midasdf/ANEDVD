@@ -25,6 +25,9 @@ pub const supported_architectures: []const []const u8 = &.{
     "GemmaForCausalLM",
     "Gemma2ForCausalLM",
     "Gemma3ForCausalLM",
+    // A multimodal wrapper: the text stack's parameters are nested under `text_config` and the
+    // architecture name is at the top level, which is what `loadConfig` dereferences.
+    "Gemma4ForConditionalGeneration",
 };
 
 /// `supported_architectures` rendered as a comma-separated list, at comptime.
@@ -182,10 +185,21 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes, .{}) catch
         return Error.InvalidConfig;
     if (root != .object) return Error.InvalidConfig;
-    const obj = root.object;
+    var obj = root.object;
 
+    // The architecture name lives at the top level of the file. For a multimodal checkpoint
+    // (`Gemma4ForConditionalGeneration`) the text stack's parameters do not: they are nested
+    // under `text_config`, with the vision and audio settings beside them. This loader builds the
+    // text model, so after resolving the name everything below reads from inside — the same
+    // dereference the reference does in `_get_text_config`.
     const arch_name = try resolveArch(allocator, obj);
     errdefer allocator.free(arch_name);
+    // Rebind `obj` rather than threading a second name through every read below.
+    var params_obj = obj;
+    if (obj.get("text_config")) |tc| {
+        if (tc == .object) params_obj = tc.object;
+    }
+    obj = params_obj;
 
     const hidden_size = try requireU32(obj, &.{ "hidden_size", "n_embd" });
     const num_hidden_layers = try requireU32(obj, &.{ "num_hidden_layers", "n_layer" });
@@ -987,4 +1001,54 @@ test "hasSafetensorsExt accepts any case and rejects near misses" {
     try std.testing.expect(!hasSafetensorsExt("model.safetensors.bak"));
     try std.testing.expect(!hasSafetensorsExt("model.safetensor"));
     try std.testing.expect(!hasSafetensorsExt(""));
+}
+
+test "loadConfig dereferences a multimodal wrapper's text_config" {
+    // Gemma 4 ships as `Gemma4ForConditionalGeneration`: the architecture name and the vision
+    // and audio settings are at the top level, and every text parameter is nested under
+    // `text_config`. Reading the top level would fail on `hidden_size` being absent.
+    const a = std.testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const nested =
+        \\{
+        \\  "architectures": ["Gemma4ForConditionalGeneration"],
+        \\  "model_type": "gemma4",
+        \\  "vision_config": { "hidden_size": 768 },
+        \\  "audio_config": { "hidden_size": 512 },
+        \\  "text_config": {
+        \\    "model_type": "gemma4_text",
+        \\    "hidden_size": 1536,
+        \\    "num_hidden_layers": 35,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 1,
+        \\    "head_dim": 256,
+        \\    "global_head_dim": 512,
+        \\    "intermediate_size": 6144,
+        \\    "vocab_size": 262144,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "rope_theta": 1000000.0,
+        \\    "tie_word_embeddings": true,
+        \\    "layer_types": ["sliding_attention", "full_attention"],
+        \\    "sliding_window": 512,
+        \\    "num_kv_shared_layers": 20,
+        \\    "hidden_size_per_layer_input": 256,
+        \\    "vocab_size_per_layer_input": 262144
+        \\  }
+        \\}
+    ;
+    const dir = try configDir(a, &tmp, nested);
+    defer a.free(dir);
+    var cfg = try loadConfig(a, dir);
+    defer cfg.deinit(a);
+
+    // The text parameters came from inside, not from the top level or from `vision_config`.
+    try std.testing.expectEqual(@as(u32, 1536), cfg.hidden_size);
+    try std.testing.expectEqual(@as(u32, 35), cfg.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 262144), cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 512), cfg.global_head_dim);
+    try std.testing.expectEqual(@as(u32, 20), cfg.num_kv_shared_layers);
+    try std.testing.expectEqual(@as(u32, 256), cfg.hidden_size_per_layer_input);
+    // The architecture name came from the top level, which is where it lives.
+    try std.testing.expectEqualStrings("Gemma4ForConditionalGeneration", cfg.arch);
 }
