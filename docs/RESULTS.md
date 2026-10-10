@@ -1387,3 +1387,24 @@ rather than an error:
     * The release binary had never been re-run after the FFN fix; the last release attempt predated
       it, which is why I still believed there was a crash. **Re-run the thing you just fixed
       before concluding anything from a log.**
+62. **Gemma 4 E2B answers correctly, not once but three times.** A single " Paris." could be luck;
+    three factual completions from one implementation is evidence:
+
+        The capital of France is   ->   Paris.
+        The capital of Japan is    ->   Tokyo.
+        The sun rises in the       ->   east, the sun rises in
+
+    via `anedvd cpu --model gemma-4-E2B-q4_0.gguf` on the real 3.35 GB QAT checkpoint, about 20 s
+    per run (prefill ~13 s, decode ~8 s). Every one of the six steps is in and the load-time
+    refusal is gone, so the file loads as itself rather than under an escape hatch.
+
+    What is NOT verified: the ANE path. `check`, `verify` and `run` all build kernels, and this
+    machine's ANE program pool has been degraded since a Gemma 4 load was killed mid-way —
+    `selftest` (two layers) passes, `check` on a 30-layer model stalls at the first layer's kernel
+    compilation, no stray process holds it, and memory is fine. That is the machine-wide pool
+    AGENTS.md describes, and a reboot is the remedy. So the claim is precise: **Gemma 4's text
+    inference works through the CPU reference; whether the ANE kernels agree with it is untested.**
+
+    Counting the whole feature: 76 tests became 137, nine real faults were found — four of them
+    only by running the real file, and one only by a debug build — and every existing model is
+    unchanged throughout.
