@@ -711,7 +711,7 @@ fn cmdCheck(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     sys.print("  per-kernel check (layer 0, token {d}):\n", .{diag_token});
     var m0 = try loaded.layers.load(allocator, 0);
     defer m0.deinit(allocator);
-    try eng.diagnose(diag_token, &m0);
+    try eng.diagnose(diag_token, &m0, 0);
 
     try predictNextTokens(allocator, &loaded.tokenizer, &eng, "The capital of France is");
     try predictNextTokens(allocator, &loaded.tokenizer, &eng, "2 + 2 =");

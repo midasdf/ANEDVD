@@ -338,7 +338,7 @@ pub const Engine = struct {
             if (opts.verbose) sys.print("  layer {d}/{d}: loading weights + compiling ANE kernels\n", .{ i + 1, L });
             var m = try layers.load(allocator, @intCast(i));
             defer m.deinit(allocator); // matrices are baked into the kernels now
-            self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, opts, opts.chunk);
+            self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, @intCast(i), opts, opts.chunk);
             // The routed experts were moved into the kernels; do not let the deferred
             // deinit free them.
             m.moe = null;
@@ -382,10 +382,13 @@ pub const Engine = struct {
             return e;
         };
 
-        const kv_dim: usize = cfg.kvDim();
         self.k_cache = try allocator.alloc([]f16, L);
         self.v_cache = try allocator.alloc([]f16, L);
         for (0..L) |i| {
+            // Per layer: Gemma 4's sliding layers carry a narrower K/V than its global ones,
+            // so one uniform row width would either overrun the narrow layers or waste the
+            // wide ones.
+            const kv_dim: usize = cfg.layerKvDim(@intCast(i));
             self.k_cache[i] = try allocator.alloc(f16, @as(usize, opts.max_seq) * kv_dim);
             self.v_cache[i] = try allocator.alloc(f16, @as(usize, opts.max_seq) * kv_dim);
             @memset(self.k_cache[i], 0);
@@ -413,7 +416,7 @@ pub const Engine = struct {
         self.x = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
         self.h = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
         self.qkv = try allocator.alloc(f32, @as(usize, cfg.qkvDim()) * ch);
-        self.attn = try allocator.alloc(f32, @as(usize, cfg.qDim()) * ch);
+        self.attn = try allocator.alloc(f32, @as(usize, cfg.maxQDim()) * ch);
         self.proj = try allocator.alloc(f32, @as(usize, cfg.hidden) * ch);
         self.gu = try allocator.alloc(f32, @as(usize, 2 * cfg.inter) * ch);
         self.act = try allocator.alloc(f32, @as(usize, cfg.inter) * ch);
@@ -435,7 +438,7 @@ pub const Engine = struct {
         self.head_in = try allocator.alloc(f16, cfg.hidden);
         self.sandwich = try allocator.alloc(f32, cfg.hidden);
         self.head_out = try allocator.alloc(f16, cfg.vocab);
-        const vec = @max(cfg.qDim(), @max(cfg.kvDim(), cfg.inter));
+        const vec = @max(cfg.maxQDim(), @max(cfg.maxKvDim(), cfg.inter));
         self.sq = try allocator.alloc(f32, vec);
         self.sk = try allocator.alloc(f32, vec);
         self.sv = try allocator.alloc(f32, vec);
@@ -473,8 +476,8 @@ pub const Engine = struct {
         const cfg = self.config;
         const ch = self.chunk;
         const hidden: usize = cfg.hidden;
-        const kv_dim: usize = cfg.kvDim();
-        const q_dim: usize = cfg.qDim();
+        // q/kv widths are per layer: Gemma 4 sizes sliding layers differently from global
+        // ones, so both are computed inside the layer loop below.
         const inter: usize = cfg.inter;
         const t_start = sys.nowNs();
 
@@ -487,6 +490,9 @@ pub const Engine = struct {
         }
 
         for (self.kernels, 0..) |*k, li| {
+            const l_hd: u32 = cfg.layerHeadDim(@intCast(li));
+            const kv_dim: usize = cfg.layerKvDim(@intCast(li));
+            const q_dim: usize = cfg.layerQDim(@intCast(li));
             const norm = &self.norms[li];
 
             // ---- attention: qkv projection on ANE (column 0) ----
@@ -512,8 +518,8 @@ pub const Engine = struct {
             gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, 0);
             gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, 0);
             gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, 0);
-            self.ropeAndCache(li, pos, cfg, kv_dim);
-            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, self.scores, .{
+            self.ropeAndCache(li, pos, cfg, kv_dim, l_hd);
+            cpu.attentionDecode(self.sa[0..q_dim], self.sq[0..q_dim], self.k_cache[li], self.v_cache[li], pos + 1, cfg.heads, cfg.kv_heads, l_hd, self.scores, .{
                 .logit_softcap = cfg.attn_logit_softcap,
                 .scale = cfg.attn_scale,
                 .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
@@ -789,16 +795,16 @@ pub const Engine = struct {
         }
     }
 
-    fn ropeAndCache(self: *Engine, li: usize, pos: u32, cfg: model.Config, kv_dim: usize) void {
+    fn ropeAndCache(self: *Engine, li: usize, pos: u32, cfg: model.Config, kv_dim: usize, hd: u32) void {
         const norm = &self.norms[li];
-        if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, cfg.head_dim, w, cfg.eps);
-        if (norm.k_norm) |w| applyHeadNorm(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, w, cfg.eps);
+        if (norm.q_norm) |w| applyHeadNorm(self.sq, cfg.heads, hd, w, cfg.eps);
+        if (norm.k_norm) |w| applyHeadNorm(self.sk[0..kv_dim], cfg.kv_heads, hd, w, cfg.eps);
         if (cfg.rope_adjacent) {
-            cpu.ropeAdjacent(self.sq, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
-            cpu.ropeAdjacent(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            cpu.ropeAdjacent(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
+            cpu.ropeAdjacent(self.sk[0..kv_dim], cfg.kv_heads, hd, pos, cfg.rope_theta);
         } else {
-            cpu.rope(self.sq, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
-            cpu.rope(self.sk[0..kv_dim], cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            cpu.rope(self.sq, cfg.heads, hd, pos, cfg.rope_theta);
+            cpu.rope(self.sk[0..kv_dim], cfg.kv_heads, hd, pos, cfg.rope_theta);
         }
         const krow = self.k_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim];
         const vrow = self.v_cache[li][@as(usize, pos) * kv_dim ..][0..kv_dim];
@@ -821,8 +827,8 @@ pub const Engine = struct {
         const cfg = self.config;
         const ch = self.chunk;
         const hidden: usize = cfg.hidden;
-        const kv_dim: usize = cfg.kvDim();
-        const q_dim: usize = cfg.qDim();
+        // Per layer, as in `forward`: a sliding layer may use a different head dimension.
+        // Both are bound inside the layer loop below.
         const inter: usize = cfg.inter;
 
         var done: usize = 0;
@@ -845,6 +851,9 @@ pub const Engine = struct {
             }
 
             for (self.kernels, 0..) |*k, li| {
+                const l_hd: u32 = cfg.layerHeadDim(@intCast(li));
+                const kv_dim: usize = cfg.layerKvDim(@intCast(li));
+                const q_dim: usize = cfg.layerQDim(@intCast(li));
                 const norm = &self.norms[li];
 
                 // Also tick once per layer, not only once per chunk. A chunk of a MoE
@@ -885,7 +894,7 @@ pub const Engine = struct {
                     gatherColumn(self.sq[0..q_dim], self.qkv[0..], ch, j);
                     gatherColumn(self.sk[0..kv_dim], self.qkv[q_dim * ch ..], ch, j);
                     gatherColumn(self.sv[0..kv_dim], self.qkv[(q_dim + kv_dim) * ch ..], ch, j);
-                    self.ropeAndCache(li, pos, cfg, kv_dim);
+                    self.ropeAndCache(li, pos, cfg, kv_dim, l_hd);
                     scatterColumn(self.qkv[0..], self.sq[0..q_dim], ch, j);
                 }
                 self.stats.pf_rope_ns += sys.nowNs() - tr0;
@@ -906,7 +915,7 @@ pub const Engine = struct {
                     base_pos,
                     cfg.heads,
                     cfg.kv_heads,
-                    cfg.head_dim,
+                    l_hd,
                     self.scores,
                     self.sq,
                     self.sa,
@@ -1132,11 +1141,11 @@ pub const Engine = struct {
     /// Compare each ANE kernel against a CPU matmul with the same weights, to
     /// localise a broken kernel when end-to-end output looks wrong. Uses column
     /// 0 of the chunked kernels.
-    pub fn diagnose(self: *Engine, token: u32, lw: *const model.Matrices) !void {
+    pub fn diagnose(self: *Engine, token: u32, lw: *const model.Matrices, layer: u32) !void {
         const cfg = self.config;
         const ch = self.chunk;
         const hidden: usize = cfg.hidden;
-        const q_dim: usize = cfg.qDim();
+        const q_dim: usize = cfg.layerQDim(layer);
         const inter: usize = cfg.inter;
 
         // Apply the architecture's embedding scale, as both real forward paths do;
@@ -1400,10 +1409,14 @@ fn makeFusedFfnKernel(
     }});
 }
 
-fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.Matrices, opts: Options, width: u32) !LayerKernels {
-    var qkv = try makeConvKernel(allocator, cfg.hidden, cfg.qkvDim(), lw.qkv, "qkv", width);
+fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const model.Matrices, layer: u32, opts: Options, width: u32) !LayerKernels {
+    // Both projections are sized from THIS layer's head dimension, which for Gemma 4 differs
+    // between sliding and global layers.
+    const l_qkv: u32 = @intCast(cfg.layerQkvDim(layer));
+    const l_q: u32 = @intCast(cfg.layerQDim(layer));
+    var qkv = try makeConvKernel(allocator, cfg.hidden, l_qkv, lw.qkv, "qkv", width);
     errdefer qkv.deinit();
-    var o = try makeConvKernel(allocator, cfg.qDim(), cfg.hidden, lw.o, "o", width);
+    var o = try makeConvKernel(allocator, l_q, cfg.hidden, lw.o, "o", width);
     errdefer o.deinit();
 
     // On a sparse layer `gate`/`up`/`down` hold the SHARED expert, whose width is
