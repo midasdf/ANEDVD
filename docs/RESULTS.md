@@ -1054,3 +1054,26 @@ rather than an error:
     on sliding — the KV cache is allocated uniformly as `max_seq * kvDim` today), KV sharing
     across 20 layers, and PLE. `gemma4` is still refused at load, with the message now naming
     only those three.
+48. **`anedvd check` on gemma-2-2b is not reproducible on this machine, and I mistook that for a
+    regression.** While testing step 3 of the Gemma 4 work I saw `check` report
+    `lm_head BROKEN` (rel 1.217e1). The sequence, all on the same model:
+
+        committed code, before I touched anything this round   -> OK    (lm_head rel 2.07e-4)
+        my working tree                                        -> BROKEN
+        committed code again (stashed my changes, rebuilt)      -> OK
+        committed code (my changes reverted, rebuilt)           -> BROKEN, then BROKEN again
+
+    The last two are the same source, so it is not the change. The head input is identical and
+    deterministic across runs (`|x| = 163.5754`), and the small models are stable throughout —
+    SmolLM2-135M and Qwen2.5-0.5B both report OK right now. So this is machine state: the ANE
+    program pool is machine-wide and a 2B model needs 27 kernels' worth of it, and the run that
+    passed came after ~3.7 hours of no activity, where the failures come after a stretch of
+    heavy model loading.
+
+    Two consequences. **`check` on the 2B model is not a usable pass/fail gate after heavy use**;
+    `verify` and the small-model `check` are, and they stayed green. And the reverted diff for
+    step 3's engine half compiles and is saved at `/tmp/item3-engine.patch` — it deserves to be
+    re-tested on an idle machine before being believed or blamed.
+
+    What would settle it: run `check` on gemma-2-2b as the first ANE work after a fresh boot,
+    and again after loading three or four models, and compare. That is one command each.
