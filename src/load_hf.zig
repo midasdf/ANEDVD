@@ -84,7 +84,9 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         .layers = c.num_hidden_layers,
         .heads = c.num_attention_heads,
         .kv_heads = c.num_key_value_heads,
-        .head_dim = c.head_dim,
+        // Gemma 4 puts the GLOBAL layers' head dimension in `global_head_dim` (512) and the
+        // sliding layers' in `head_dim` (256); Config's `head_dim` is the global/default one.
+        .head_dim = if (c.global_head_dim > 0) c.global_head_dim else c.head_dim,
         .inter = c.intermediate_size,
         .vocab = c.vocab_size,
         .eps = c.rms_norm_eps,
@@ -119,6 +121,10 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         // An explicit `layer_types` list beats both the pattern and `swa_all`.
         .swa_explicit = c.swa_explicit,
         .swa_layers = c.swa_layers,
+        // Gemma 4 splits the head dimension: `global_head_dim` is the global layers' (512) and
+        // `head_dim` is the sliding layers' (256). Config's `head_dim` is the global/default
+        // one and `head_dim_swa` the sliding one, so the two swap when both are present.
+        .head_dim_swa = if (c.global_head_dim > 0) c.head_dim else 0,
     };
 }
 
@@ -504,6 +510,29 @@ test "a Mistral config windows every layer, a Gemma 2 config alternates" {
     try std.testing.expect(!g.swa_all); // Gemma 2 alternates instead
     try std.testing.expect(g.layerIsSliding(0));
     try std.testing.expect(!g.layerIsSliding(1));
+
+    // Gemma 4's two head dimensions. HF calls the sliding one `head_dim` (256) and the global
+    // one `global_head_dim` (512); Config's `head_dim` is the global/default one, so they swap.
+    // Driven through toModelConfig so deleting the mapping fails the test.
+    var split = base;
+    split.arch = "Gemma4ForConditionalGeneration";
+    split.head_dim = 256;
+    split.global_head_dim = 512;
+    split.sliding_window = 512;
+    split.swa_explicit = true;
+    split.swa_layers[0] = 0b0000_0001; // layer 0 slides
+    const c5 = try toModelConfig(split);
+    try std.testing.expectEqual(@as(u32, 512), c5.head_dim);
+    try std.testing.expectEqual(@as(u32, 256), c5.head_dim_swa);
+    try std.testing.expectEqual(@as(u32, 256), c5.layerHeadDim(0)); // sliding
+    try std.testing.expectEqual(@as(u32, 512), c5.layerHeadDim(1)); // global
+    // One head dim must leave every other architecture exactly as it was.
+    var one = base;
+    one.head_dim = 128;
+    one.global_head_dim = 0;
+    const c6 = try toModelConfig(one);
+    try std.testing.expectEqual(@as(u32, 128), c6.head_dim);
+    try std.testing.expectEqual(@as(u32, 0), c6.head_dim_swa);
 
     // `layer_types` as Gemma 4 ships it: an explicit per-layer list, [sliding x4, full, ...],
     // which no modulo describes. Driven through toModelConfig, not through layerIsSliding

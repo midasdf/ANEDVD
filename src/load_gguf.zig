@@ -187,6 +187,13 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
             cfg.swa_all = true;
         }
     }
+    // Gemma 4 carries two head dimensions: `key_length` for the global layers and
+    // `key_length_swa` for the sliding ones (512 and 256). Config's `head_dim` is the
+    // global/default one, so the plain `key_length` read above already filled it.
+    if (g.getU32(key(&buf, arch, "attention.key_length_swa"))) |swa_hd| {
+        if (swa_hd > 0 and swa_hd != cfg.head_dim) cfg.head_dim_swa = swa_hd;
+    }
+
     // The pattern key overrides the architecture default in both directions: Gemma 3 needs 6
     // where Gemma 2 uses 2, and a non-Gemma model may declare one too. Two shapes exist: a
     // repeating length (Gemma 2/3) and an explicit per-layer list (Gemma 4, whose
@@ -1105,4 +1112,46 @@ test "per-layer FFN widths: the metadata array gives the max, the tensors give e
     // A missing tensor or a wrong in_dim must not be mistaken for a width.
     try std.testing.expect(tensorOutDim(&g, "blk.9.ffn_gate.weight", hidden) == null);
     try std.testing.expect(tensorOutDim(&g, "blk.0.ffn_gate.weight", 7) == null);
+}
+
+test "gemma4's second head dimension is read from key_length_swa" {
+    // `key_length` is the global layers' (512) and `key_length_swa` the sliding layers' (256).
+    // Without this the sliding layers would be run at 512 and the KV cache sized wrong.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 0);
+    try putInt(&bytes, a, u64, 9);
+    try putStr(&bytes, a, "general.architecture", "llama");
+    try putU32Kv(&bytes, a, "llama.embedding_length", 1536);
+    try putU32Kv(&bytes, a, "llama.block_count", 2);
+    try putU32Kv(&bytes, a, "llama.attention.head_count", 8);
+    try putU32Kv(&bytes, a, "llama.attention.head_count_kv", 1);
+    try putU32Kv(&bytes, a, "llama.feed_forward_length", 6144);
+    try putU32Kv(&bytes, a, "llama.vocab_size", 1024);
+    try putU32Kv(&bytes, a, "llama.attention.key_length", 512);
+    try putU32Kv(&bytes, a, "llama.attention.key_length_swa", 256);
+    try putU32Kv(&bytes, a, "llama.attention.sliding_window", 512);
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expectEqual(@as(u32, 512), cfg.head_dim);
+    try std.testing.expectEqual(@as(u32, 256), cfg.head_dim_swa);
+    // head_count_kv is 1, so a KV row is the head dimension itself. This fixture carries no
+    // sliding list, so every layer is non-sliding and uses the global 512 — the 256 is what a
+    // sliding layer will use once `layerIsSliding` says so.
+    try std.testing.expectEqual(@as(usize, 512), cfg.layerKvDim(0));
+    try std.testing.expectEqual(@as(usize, 512), cfg.layerKvDim(1));
+    var sliding = cfg;
+    sliding.sliding_window = 512;
+    sliding.swa_explicit = true;
+    sliding.swa_layers[0] = 0b01; // layer 0 slides
+    try std.testing.expectEqual(@as(usize, 256), sliding.layerKvDim(0));
+    try std.testing.expectEqual(@as(usize, 512), sliding.layerKvDim(1));
+    try std.testing.expectEqual(@as(u32, 8 * 512), sliding.maxQDim());
 }

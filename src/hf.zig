@@ -88,6 +88,9 @@ pub const Config = struct {
     num_key_value_heads: u32,
     /// Defaults to `hidden_size / num_attention_heads`.
     head_dim: u32,
+    /// Gemma 4 names the GLOBAL layers' head dimension separately and calls the other one
+    /// `head_dim`. 0 means there is only one, which is every other architecture.
+    global_head_dim: u32 = 0,
     /// `0` when the config omits it (e.g. some MoE configs).
     intermediate_size: u32,
     vocab_size: u32,
@@ -196,6 +199,7 @@ pub fn loadConfig(allocator: Allocator, dir: []const u8) !Config {
         .num_attention_heads = num_attention_heads,
         .num_key_value_heads = getU32(obj, &.{"num_key_value_heads"}) orelse num_attention_heads,
         .head_dim = head_dim,
+        .global_head_dim = getU32(obj, &.{"global_head_dim"}) orelse 0,
         .intermediate_size = getU32(obj, &.{ "intermediate_size", "n_inner" }) orelse 0,
         .vocab_size = vocab_size,
         .rms_norm_eps = getF32(obj, &.{"rms_norm_eps"}) orelse 1e-6,
