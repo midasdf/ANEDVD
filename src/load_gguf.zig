@@ -455,6 +455,19 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         }
 
         lw.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{li}) catch unreachable, cfg.qDim(), cfg.hidden);
+        // Per-Layer Embeddings (Gemma 4). The three tensors are present on every layer, shared
+        // ones included, and only when the model declares a per-layer input width.
+        if (cfg.ple_dim > 0) {
+            lw.ple_gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.inp_gate.weight", .{li}) catch unreachable, cfg.hidden, cfg.ple_dim);
+            lw.ple_proj = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.proj.weight", .{li}) catch unreachable, cfg.ple_dim, cfg.hidden);
+            lw.ple_post_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_norm.weight", .{li}) catch unreachable, cfg.hidden, cfg);
+            // A scalar, not a vector: the reference holds it as a buffer initialised to ones.
+            if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.layer_output_scale.weight", .{li}) catch unreachable) != null) {
+                const sc = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.layer_output_scale.weight", .{li}) catch unreachable);
+                defer allocator.free(sc);
+                if (sc.len > 0) lw.layer_output_scale = sc[0];
+            }
+        }
         // Qwen3: per-head q/k normalisation, needed by the CPU reference too.
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
             lw.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);

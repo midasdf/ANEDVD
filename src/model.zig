@@ -264,6 +264,15 @@ pub const Matrices = struct {
     down: []f16 = &.{},
     qkv_bias: ?[]f32 = null,
     o_bias: ?[]f32 = null,
+    /// PLE, Gemma 4 only. `ple_gate` is `[ple_dim][hidden]`, `ple_proj` is `[hidden][ple_dim]`
+    /// and `ple_post_norm` is `[hidden]` — the norm applied after the projection. All null when
+    /// the model has no per-layer embeddings, which is every other architecture here.
+    ple_gate: ?[]f16 = null,
+    ple_proj: ?[]f16 = null,
+    ple_post_norm: ?[]f32 = null,
+    /// `blk.N.layer_output_scale`: a scalar every layer ends with, `h *= scale`. Null when the
+    /// file has none.
+    layer_output_scale: ?f32 = null,
 
     pub fn deinit(self: *Matrices, allocator: std.mem.Allocator) void {
         if (self.qkv.len > 0) allocator.free(self.qkv);
@@ -273,6 +282,9 @@ pub const Matrices = struct {
         if (self.down.len > 0) allocator.free(self.down);
         if (self.qkv_bias) |b| allocator.free(b);
         if (self.o_bias) |b| allocator.free(b);
+        if (self.ple_gate) |m| allocator.free(m);
+        if (self.ple_proj) |m| allocator.free(m);
+        if (self.ple_post_norm) |m| allocator.free(m);
         if (self.moe) |*m| m.deinit(allocator);
         self.* = .{};
     }
@@ -546,6 +558,13 @@ pub const LayerWeights = struct {
     /// Gemma 2's sandwich norms: [hidden] each, null when the model has none.
     post_attn_norm: ?[]f32 = null,
     post_ffw_norm: ?[]f32 = null,
+    /// PLE (Gemma 4): `[ple_dim][hidden]`, `[hidden][ple_dim]` and `[hidden]`. Null when the
+    /// model has no per-layer embeddings.
+    ple_gate: ?[]f16 = null,
+    ple_proj: ?[]f16 = null,
+    ple_post_norm: ?[]f32 = null,
+    /// `blk.N.layer_output_scale`: every layer ends with `h *= scale`.
+    layer_output_scale: ?f32 = null,
     /// [(q + k + v) dims][hidden]
     qkv: []f16 = &.{},
     /// [hidden][q_dim]
@@ -572,6 +591,10 @@ pub const LayerWeights = struct {
             .qkv_bias = self.qkv_bias,
             .o_bias = self.o_bias,
             .moe = self.moe,
+            .ple_gate = self.ple_gate,
+            .ple_proj = self.ple_proj,
+            .ple_post_norm = self.ple_post_norm,
+            .layer_output_scale = self.layer_output_scale,
         };
         self.qkv = &.{};
         self.o = &.{};
@@ -580,6 +603,9 @@ pub const LayerWeights = struct {
         self.down = &.{};
         self.qkv_bias = null;
         self.o_bias = null;
+        self.ple_gate = null;
+        self.ple_proj = null;
+        self.ple_post_norm = null;
         // The experts moved with the matrices; leave nothing behind for deinit to
         // free twice.
         self.moe = null;
