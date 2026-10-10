@@ -125,6 +125,7 @@ pub fn toModelConfig(c: hf.Config) !model.Config {
         // `head_dim` is the sliding layers' (256). Config's `head_dim` is the global/default
         // one and `head_dim_swa` the sliding one, so the two swap when both are present.
         .head_dim_swa = if (c.global_head_dim > 0) c.head_dim else 0,
+        .kv_shared_layers = c.num_kv_shared_layers,
     };
 }
 

@@ -67,6 +67,10 @@ pub const Config = struct {
     attn_logit_softcap: f32 = 0,
     /// The same cap applied to the final logits; 0 disables.
     final_logit_softcap: f32 = 0,
+    /// How many of the LAST layers share K/V with earlier ones instead of computing their own.
+    /// Gemma 4 E2B shares 20 of its 35. A shared layer attends with its own queries but reads
+    /// the keys and values of the last non-shared layer of the same attention type.
+    kv_shared_layers: u32 = 0,
     /// The head dimension used by sliding layers when it differs from the global ones. Gemma 4
     /// is 256 on sliding layers and 512 on global ones; 0 means every layer uses `head_dim`.
     head_dim_swa: u32 = 0,
@@ -136,6 +140,31 @@ pub const Config = struct {
 
     pub fn qDim(self: Config) u32 {
         return self.heads * self.head_dim;
+    }
+
+    /// The first layer that shares K/V rather than computing it. 0 when none do.
+    pub fn firstKvSharedLayer(self: Config) u32 {
+        if (self.kv_shared_layers == 0 or self.kv_shared_layers >= self.layers) return self.layers;
+        return self.layers - self.kv_shared_layers;
+    }
+    pub fn isKvShared(self: Config, layer: u32) bool {
+        return layer >= self.firstKvSharedLayer();
+    }
+    /// Where this layer's keys and values come from. A layer that computes its own is its own
+    /// donor. A shared layer borrows from the **last non-shared layer of the same attention
+    /// type** — sliding layers from a sliding donor, global from a global — which is what the
+    /// reference does (`prev_layers[::-1].index(current_layer_type)`), because the two types
+    /// have different head dimensions and must not be mixed.
+    pub fn kvDonor(self: Config, layer: u32) u32 {
+        if (!self.isKvShared(layer)) return layer;
+        const first = self.firstKvSharedLayer();
+        const want_sliding = self.layerIsSliding(layer);
+        var i: u32 = first;
+        while (i > 0) {
+            i -= 1;
+            if (self.layerIsSliding(i) == want_sliding) return i;
+        }
+        return layer; // no donor of the right type: keep its own, which the loader will have
     }
 
     /// The head dimension a particular layer uses. Sliding and global layers may differ: Gemma 4
@@ -803,4 +832,41 @@ test "sliding layers can use their own head dimension" {
     try std.testing.expectEqual(@as(u32, 64), plain.layerHeadDim(7));
     try std.testing.expectEqual(@as(usize, plain.qkvDim()), plain.maxQkvDim());
     try std.testing.expectEqual(@as(usize, plain.kvDim()), plain.layerKvDim(3));
+}
+
+test "a shared layer borrows K/V from the last non-shared layer of the same type" {
+    // Gemma 4 E2B: 35 layers, 20 shared, and its pattern is [sliding x4, full] repeated. The
+    // reference takes the last non-shared layer of the same type, not simply the layer 20 back,
+    // because sliding and global layers have different head dimensions (256 against 512).
+    const layers: u32 = 35;
+    const shared: u32 = 20;
+    var cfg = Config{ .layers = layers, .kv_shared_layers = shared, .sliding_window = 512, .swa_explicit = true };
+    // [sliding x4, full] repeated: layer 4, 9, 14, 19, 24, 29, 34 are full.
+    for (0..layers) |li| {
+        if (li % 5 != 4) cfg.swa_layers[li / 64] |= @as(u64, 1) << @intCast(li % 64);
+    }
+    try std.testing.expectEqual(@as(u32, 15), cfg.firstKvSharedLayer());
+    try std.testing.expect(!cfg.isKvShared(14));
+    try std.testing.expect(cfg.isKvShared(15));
+
+    // The pattern is [sliding, sliding, sliding, sliding, full], so the non-shared SLIDING
+    // layers are 0-3, 5-8, 10-13 and the non-shared FULL ones are 4, 9, 14.
+    // Layer 15 slides, so it borrows from 13, the last sliding layer before 15 — not from 14,
+    // which is full and has a different head dimension.
+    try std.testing.expectEqual(@as(u32, 13), cfg.kvDonor(15));
+    try std.testing.expectEqual(@as(u32, 13), cfg.kvDonor(16)); // 15 is shared, so not a donor
+    // 17 slides as well (only li % 5 == 4 is full), so it also borrows from 13.
+    try std.testing.expectEqual(@as(u32, 13), cfg.kvDonor(17));
+    try std.testing.expectEqual(@as(u32, 13), cfg.kvDonor(18));
+    // 19 IS full (19 % 5 == 4) and is the first shared full layer: donor 14.
+    try std.testing.expectEqual(@as(u32, 14), cfg.kvDonor(19));
+    try std.testing.expectEqual(@as(u32, 14), cfg.kvDonor(24));
+    // A layer that computes its own K/V is its own donor.
+    try std.testing.expectEqual(@as(u32, 3), cfg.kvDonor(3));
+    try std.testing.expectEqual(@as(u32, 14), cfg.kvDonor(14));
+
+    // No sharing configured: every layer is its own donor, which is every other model.
+    const plain = Config{ .layers = 26 };
+    try std.testing.expectEqual(@as(u32, 26), plain.firstKvSharedLayer());
+    for ([_]u32{ 0, 1, 25 }) |li| try std.testing.expectEqual(li, plain.kvDonor(li));
 }

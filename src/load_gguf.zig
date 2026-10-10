@@ -186,6 +186,11 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
             cfg.swa_all = true;
         }
     }
+    // How many of the last layers share K/V instead of computing it (Gemma 4 E2B: 20 of 35).
+    // Verified against the official GGUF: layers 0-14 carry `blk.N.attn_k.weight` and
+    // `blk.N.attn_v.weight` and layers 15-34 do not, while every layer keeps `attn_q`.
+    if (g.getU32(key(&buf, arch, "attention.shared_kv_layers"))) |n| cfg.kv_shared_layers = n;
+
     // Gemma 4 carries two head dimensions: `key_length` for the global layers and
     // `key_length_swa` for the sliding ones (512 and 256). Config's `head_dim` is the
     // global/default one, so the plain `key_length` read above already filled it.
