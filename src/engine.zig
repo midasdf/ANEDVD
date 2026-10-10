@@ -1402,6 +1402,23 @@ pub const Engine = struct {
             reportKernel("ffn(fused)", got[0..hidden], ref[0..hidden]);
         }
 
+        // PLE, which the engine applies at the end of every layer and `diagnose` walks by hand.
+        // Without it the head is fed a different activation than the model produces, and the
+        // lm_head comparison reports BROKEN for a working head — which is exactly what it did.
+        if (cfg.ple_dim > 0) {
+            self.preparePle(token, 0);
+            if (lw.ple_gate) |g| {
+                for (0..hidden) |c| self.h[c] = self.x[c * ch];
+                cpu.pleBlock(self.h[0..hidden], self.ple_in[0..cfg.ple_dim], g, lw.ple_proj.?, lw.ple_post_norm.?, self.ple_scr, self.ple_tmp, cfg.eps);
+                for (0..hidden) |c| self.x[c * ch] = self.h[c];
+            }
+            if (lw.layer_output_scale) |sc| {
+                if (sc != 1.0) {
+                    for (0..hidden) |c| self.x[c * ch] *= sc;
+                }
+            }
+        }
+
         // --- lm head ---
         rmsnormColumn(self.head_in[0..hidden], self.x, self.final_norm, cfg.eps, ch);
         // Use the same chunked path the engine really runs, so this reports on the code
