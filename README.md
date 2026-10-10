@@ -532,6 +532,19 @@ quantisation rather than unified memory:
   tanh-GELU FFN, both logit soft-caps, alternating sliding-window attention and
   the "sandwich" norms — all of them implemented).
 
+  **Gemma 4** is in a category of its own, so it is stated separately. Its text stack works:
+  `anedvd cpu --model gemma-4-E2B-q4_0.gguf --prompt "The capital of France is"` answers
+  `Paris.`, and "The capital of Japan is" answers `Tokyo.` It needs five things no other
+  architecture here does — a per-layer head dimension (256 sliding, 512 global), per-layer FFN
+  widths (6144 or 12288, `use_double_wide_mlp`), an explicit per-layer sliding list, K/V shared by
+  the last 20 of its 35 layers, and per-layer input embeddings (PLE) — plus a nested
+  `text_config`.
+
+  But **only the CPU path is verified**. `check`, `verify` and `run` build ANE kernels and were
+  not run against it, so whether the ANE kernels agree with the reference is untested. And E4B has
+  not been run at all: the CPU reference loads every layer eagerly and E4B's layers are 10240 or
+  20480 wide, which is 8.6 GB against this machine's 8 GB.
+
   *Recognised but not run here*: Mistral, SmolLM3 and Gemma 3. Their configuration is parsed
   and unit-tested — Mistral's window applies to every layer, Gemma 2's alternates 1:1, and
   Gemma 3 repeats over six, all three now read from the config rather than assumed — but no
