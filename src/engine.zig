@@ -19,6 +19,7 @@
 const std = @import("std");
 const sys = @import("sys.zig");
 const cpu = @import("cpu.zig");
+const gguf = @import("gguf.zig");
 const model = @import("model.zig");
 const ane = @import("ane/runtime.zig");
 const mil = @import("ane/mil.zig");
@@ -197,6 +198,11 @@ pub const Engine = struct {
     ple_in: []f32 = &.{},
     ple_scr: []f32 = &.{},
     ple_tmp: []f32 = &.{},
+    /// Borrowed from `Runtime`: the model projection, its norm, and the table's bytes and type.
+    ple_proj: []f16 = &.{},
+    ple_norm: []f32 = &.{},
+    ple_table: []const u8 = &.{},
+    ple_type: u32 = 0,
     /// Contiguous scratch for one column's q/k/v/attention vectors.
     sq: []f32,
     sk: []f32,
@@ -346,6 +352,12 @@ pub const Engine = struct {
         self.rt = rt;
         self.embed = rt.embed;
         self.final_norm = rt.final_norm;
+        // Borrowed, not owned, like `embed` and `norms` above: `Runtime.deinit` frees these.
+        // The table likewise aliases the mapping, so the `Gguf` must outlive the engine.
+        self.ple_proj = rt.ple_proj;
+        self.ple_norm = rt.ple_norm;
+        self.ple_table = rt.ple_table;
+        self.ple_type = rt.ple_table_type;
         self.head = &.{};
         self.norms = rt.norms;
         self.max_seq = opts.max_seq;
@@ -476,7 +488,9 @@ pub const Engine = struct {
             self.ple_emb = try allocator.alloc(f32, cfg.hidden);
             self.ple_row = try allocator.alloc(f32, rows);
             self.ple_proj_out = try allocator.alloc(f32, rows);
-            self.ple_in = try allocator.alloc(f32, rows);
+            // Per column: prefill prepares a whole chunk's worth before the layer loop, since
+            // every layer walks all the columns.
+            self.ple_in = try allocator.alloc(f32, rows * ch);
             self.ple_scr = try allocator.alloc(f32, cfg.ple_dim);
             self.ple_tmp = try allocator.alloc(f32, cfg.hidden);
         }
@@ -531,6 +545,9 @@ pub const Engine = struct {
             const e: f32 = @floatCast(self.embed[@as(usize, token) * hidden + c]);
             self.x[c * ch] = e * cfg.embed_scale;
         }
+        // PLE is computed once per token, before any layer, because every layer needs its slice
+        // of the same result. Empty for every model without per-layer embeddings.
+        if (cfg.ple_dim > 0) self.preparePle(token, 0);
 
         for (self.kernels, 0..) |*k, li| {
             const l_hd: u32 = cfg.layerHeadDim(@intCast(li));
@@ -743,6 +760,25 @@ pub const Engine = struct {
                 for (0..hidden) |c| self.x[c * ch] += self.moe_out[c];
                 self.stats.moe_ns += sys.nowNs() - t_moe;
             }
+            // PLE: Gemma 4 gates, projects and norms a per-layer vector back onto the residual
+            // before the layer's output scale. `x` is strided, so the column is gathered into
+            // `h` for the contiguous arithmetic and scattered back.
+            if (k.ple_gate) |g| {
+                const off: usize = @as(usize, li) * cfg.ple_dim;
+                for (0..hidden) |c| self.h[c] = self.x[c * ch];
+                cpu.pleBlock(
+                    self.h[0..hidden],
+                    self.ple_in[off..][0..cfg.ple_dim],
+                    g,
+                    k.ple_proj.?,
+                    k.ple_post_norm.?,
+                    self.ple_scr,
+                    self.ple_tmp,
+                    cfg.eps,
+                );
+                for (0..hidden) |c| self.x[c * ch] = self.h[c];
+            }
+
             // Gemma 4 scales the whole output of the layer; 1.0 for every other model.
             if (k.out_scale != 1.0) {
                 for (0..hidden) |c| self.x[c * ch] *= k.out_scale;
@@ -851,6 +887,32 @@ pub const Engine = struct {
     /// Q norm and rotary only, for a layer that borrows another layer's K/V. Its own keys
     /// do not exist: no weights were loaded for them, so there is nothing to normalise, rotate
     /// or store.
+    /// Compute every layer's per-layer input vector for one token, into `ple_in`.
+    ///
+    /// The table row is dequantised straight out of the aliased mapping: the table is 23.5e9
+    /// parameters on E2B and one row is used per token, so it is never materialised. The row and
+    /// the model projection of the token's own embedding are combined by `cpu.plePrepare`, which
+    /// also owns the reference's three constants.
+    fn preparePle(self: *Engine, token: u32, col: usize) void {
+        const cfg = self.config;
+        const hidden: usize = cfg.hidden;
+        const rows: usize = @as(usize, cfg.layers) * cfg.ple_dim;
+        // The projection consumes the same scaled embedding the model runs on, not the raw one.
+        for (0..hidden) |c| {
+            const e: f32 = @floatCast(self.embed[@as(usize, token) * hidden + c]);
+            self.ple_emb[c] = e * cfg.embed_scale;
+        }
+        const ttype: gguf.GgmlType = @fromBackingInt(@intCast(self.ple_type));
+        if (gguf.dequantizeRange(ttype, self.ple_table, @as(u64, token) * rows, self.ple_row[0..rows])) |_| {} else |_| {
+            // A malformed table is the only way here: `loadRuntime` refuses a model that declares
+            // PLE without the tensor. Zero rather than stale, so the failure is deterministic.
+            @memset(self.ple_row[0..rows], 0);
+        }
+        cpu.matmulF16(self.ple_proj_out[0..rows], self.ple_proj, self.ple_emb[0..hidden], @intCast(rows), @intCast(hidden));
+        const out = self.ple_in[col * rows ..][0..rows];
+        cpu.plePrepare(out, self.ple_row[0..rows], self.ple_proj_out[0..rows], self.ple_norm, cfg.layers, cfg.ple_dim, cfg.hidden, cfg.eps, self.ple_scr);
+    }
+
     fn ropeQueryOnly(self: *Engine, li: usize, pos: u32, cfg: model.Config, hd: u32) void {
         const norm = &self.norms[li];
         // Per layer: Gemma 4 rotates its sliding layers at a different base from its global ones.
@@ -917,6 +979,11 @@ pub const Engine = struct {
             }
             for (n..ch) |j| {
                 for (0..hidden) |c| self.x[c * ch + j] = 0;
+            }
+            // PLE for the whole chunk before the layer loop, since every layer walks all the
+            // columns and each needs its slice of the same per-token result.
+            if (cfg.ple_dim > 0) {
+                for (0..n) |j| self.preparePle(ids[done + j], j);
             }
 
             for (self.kernels, 0..) |*k, li| {
@@ -1188,6 +1255,25 @@ pub const Engine = struct {
                         for (0..hidden) |c| self.x[c * ch + j] += self.sandwich[c];
                     }
                 }
+                // PLE, per column, before the layer's output scale (the reference order).
+                if (k.ple_gate) |g| {
+                    const off: usize = @as(usize, li) * cfg.ple_dim;
+                    for (0..n) |j| {
+                        for (0..hidden) |c| self.h[c] = self.x[c * ch + j];
+                        cpu.pleBlock(
+                            self.h[0..hidden],
+                            self.ple_in[j * @as(usize, cfg.layers) * cfg.ple_dim + off ..][0..cfg.ple_dim],
+                            g,
+                            k.ple_proj.?,
+                            k.ple_post_norm.?,
+                            self.ple_scr,
+                            self.ple_tmp,
+                            cfg.eps,
+                        );
+                        for (0..hidden) |c| self.x[c * ch + j] = self.h[c];
+                    }
+                }
+
                 // Gemma 4 scales the whole output of a layer. Prefill does every column
                 // of the chunk; decode does its single one.
                 if (k.out_scale != 1.0) {
