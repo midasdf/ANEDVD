@@ -1133,3 +1133,35 @@ rather than an error:
     would not have.
 
     Remaining: PLE (step 5) and the multimodal wrapper (step 6).
+52. **Gemma 4 step 5 (PLE): the complete tensor inventory, read from the official GGUF.** Names
+    collected by range request, so this is what the file has rather than what the architecture
+    paper implies.
+
+    Outside the layers:
+
+        per_layer_token_embd.weight     the per-layer embedding table
+        per_layer_model_proj.weight     hidden -> num_layers * ple_dim
+        per_layer_proj_norm.weight      normalises the projected per-layer inputs
+        token_embd.weight, output_norm.weight, rope_freqs.weight
+
+    On EVERY layer, shared or not (layer 0 shown; the shared ones carry the same set minus
+    attn_k/attn_v):
+
+        blk.0.attn_norm, ffn_norm, post_attention_norm, post_ffw_norm, post_norm   <- FIVE norms
+        blk.0.attn_q_norm, attn_k_norm
+        blk.0.inp_gate.weight        PLE: gates this layer's per-layer input
+        blk.0.proj.weight            PLE: projects it
+        blk.0.layer_output_scale.weight
+
+    So beyond PLE there are two things this engine does not model yet: a fifth norm per layer
+    (`post_norm`, which no other architecture here has) and `layer_output_scale`, a per-layer
+    scalar the reference keeps as a buffer. The reference's flow for the per-layer input is
+    project -> scale by hidden^-0.5 -> reshape to (tokens, layers, ple_dim) -> normalise with
+    `per_layer_projection_norm` -> `(projection + per_layer_input) * 1/sqrt(2)`, and the layer's
+    `inp_gate` gates it before it joins the residual.
+
+    Also from the reference and not yet in this engine, all of which the text path needs: the
+    attention scale is **1.0** (Gemma 4 relies on its Q/K norms, unlike Gemma 2/3's
+    `query_pre_attn_scalar`), V has a norm with **no learned weight**, and the RoPE base differs
+    per layer type (1e6 global against 1e4 sliding — the GGUF carries `rope.freq_base` and
+    `rope.freq_base_swa`, which are read but not yet used per layer).
