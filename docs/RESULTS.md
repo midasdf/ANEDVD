@@ -1341,3 +1341,25 @@ rather than an error:
     Not fixed here. `refForward` is ~80 lines and verifying the fix needs a Gemma 4 CPU run that
     takes minutes, which is not something to start at the end of a round. The line numbers above
     are where it needs to change.
+60. **A debug build found the Gemma 4 segfault that reading the code did not.** `zig build
+    -Doptimize=debug` with bounds checks, run against the real checkpoint, named the line
+    immediately: `main.zig:488`, the gate matmul in `refForward`. The reference used `inter` from
+    the config — the MAXIMUM across layers (12288 on E2B) — for every layer, so layer 0 at 6144
+    wide had `matmulF16` asked for twice the rows its matrix has. Fixed by binding
+    `l_inter = lw.gate.len / hidden` per layer.
+
+    That is the **fourth** instance of the same mistake in this feature:
+
+        1. `loadLayer` (streaming) had none of the per-layer work
+        2. `loadWeights` (eager) had it except the `o` projection
+        3. `refForward` used cfg.head_dim / cfg.qDim() / cfg.kvDim() throughout
+        4. `refForward` used cfg.inter for every layer's FFN
+
+    Each was found by a separate failure, and three of the four by *running* something rather than
+    reading it. The lesson is not "read more carefully" — I did read these — it is that a config
+    full of per-layer fields is a standing invitation to keep using the config-wide ones, and a
+    debug build catches it in one run where reading catches it in four.
+
+    The debug run then got past that and stopped in `loadNorm` -> `g.readF32` while reading
+    `blk.N.post_ffw_norm.weight`, so one more fault remains in `loadWeights`. Recorded with the
+    call chain, not diagnosed.
