@@ -1432,3 +1432,36 @@ rather than an error:
     Worth noting for whoever picks this up: none of the nine faults found in this feature were
     E2B-specific. They were all in the shared loader, the shared reference or the shared engine,
     so E4B should need the same code — the only untested thing about it is its own geometry.
+64. **The "degraded ANE pool" was my own double free, for about a dozen rounds.** `check` and
+    `verify` aborted on every real model while `cpu` was fine, and I attributed it to the ANE
+    program pool being left degraded by a killed Gemma 4 load — the machine-wide pool AGENTS.md
+    describes — and said a reboot was the remedy.
+
+    It was `loadLayer`: `defer allocator.free(q)` **and** an explicit `allocator.free(q)` once `q`
+    had been copied into the combined q||k||v matrix. A double free, reported by malloc as "pointer
+    being freed was not allocated". `cpu` never noticed because it builds no kernels, and
+    `gemma2-tiny` often survived because malloc does not always catch it. `errdefer` is the fix —
+    the same fix `loadWeights` needed two rounds earlier for the same mistake made in the other
+    loader.
+
+    **With it fixed the ANE path works and Gemma 4's layer-0 kernels are verified correct**:
+
+        qkv  rel 3.24041e-4   o  rel 2.64528e-4   ffn(fused)  rel 2.82230e-4     all ok
+
+    107 kernels built in 34 s, and one decode step gives finite logits over the full 262144-entry
+    vocabulary (min -21.5, max 11.8, no NaN).
+
+    Three lessons, all of which cost real time here:
+
+    * **The crash reports had the answer in them and I did not look.** `~/Library/Logs/DiagnosticReports/anedvd-*.ips`
+      contained `LayerWeights.deinit <- ModelWeights.deinit <- cmdCpu` from 13:49 and 14:10. `ls -t`
+      on that directory is one command.
+    * **A stall and an abort are different symptoms of the same bug**, and the abort — after the
+      reboot — is what produced a stack. The reboot did not fix anything; it changed how the
+      corruption surfaced.
+    * **"The machine is in a bad state" is a hypothesis to test, not a conclusion.** I repeated it
+      for many rounds without ever testing it against a build from before the change.
+
+    Still open: `diagnose`'s `lm_head` comparison on Gemma 4 is BROKEN at rel 9.06 (down from
+    24.65 once PLE was applied), so something remains between `diagnose` and the engine on that
+    path.
