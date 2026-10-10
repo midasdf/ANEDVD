@@ -67,6 +67,9 @@ pub const Config = struct {
     attn_logit_softcap: f32 = 0,
     /// The same cap applied to the final logits; 0 disables.
     final_logit_softcap: f32 = 0,
+    /// The head dimension used by sliding layers when it differs from the global ones. Gemma 4
+    /// is 256 on sliding layers and 512 on global ones; 0 means every layer uses `head_dim`.
+    head_dim_swa: u32 = 0,
     /// Sliding-window size for the layers that use it; 0 disables windowing.
     sliding_window: u32 = 0,
     /// Gemma 2 alternates full and sliding attention. The rule, from the reference:
@@ -133,6 +136,39 @@ pub const Config = struct {
 
     pub fn qDim(self: Config) u32 {
         return self.heads * self.head_dim;
+    }
+
+    /// The head dimension a particular layer uses. Sliding and global layers may differ: Gemma 4
+    /// is 256 on sliding layers against 512 on global ones, so a single `head_dim` cannot
+    /// describe it. `head_dim_swa == 0` means every layer uses `head_dim`.
+    pub fn layerHeadDim(self: Config, layer: u32) u32 {
+        if (self.head_dim_swa > 0 and self.layerIsSliding(layer)) return self.head_dim_swa;
+        return self.head_dim;
+    }
+    pub fn layerQDim(self: Config, layer: u32) usize {
+        return @as(usize, self.heads) * self.layerHeadDim(layer);
+    }
+    pub fn layerKvDim(self: Config, layer: u32) usize {
+        return @as(usize, self.kv_heads) * self.layerHeadDim(layer);
+    }
+    pub fn layerQkvDim(self: Config, layer: u32) usize {
+        return self.layerQDim(layer) + 2 * self.layerKvDim(layer);
+    }
+    /// The widest per-layer q/kv widths, for buffers that hold one layer at a time.
+    pub fn maxQDim(self: Config) u32 {
+        return self.heads * @max(self.head_dim, self.head_dim_swa);
+    }
+    pub fn maxKvDim(self: Config) u32 {
+        return self.kv_heads * @max(self.head_dim, self.head_dim_swa);
+    }
+    /// The widest per-layer qkv row, for buffers that hold one layer at a time.
+    pub fn maxQkvDim(self: Config) usize {
+        const hd = @max(self.head_dim, self.head_dim_swa);
+        return @as(usize, self.qkv_heads_count(hd)) * hd;
+    }
+    fn qkv_heads_count(self: Config, hd: u32) u32 {
+        _ = hd;
+        return self.heads + 2 * self.kv_heads;
     }
     pub fn kvDim(self: Config) u32 {
         return self.kv_heads * self.head_dim;
@@ -736,4 +772,35 @@ test "an explicit per-layer list overrides both the pattern and swa_all" {
 
     // Beyond the 128-layer ceiling it must answer rather than read past the array.
     try std.testing.expect(!cfg.layerIsSliding(200));
+}
+
+test "sliding layers can use their own head dimension" {
+    // Gemma 4: sliding layers 256, global layers 512, with one KV head. A single `head_dim`
+    // could not describe it, and the KV cache is allocated per layer precisely because of this.
+    var cfg = Config{
+        .heads = 8,
+        .kv_heads = 1,
+        .head_dim = 512,
+        .head_dim_swa = 256,
+        .sliding_window = 512,
+        .swa_explicit = true,
+    };
+    cfg.swa_layers[0] = 0b001; // only layer 0 slides; layer 1 is global
+
+    try std.testing.expectEqual(@as(u32, 256), cfg.layerHeadDim(0));
+    try std.testing.expectEqual(@as(u32, 512), cfg.layerHeadDim(1));
+    try std.testing.expectEqual(@as(usize, 8 * 256), cfg.layerQDim(0));
+    try std.testing.expectEqual(@as(usize, 8 * 512), cfg.layerQDim(1));
+    try std.testing.expectEqual(@as(usize, 256), cfg.layerKvDim(0)); // one KV head
+    try std.testing.expectEqual(@as(usize, 512), cfg.layerKvDim(1));
+    try std.testing.expectEqual(@as(usize, 8 * 256 + 2 * 256), cfg.layerQkvDim(0));
+    // Buffers holding one layer at a time must fit the widest layer.
+    try std.testing.expectEqual(@as(usize, 8 * 512 + 2 * 512), cfg.maxQkvDim());
+
+    // With no sliding head dim set, every layer is unchanged — which is every other model here.
+    const plain = Config{ .heads = 14, .kv_heads = 2, .head_dim = 64 };
+    try std.testing.expectEqual(@as(u32, 64), plain.layerHeadDim(0));
+    try std.testing.expectEqual(@as(u32, 64), plain.layerHeadDim(7));
+    try std.testing.expectEqual(@as(usize, plain.qkvDim()), plain.maxQkvDim());
+    try std.testing.expectEqual(@as(usize, plain.kvDim()), plain.layerKvDim(3));
 }
