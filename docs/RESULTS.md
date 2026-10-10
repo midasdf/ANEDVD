@@ -1101,3 +1101,20 @@ rather than an error:
       this machine**; the small models and `verify` are, and they stayed green throughout.
     * Re-testing on the next round with the right gates took one command. Parked work plus a
       written-down verification plan beats shipping a change whose evidence is a flaky check.
+50. **Gemma 4 step 4, config half: K/V sharing, measured from the file.** The last 20 of E2B's
+    35 layers do not compute K/V. The reference takes the **last non-shared layer of the same
+    attention type** as the donor — not the layer `num_shared` back — because sliding and global
+    layers have different head dimensions (256 against 512). `Config.kv_shared_layers` plus
+    `firstKvSharedLayer`/`isKvShared`/`kvDonor` now express it, tested over E2B's
+    `[sliding x4, full]` pattern.
+
+    Rather than take that from the source alone, range requests against the official QAT GGUF
+    settled it: `blk.14.attn_k.weight` and `blk.14.attn_v.weight` are present, `blk.15.*` for both
+    is **absent**, and `attn_q.weight` is present on every layer including 34. The shared layers
+    have no K/V weights at all, so the loader must not ask for them and their qkv is Q-only.
+
+    The same fetch showed the shared layers carrying `inp_gate`, `proj` and `layer_output_scale`
+    — which is step 5's PLE, plus a per-layer output scale the reference models as a buffer.
+
+    Engine half still to do: a Q-only qkv kernel for shared layers and attention pointed at the
+    donor's cache. Tests: 132 -> 133.
