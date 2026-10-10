@@ -1996,7 +1996,7 @@ fn cloneForReference(allocator: std.mem.Allocator, path: []const u8, cap: usize)
 /// tool when the question is "ANE vs CPU"; this one answers "which layer".
 fn cmdLayers(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
     if (argv.len < 3) {
-        sys.eprint("usage: anedvd layers <model> --prompt \"...\" [--upto N]\n", .{});
+        sys.eprint("usage: anedvd layers <model> --prompt \"...\" [--upto N] [--max-layers N]\n", .{});
         std.process.exit(2);
     }
     const path = argv[2];
@@ -2018,6 +2018,7 @@ fn cmdLayers(allocator: std.mem.Allocator, argv: []const [:0]const u8) !void {
 
     var eng = try engine_mod.Engine.init(allocator, loaded.rt, loaded.layers, loaded.head, .{
         .max_seq = @intCast(@max(@as(usize, 256), ids.len + 8)),
+        .max_layers = argValue(argv, "--max-layers", 0),
         .verbose = false,
     });
     defer eng.deinit();

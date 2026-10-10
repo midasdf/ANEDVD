@@ -27,6 +27,13 @@ const weights = @import("ane/weights.zig");
 
 pub const Options = struct {
     max_seq: u32 = 2048,
+    /// Build kernels for only the first N layers. 0 means all of them.
+    ///
+    /// The ANE program pool is machine-wide and a large model needs tens of kernels, so a degraded
+    /// pool stalls at the first layer and there is no way to ask a smaller question. This builds a
+    /// prefix, which is enough to check a new architecture's kernel shapes on a machine that
+    /// cannot hold the whole model at once.
+    max_layers: u32 = 0,
     verbose: bool = true,
     /// Activation width every kernel is compiled for. The ANE reads the weights
     /// once per evaluation regardless of width (measured: width 128 costs 5%
@@ -376,8 +383,11 @@ pub const Engine = struct {
             }
             allocator.free(self.kernels);
         }
-        for (0..L) |i| {
-            if (opts.verbose) sys.print("  layer {d}/{d}: loading weights + compiling ANE kernels\n", .{ i + 1, L });
+        // A prefix, when asked for. Everything below shrinks to `built` so deinit and the
+        // forward loops see only what was actually compiled.
+        const build_layers: usize = if (opts.max_layers > 0) @min(L, opts.max_layers) else L;
+        for (0..build_layers) |i| {
+            if (opts.verbose) sys.print("  layer {d}/{d}: loading weights + compiling ANE kernels\n", .{ i + 1, build_layers });
             var m = try layers.load(allocator, @intCast(i));
             defer m.deinit(allocator); // matrices are baked into the kernels now
             self.kernels[i] = try buildLayerKernels(allocator, cfg, &m, @intCast(i), opts, opts.chunk);
@@ -388,6 +398,13 @@ pub const Engine = struct {
             m.ple_proj = null;
             m.ple_post_norm = null;
             built += 1;
+        }
+        if (built < L) {
+            // Shrink so `deinit` and both loops only see compiled layers.
+            self.kernels = self.kernels[0..built];
+            self.norms = self.norms[0..built];
+            self.active_layers = @intCast(built);
+            sys.eprint("note: built {d} of {d} layers (--max-layers); the head still runs.\n", .{ built, L });
         }
         if (opts.verbose) sys.print("  lm head: loading weights + compiling ANE kernel ({d} -> {d})\n", .{ cfg.hidden, cfg.vocab });
         const hw = try head.load(allocator);
