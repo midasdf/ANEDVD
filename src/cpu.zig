@@ -1483,3 +1483,121 @@ test "sampling: with top_k set, no drawn token comes from outside the true top-k
         }
     }
 }
+
+/// One layer's Per-Layer Embedding block, exactly as the Gemma 4 reference writes it:
+///
+///     residual = h
+///     h = gelu_tanh(inp_gate @ h)          # hidden -> ple_dim
+///     h = h * ple                          # elementwise, width ple_dim
+///     h = proj @ h                         # ple_dim -> hidden
+///     h = rmsnorm(h, post_norm)
+///     h = residual + h
+///
+/// `ple` is this layer's per-layer input vector (width `ple_dim`), already combined by
+/// `plePrepare`. `gate` is [ple_dim][hidden], `proj` is [hidden][ple_dim]; `scratch` holds
+/// `ple_dim` values and `tmp` holds `hidden`.
+pub fn pleBlock(
+    x: []f32,
+    ple: []const f32,
+    gate: []const f16,
+    proj: []const f16,
+    post_norm: []const f32,
+    scratch: []f32,
+    tmp: []f32,
+    eps: f32,
+) void {
+    const ple_dim = ple.len;
+    const hidden = x.len;
+    std.debug.assert(scratch.len >= ple_dim and tmp.len >= hidden);
+    std.debug.assert(gate.len == ple_dim * hidden and proj.len == hidden * ple_dim);
+
+    // gate @ h, then the tanh GELU Gemma uses (not SiLU).
+    matmulF16(scratch[0..ple_dim], gate, x, ple_dim, hidden);
+    for (scratch[0..ple_dim]) |*v| v.* = geluTanh(v.*);
+    for (scratch[0..ple_dim], ple) |*v, p| v.* *= p;
+
+    matmulF16(tmp[0..hidden], proj, scratch[0..ple_dim], hidden, ple_dim);
+    rmsnorm(tmp[0..hidden], tmp[0..hidden], post_norm, eps);
+    for (x, tmp[0..hidden]) |*v, t| v.* += t;
+}
+
+/// The model-level half of Per-Layer Embeddings: turn one token's table row and embedding into
+/// the per-layer vectors every layer's `pleBlock` consumes.
+///
+///     table = per_layer_token_embd[token] * sqrt(ple_dim)
+///     proj  = per_layer_model_proj @ embed * hidden^-0.5
+///     per layer l:  ple[l] = (rmsnorm(proj[l], per_layer_proj_norm) + table[l]) * 2^-0.5
+///
+/// Both `table` and `proj` arrive flat, layer-major, with `layers * ple_dim` entries each, and
+/// `out` has the same layout. The three constants are the reference's and are easy to get wrong:
+/// `sqrt(ple_dim)` on the table, `hidden^-0.5` on the model projection, `2^-0.5` on the sum.
+pub fn plePrepare(
+    out: []f32,
+    table: []const f32,
+    proj: []f32,
+    norm: []const f32,
+    layers: u32,
+    ple_dim: u32,
+    hidden: u32,
+    eps: f32,
+    scratch: []f32,
+) void {
+    const per = @as(usize, ple_dim);
+    std.debug.assert(out.len == @as(usize, layers) * per);
+    std.debug.assert(table.len == out.len and proj.len == out.len);
+    std.debug.assert(scratch.len >= per);
+
+    const table_scale = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+    const proj_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden)));
+    const sum_scale = 0.70710678; // 2^-0.5
+    for (0..layers) |l| {
+        const off = l * per;
+        // The `hidden^-0.5` scale belongs to the model projection; applying it here means the
+        // caller cannot forget it, which is why this function takes `proj` unscaled.
+        for (0..per) |i| scratch[i] = proj[off + i] * proj_scale;
+        rmsnorm(scratch[0..per], scratch[0..per], norm, eps);
+        for (0..per) |i| {
+            out[off + i] = (scratch[i] + table[off + i] * table_scale) * sum_scale;
+        }
+    }
+}
+
+test "PLE: the reference's three constants, checked against doing it by hand" {
+    // Two layers, ple_dim 4, hidden 8. Small enough to compute the expected values directly, so
+    // the test pins the constants (sqrt(ple_dim), hidden^-0.5, 2^-0.5) rather than the shapes.
+    const layers: u32 = 2;
+    const ple_dim: u32 = 4;
+    const hidden: u32 = 8;
+    const eps: f32 = 1e-6;
+
+    var table = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }; // layer-major, [layers][ple_dim]
+    var proj = [_]f32{ 1, 1, 1, 1, 2, 2, 2, 2 };
+    var norm = [_]f32{ 1, 1, 1, 1 };
+    var out: [8]f32 = undefined;
+    var scratch: [4]f32 = undefined;
+    plePrepare(&out, &table, &proj, &norm, layers, ple_dim, hidden, eps, &scratch);
+
+    // By hand for layer 0: proj * hidden^-0.5 = 0.353553, rmsnorm of four equal values gives
+    // 1/sqrt(0.125+eps) each, so ~0.99999994 per element; then (that + table*sqrt(4)) * 2^-0.5.
+    const sq4: f32 = 2.0;
+    const rms0: f32 = 1.0 / @sqrt(0.35355339 * 0.35355339 + eps);
+    for (0..4) |i| {
+        const expect = (0.35355339 * rms0 + table[i] * sq4) * 0.70710678;
+        try std.testing.expectApproxEqAbs(expect, out[i], 1e-5);
+    }
+    // Layer 1 has twice the projected value, so its normalised result differs from layer 0's.
+    for (0..4) |i| try std.testing.expect(@abs(out[4 + i] - out[i]) > 1e-4);
+
+    // The block: with a zero `ple` vector the gate output is zeroed, so the residual is returned
+    // unchanged — which is the one case where the answer is knowable without a reference.
+    var x = [_]f32{ 1, -2, 3, -4, 5, -6, 7, -8 };
+    const before = x;
+    var gate: [4 * 8]f16 = @splat(0);
+    var pj: [8 * 4]f16 = @splat(0);
+    var pn: [8]f32 = @splat(1);
+    var sc: [4]f32 = undefined;
+    var tmp: [8]f32 = undefined;
+    var zero_ple: [4]f32 = @splat(0);
+    pleBlock(&x, &zero_ple, &gate, &pj, &pn, &sc, &tmp, eps);
+    for (before, x) |b, got| try std.testing.expectApproxEqAbs(b, got, 1e-6);
+}
