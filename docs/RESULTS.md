@@ -1242,3 +1242,26 @@ rather than an error:
     block — `inp_gate` -> `gelu_tanh` -> times the per-layer vector -> `proj` -> `post_norm` ->
     residual. `gemma4` stays refused until all of that is in, so a partly-applied path cannot
     produce output.
+56. **Gemma 4: all six steps implemented.** The order recorded in finding 46 is done:
+
+    1. the per-layer sliding list (`swa_explicit` + a 128-bit mask, from GGUF bool arrays and HF
+       `layer_types`)
+    2. per-layer FFN widths (from each layer's own tensor; the metadata array gives the max for
+       scratch)
+    3. per-layer head dimensions (256 sliding, 512 global; KV rows allocated per layer)
+    4. K/V sharing (Q-only qkv for the shared tail, attention on the donor's cache,
+       `ropeQueryOnly`)
+    5. PLE (table row read on demand, `per_layer_model_proj`, `plePrepare`/`pleBlock` with the
+       reference's three constants, plus the per-layer RoPE base and output scale)
+    6. the multimodal wrapper's nested `text_config`
+
+    137 tests pass, up from 76 when this work started, and every existing model is unchanged
+    throughout — SmolLM2 both formats, Qwen2.5, gemma2-tiny MATCH; SmolLM2 and Qwen2.5 `check` OK;
+    `run --ab` bit-identical; the tiny MoE's numbers and the 9.5 GB Qwen1.5-MoE load intact.
+
+    **None of it has run on a real Gemma 4 checkpoint.** The design comes from the official QAT
+    GGUF's metadata and tensor names (read by range request), the reference implementation, and
+    unit tests of the arithmetic — not from a working forward pass. `gemma4` is still refused at
+    load, which is what has kept that safe: nothing half-applied can produce output. The 3.35 GB
+    checkpoint is downloading now; the first real test will be `anedvd check` and `verify` against
+    the CPU reference, which is what has caught every previous mistake in this project.
