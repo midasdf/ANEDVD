@@ -1363,3 +1363,27 @@ rather than an error:
     The debug run then got past that and stopped in `loadNorm` -> `g.readF32` while reading
     `blk.N.post_ffw_norm.weight`, so one more fault remains in `loadWeights`. Recorded with the
     call chain, not diagnosed.
+61. **Gemma 4 E2B now runs end to end on the CPU path — and its output is wrong.** The FFN-width
+    fix was the last crash. `anedvd cpu --model gemma-4-E2B-q4_0.gguf --prompt "The capital of
+    France is" --max-tokens 4` completes with **exit 0**:
+
+        cpu reference: gemma4 hidden=1536 layers=35 heads=8/1 rope_adjacent=false
+        prefill 15.46 s, decode 6.83 s
+
+    The text it produces is multilingual noise (`み気の थकान tỷ`), which is what a wrong forward
+    pass looks like, and there is an obvious candidate: **`refForward` does not implement PLE at
+    all.** The engine does — `preparePle` and `cpu.pleBlock` are wired into both its loops — so the
+    reference beside it is computing a different model. That is exactly the shape of the Gemma 2
+    sandwich-norm bug, where `verify` reported MISMATCH for a working model because the reference
+    skipped a term.
+
+    Two other things this round established:
+
+    * The "segfault" in the debug build was **not a crash**: the run completed, printed its top-5
+      and its timings, and the trace I had been reading was Zig's testing allocator reporting a
+      **leak** at exit. `loadNorm` leaks the f32 buffer `readF32` returns when the tensor's length
+      does not match the expected `n` — it returns `error.DimensionMismatch` without freeing `v`.
+      On the real file that path is taken somewhere, which is itself worth knowing.
+    * The release binary had never been re-run after the FFN fix; the last release attempt predated
+      it, which is why I still believed there was a crash. **Re-run the thing you just fixed
+      before concluding anything from a log.**
