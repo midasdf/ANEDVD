@@ -1328,8 +1328,15 @@ pub const Engine = struct {
         const cfg = self.config;
         const ch = self.chunk;
         const hidden: usize = cfg.hidden;
+        // THIS layer's FFN width, from its own matrix: `cfg.inter` is the maximum across layers
+        // (Gemma 4 has 6144 and 12288), and using it for a 6144 layer read past the matrix and
+        // segfaulted — the same mistake the reference had, in the diagnostic beside it.
         const q_dim: usize = cfg.layerQDim(layer);
-        const inter: usize = cfg.inter;
+        // The kernel's OWN row count, not the config's: a sliding layer of Gemma 4 produces
+        // `q` alone when it shares K/V, and half the qkv width otherwise, so asking for
+        // `cfg.qkvDim()` made `readOutputColumnF16` reject the buffer with WrongShape.
+        const qkv_rows: usize = self.kernels[0].qkv_rows;
+        const inter: usize = lw.gate.len / hidden;
 
         // Apply the architecture's embedding scale, as both real forward paths do;
         // without it the per-kernel check would validate a different input than the
@@ -1342,19 +1349,19 @@ pub const Engine = struct {
 
         const ref = try self.allocator.alloc(f32, cfg.vocab);
         defer self.allocator.free(ref);
-        const h32 = try self.allocator.alloc(f32, @max(hidden, @max(cfg.qkvDim(), inter)));
+        const h32 = try self.allocator.alloc(f32, @max(hidden, @max(qkv_rows, inter)));
         defer self.allocator.free(h32);
-        const got = try self.allocator.alloc(f32, @max(cfg.qkvDim(), @max(hidden, inter)));
+        const got = try self.allocator.alloc(f32, @max(qkv_rows, @max(hidden, inter)));
         defer self.allocator.free(got);
 
         // --- qkv ---
         try self.kernels[0].qkv.writeInputColumnF16(0, 0, self.dec_in[0..hidden]);
         try self.kernels[0].qkv.eval();
-        try self.kernels[0].qkv.readOutputColumnF16(0, 0, self.dec_out[0..cfg.qkvDim()]);
+        try self.kernels[0].qkv.readOutputColumnF16(0, 0, self.dec_out[0..qkv_rows]);
         for (0..hidden) |c| h32[c] = @floatCast(self.dec_in[c]);
-        for (0..cfg.qkvDim()) |c| got[c] = @floatCast(self.dec_out[c]);
-        cpu.matmulF16(ref[0..cfg.qkvDim()], lw.qkv, h32[0..hidden], cfg.qkvDim(), hidden);
-        reportKernel("qkv", got[0..cfg.qkvDim()], ref[0..cfg.qkvDim()]);
+        for (0..qkv_rows) |c| got[c] = @floatCast(self.dec_out[c]);
+        cpu.matmulF16(ref[0..qkv_rows], lw.qkv, h32[0..hidden], @intCast(qkv_rows), hidden);
+        reportKernel("qkv", got[0..qkv_rows], ref[0..qkv_rows]);
 
         // --- o projection (fed with the ANE qkv's q part so both see the same x) ---
         for (0..q_dim) |c| self.dec_in[c] = @floatCast(self.dec_out[c]);

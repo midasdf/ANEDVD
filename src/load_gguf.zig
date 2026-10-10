@@ -649,7 +649,13 @@ pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.C
         // Q-only, which `LayerKernels.qkv_rows` picks up from the matrix's length.
         m.qkv = q;
     } else {
-        defer allocator.free(q);
+        // `errdefer`, not `defer`: `q` is freed explicitly below once it has been copied into
+        // `both`, and a plain defer freed it a SECOND time. That is a double free — malloc
+        // reports it as "pointer being freed was not allocated" and aborts, which is what made
+        // every real model fail at layer 1 in `check` and `verify` while `cpu` (which does not
+        // build kernels) was fine. This is the same mistake `loadWeights` had, made again in the
+        // other loader.
+        errdefer allocator.free(q);
         const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{index}) catch unreachable, cfg.hidden, l_kv);
         defer allocator.free(k);
         const v = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.weight", .{index}) catch unreachable, cfg.hidden, l_kv);
