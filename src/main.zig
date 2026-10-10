@@ -344,10 +344,10 @@ fn refForward(
 ) ![]f32 {
     const cfg = mw.config;
     const hidden: usize = cfg.hidden;
-    const q_dim: usize = cfg.qDim();
-    const kv_dim: usize = cfg.kvDim();
+    // The MAXIMA: per-layer widths are bound inside the loop below, but the scratch buffers
+    // here hold one layer at a time and so must fit the widest one.
+    const q_dim: usize = cfg.maxQDim();
     const inter: usize = cfg.inter;
-    const hd: usize = cfg.head_dim;
 
     const x = try allocator.alloc(f32, hidden);
     defer allocator.free(x);
@@ -387,43 +387,51 @@ fn refForward(
     }
 
     for (mw.layers[0..@min(layers, mw.layers.len)], 0..) |*lw, li| {
+        // Per layer, like the engine: Gemma 4's sliding layers carry a different head dimension
+        // and a different q/kv width from its global ones, and using the config-wide values here
+        // walked past the end of layer 0's q and segfaulted.
+        const l_hd: usize = cfg.layerHeadDim(@intCast(li));
+        const l_q_dim: usize = cfg.layerQDim(@intCast(li));
+        const l_kv_dim: usize = cfg.layerKvDim(@intCast(li));
+        const l_qkv_dim: usize = l_q_dim + 2 * l_kv_dim;
+        const l_theta: f32 = cfg.layerRopeTheta(@intCast(li));
         cpu.rmsnorm(h, x, lw.attn_norm, cfg.eps);
-        matmulF16(qkv, lw.qkv, h, cfg.qkvDim(), hidden);
+        matmulF16(qkv, lw.qkv, h, @intCast(l_qkv_dim), hidden);
         if (lw.qkv_bias) |b| cpu.addInPlace(qkv, b);
-        const q = qkv[0..q_dim];
-        const kk = qkv[q_dim..][0..kv_dim];
-        const vv = qkv[q_dim + kv_dim ..][0..kv_dim];
+        const q = qkv[0..l_q_dim];
+        const kk = qkv[l_q_dim..][0..l_kv_dim];
+        const vv = qkv[l_q_dim + l_kv_dim ..][0..l_kv_dim];
         // Qwen3 normalises each head's q/k before RoPE; the reference has to do
         // the same or `verify` reports a mismatch that is the reference's fault.
         if (lw.q_norm) |w| {
             for (0..cfg.heads) |qh| {
-                const v = q[qh * cfg.head_dim ..][0..cfg.head_dim];
+                const v = q[qh * l_hd ..][0..l_hd];
                 cpu.rmsnorm(v, v, w, cfg.eps);
             }
         }
         if (lw.k_norm) |w| {
             for (0..cfg.kv_heads) |kh| {
-                const v = kk[kh * cfg.head_dim ..][0..cfg.head_dim];
+                const v = kk[kh * l_hd ..][0..l_hd];
                 cpu.rmsnorm(v, v, w, cfg.eps);
             }
         }
         if (cfg.rope_adjacent) {
-            cpu.ropeAdjacent(q, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
-            cpu.ropeAdjacent(kk, cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            cpu.ropeAdjacent(q, cfg.heads, @intCast(l_hd), pos, l_theta);
+            cpu.ropeAdjacent(kk, cfg.kv_heads, @intCast(l_hd), pos, l_theta);
         } else {
-            cpu.rope(q, cfg.heads, cfg.head_dim, pos, cfg.rope_theta);
-            cpu.rope(kk, cfg.kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            cpu.rope(q, cfg.heads, @intCast(l_hd), pos, l_theta);
+            cpu.rope(kk, cfg.kv_heads, @intCast(l_hd), pos, l_theta);
         }
-        for (0..kv_dim) |i| {
-            st.k[li][@as(usize, pos) * kv_dim + i] = @floatCast(kk[i]);
-            st.v[li][@as(usize, pos) * kv_dim + i] = @floatCast(vv[i]);
+        for (0..l_kv_dim) |i| {
+            st.k[li][@as(usize, pos) * l_kv_dim + i] = @floatCast(kk[i]);
+            st.v[li][@as(usize, pos) * l_kv_dim + i] = @floatCast(vv[i]);
         }
-        cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, cfg.head_dim, scores, .{
+        cpu.attentionDecode(attn, q, st.k[li], st.v[li], pos + 1, cfg.heads, cfg.kv_heads, @intCast(l_hd), scores, .{
             .logit_softcap = cfg.attn_logit_softcap,
             .scale = cfg.attn_scale,
             .window = if (cfg.layerIsSliding(@intCast(li))) cfg.sliding_window else 0,
         });
-        matmulF16(proj, lw.o, attn, hidden, q_dim);
+        matmulF16(proj, lw.o, attn, hidden, @intCast(l_q_dim));
         if (lw.o_bias) |b| cpu.addInPlace(proj, b);
         // Gemma 2 normalises the attention output before it joins the residual. This was
         // missing here entirely, so `verify` compared the engine against a model with two
@@ -473,7 +481,6 @@ fn refForward(
             cpu.addInPlace(x, proj);
         }
     }
-    _ = hd;
     cpu.rmsnorm(h, x, mw.final_norm, cfg.eps);
     const logits = try allocator.alloc(f32, cfg.vocab);
     matmulF16(logits, mw.headWeights(), h, cfg.vocab, hidden);
