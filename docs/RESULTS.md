@@ -1153,9 +1153,19 @@ rather than an error:
         blk.0.proj.weight            PLE: projects it
         blk.0.layer_output_scale.weight
 
-    So beyond PLE there are two things this engine does not model yet: a fifth norm per layer
-    (`post_norm`, which no other architecture here has) and `layer_output_scale`, a per-layer
-    scalar the reference keeps as a buffer. The reference's flow for the per-layer input is
+    **Correction to what I first wrote here.** I called `post_norm` "a fifth norm per layer,
+    which no other architecture here has", inferring it from the name. It is not a residual norm:
+    the reference calls it `post_per_layer_input_norm`, and it takes PLE's **projected per-layer
+    vector** (width `hidden`) inside the PLE block. So the per-layer tensor names map as
+
+        blk.N.inp_gate.weight         per_layer_input_gate      [ple_dim][hidden]
+        blk.N.proj.weight             per_layer_projection     [hidden][ple_dim]
+        blk.N.post_norm.weight        post_per_layer_input_norm[hidden]
+        blk.N.layer_output_scale.weight  layer_scalar          a scalar buffer, ones initially
+
+    which is a correction of exactly the kind this document keeps recording: reading a name and
+    concluding a role.`layer_output_scale` IS a genuine extra — every layer ends with
+    `hidden_states *= self.layer_scalar`. The reference's flow for the per-layer input is
     project -> scale by hidden^-0.5 -> reshape to (tokens, layers, ple_dim) -> normalise with
     `per_layer_projection_norm` -> `(projection + per_layer_input) * 1/sqrt(2)`, and the layer's
     `inp_gate` gates it before it joins the residual.
@@ -1186,3 +1196,33 @@ rather than an error:
     commit message for the RoPE change went through an **unquoted** heredoc, so the shell ate
     every backticked identifier and left a sentence with holes in it; a quoted delimiter is what
     prevents that.
+54. **Gemma 4 step 5: the exact PLE algorithm, from the reference.** Written down because it is
+    the part that cannot be guessed and every constant matters.
+
+    Once per prompt, for all layers together:
+
+        per_layer_inputs = embed_tokens_per_layer(input_ids)      # [T][layers * ple_dim]
+                                 * sqrt(ple_dim)                  # the table's embed_scale
+        per_layer_inputs = reshape(per_layer_inputs, T, layers, ple_dim)
+
+        proj = per_layer_model_projection(inputs_embeds) * hidden^-0.5   # [T][layers * ple_dim]
+        proj = reshape(proj, T, layers, ple_dim)
+        proj = per_layer_projection_norm(proj)                    # RMSNorm over ple_dim
+
+        per_layer_inputs = (proj + per_layer_inputs) * 2^-0.5
+
+    Then each layer, at the very end of its block:
+
+        residual = h
+        h = inp_gate(h)            # hidden -> ple_dim
+        h = gelu_tanh(h)
+        h = h * per_layer_inputs[:, layer]      # elementwise, width ple_dim
+        h = proj(h)                # ple_dim -> hidden
+        h = post_norm(h)           # i.e. post_per_layer_input_norm, width hidden
+        h = residual + h
+        h = h * layer_output_scale # the per-layer scalar
+
+    Two constants that would be easy to get wrong: the per-layer table is scaled by
+    `sqrt(ple_dim)` (256 -> 16) and the combined vector by `2^-0.5`, and the model projection by
+    `hidden^-0.5`. The main embedding is scaled by `sqrt(hidden)` as Gemma 2/3 are, which this
+    engine already does through `embed_scale`.

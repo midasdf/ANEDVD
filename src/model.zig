@@ -77,8 +77,13 @@ pub const Config = struct {
     rope_theta_swa: f32 = 0,
     /// A per-layer output scale (`blk.N.layer_output_scale`) exists and must be applied.
     layer_output_scale: bool = false,
-    /// A fifth norm per layer (`blk.N.post_norm`) exists. Gemma 4 has it; no other architecture
-    /// here does.
+    /// `blk.N.post_norm.weight` exists: the norm applied after PLE's per-layer projection.
+    ///
+    /// I first described this as "a fifth residual norm per layer", inferring it from the name.
+    /// It is not — the reference calls it `post_per_layer_input_norm`, it takes the projected
+    /// per-layer vector (width `hidden`) and sits inside the PLE block, not on the residual.
+    /// Renamed in the reference's terms would be clearer, but the GGUF name is what the loader
+    /// looks for, so the field keeps it and the comment carries the meaning.
     post_norm: bool = false,
     /// How many of the LAST layers share K/V with earlier ones instead of computing their own.
     /// Gemma 4 E2B shares 20 of its 35. A shared layer attends with its own queries but reads
