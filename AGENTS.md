@@ -280,10 +280,19 @@ Two traps:
   `_ane_helper`, so `rea decompile <path> ane_helper` fails with
   `invalid_request`; drop the name only for provider-free tools.
 * **A universal binary is rejected**: `architecture_unsupported` — "analyze a
-  thinned Mach-O slice instead". `aned` is x86_64 + arm64, so thin it first
-  (`lipo -thin arm64 /usr/libexec/aned -output /tmp/aned-arm64`). Every CLI call
-  is a new process, so a big binary pays Ghidra's import again unless the command
-  is given `--snapshot <file>`.
+  thinned Mach-O slice instead". `aned` is `x86_64 arm64e arm64e.x1` (there is no
+  plain `arm64` slice), so get the names from `lipo -archs` and thin first
+  (`lipo -thin arm64e /usr/libexec/aned -output /tmp/aned-arm64e`). Every CLI call
+  is a new process and Ghidra re-analyzes: **~60 s per query on a 1.4 MB binary**,
+  and `--snapshot` does not help (measured 64.8 s against 60.6 s for the same
+  query). Ask everything you need per run.
+* On a thinned `aned`, `rea search /tmp/aned-arm64e ane --kind procedures` returns
+  1,028 names in ~60 s. They mix two things worth telling apart: `aned`'s **own**
+  code (`+[_ANEProgramCache initialize]`, a local `t` symbol) and the **imported**
+  private-framework symbols REA prints with their source path
+  (`/System/Library/PrivateFrameworks/ANECompiler.framework/...::_ANECCreateModelDictionary`,
+  an undefined `U` symbol). Only the first kind is decompilable here; the
+  framework bodies live in the dyld shared cache.
 
 `rea observe-native-calls` (LLDB, provider-free) works and records entries with
 integer arguments and backtraces, but it is **racy on this machine**: 6 of 8 runs

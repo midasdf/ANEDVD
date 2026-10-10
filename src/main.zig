@@ -347,6 +347,9 @@ fn refForward(
     // The MAXIMA: per-layer widths are bound inside the loop below, but the scratch buffers
     // here hold one layer at a time and so must fit the widest one.
     const q_dim: usize = cfg.maxQDim();
+    // The MAXIMUM: each layer binds its own below, from its own matrix. Gemma 4's layers are
+    // 6144 or 12288 wide, and using the max for every layer read three times past a 6144
+    // matrix. That was the segfault a debug build finally located, at the gate matmul.
     const inter: usize = cfg.inter;
 
     const x = try allocator.alloc(f32, hidden);
@@ -485,10 +488,13 @@ fn refForward(
             if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
             cpu.addInPlace(x, proj);
         } else {
-            matmulF16(gate, lw.gate, h, inter, hidden);
-            matmulF16(up, lw.up, h, inter, hidden);
+            // From the matrix, like the engine does: `lw.gate.len / hidden` is this layer's
+            // width, not the config's maximum.
+            const l_inter: usize = lw.gate.len / hidden;
+            matmulF16(gate, lw.gate, h, @intCast(l_inter), hidden);
+            matmulF16(up, lw.up, h, @intCast(l_inter), hidden);
             cpu.gateMul(act, gate, up, cfg.use_gelu);
-            matmulF16(proj, lw.down, act, hidden, inter);
+            matmulF16(proj, lw.down, act, hidden, @intCast(l_inter));
             if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
             cpu.addInPlace(x, proj);
         }

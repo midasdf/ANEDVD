@@ -69,9 +69,11 @@ them would be attached to every request.
   "analyze a thinned Mach-O slice instead". Get the exact slice names with
   `lipo -archs <file>` (`aned` is `x86_64 arm64e arm64e.x1` — no plain `arm64`)
   and thin first: `lipo -thin arm64e <fat> -output <thin>`.
-* Every CLI call is a new process, so Ghidra re-imports and re-analyzes on each
-  one. Pass the same `--snapshot <file>` to every command on one target to reuse
-  the analysis instead of paying for it per query.
+* Every CLI call is a new process, so Ghidra re-imports and re-analyzes the
+  target each time: a 1.4 MB Mach-O costs ~60 s per query. `--snapshot <file>`
+  retains results for later commands that take Evidence input, but it does **not**
+  avoid that re-analysis — measured 64.8 s against 60.6 s for the same query with
+  the same snapshot. Budget for the wall clock or ask several questions per run.
 * These work with no provider at all: `inspect-macho`, `inspect-signature`,
   `inspect-plist`, `trace-dylib-resolution`, `decode-interface-builder`,
   `inspect-keyed-archive`, `inspect-asset-catalog`,
