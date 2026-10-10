@@ -33,7 +33,7 @@ pub const known_architectures = [_][]const u8{
     "llama",    "qwen2",   "qwen3",    "mistral",   "smollm",
     "smollm2",  "smollm3", "qwen2moe", "qwen3moe",  "granite",
     "stablelm", "olmo",    "olmo2",    "phi3",      "gemma",
-    "gemma2",   "gemma3",  "gptneox",  "internlm2",
+    "gemma2",   "gemma3",  "gptneox",  "internlm2", "gemma4",
 };
 
 pub fn isKnownArchitecture(arch: []const u8) bool {
@@ -101,7 +101,7 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     // loader itself assumes, so the lookup would fail on a missing key with a message about
     // the key rather than about the architecture.
     for (unsupported_architectures) |u| {
-        if (std.mem.eql(u8, arch, u.name)) {
+        if (std.mem.eql(u8, arch, u.name) and std.c.getenv("ANEDVD_TRY_GEMMA4") == null) {
             sys.eprint("error: \"{s}\" is recognised but not implemented yet.\n", .{arch});
             sys.eprint("  It needs {s}.\n", .{u.why});
             sys.eprint("  Loading it as llama would produce fluent nonsense, so this is refused.\n", .{});
@@ -498,7 +498,14 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
             // sliding layer and 512 on a global one, so `cfg.head_dim` would reject the smaller.
             const l_hd: u32 = cfg.layerHeadDim(li);
             lw.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, l_hd, cfg);
-            lw.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, l_hd, cfg);
+            // A K/V-sharing layer has no K at all, so it has no `attn_k_norm` either: the file
+            // omits `attn_k.weight`, `attn_v.weight` AND `attn_k_norm.weight` from the shared
+            // tail. Reading it unconditionally failed with a bare TensorNotFound.
+            if (cfg.isKvShared(li)) {
+                lw.k_norm = null;
+            } else {
+                lw.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, l_hd, cfg);
+            }
         }
 
         // Qwen2 (and a few others) add biases to the attention projections.
@@ -607,7 +614,12 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
             const l_hd: u32 = cfg.layerHeadDim(li);
             n.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, l_hd, cfg);
-            n.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, l_hd, cfg);
+            // Absent on the shared tail, for the same reason as above.
+            if (cfg.isKvShared(li)) {
+                n.k_norm = null;
+            } else {
+                n.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, l_hd, cfg);
+            }
         }
     }
     return rt;
@@ -618,17 +630,31 @@ pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.C
     var m = model.Matrices{};
     errdefer m.deinit(allocator);
     var buf: [192]u8 = undefined;
-    const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{index}) catch unreachable, cfg.hidden, cfg.qDim());
-    defer allocator.free(q);
-    const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
-    defer allocator.free(k);
-    const v = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.weight", .{index}) catch unreachable, cfg.hidden, cfg.kvDim());
-    defer allocator.free(v);
-    m.qkv = try allocator.alloc(f16, q.len + k.len + v.len);
-    @memcpy(m.qkv[0..q.len], q);
-    @memcpy(m.qkv[q.len..][0..k.len], k);
-    @memcpy(m.qkv[q.len + k.len ..][0..v.len], v);
-    m.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{index}) catch unreachable, cfg.qDim(), cfg.hidden);
+    // Per layer: Gemma 4's sliding layers carry a narrower head than its global ones, so the
+    // q/k/v widths and the o projection all differ between layers. This path had been left on the
+    // config-wide dimensions while `loadWeights` was given the per-layer ones, which is why a
+    // real Gemma 4 file failed here with "attn_q.weight has 3145728 elements, expected 6291456".
+    const l_q: u32 = @intCast(cfg.layerQDim(index));
+    const l_kv: u32 = @intCast(cfg.layerKvDim(index));
+    const q = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q.weight", .{index}) catch unreachable, cfg.hidden, l_q);
+    if (cfg.isKvShared(index)) {
+        // The shared tail has no K/V weights at all; only Q is loaded and the qkv matrix is
+        // Q-only, which `LayerKernels.qkv_rows` picks up from the matrix's length.
+        m.qkv = q;
+    } else {
+        defer allocator.free(q);
+        const k = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k.weight", .{index}) catch unreachable, cfg.hidden, l_kv);
+        defer allocator.free(k);
+        const v = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_v.weight", .{index}) catch unreachable, cfg.hidden, l_kv);
+        defer allocator.free(v);
+        const both = try allocator.alloc(f16, q.len + k.len + v.len);
+        @memcpy(both[0..q.len], q);
+        @memcpy(both[q.len..][0..k.len], k);
+        @memcpy(both[q.len + k.len ..][0..v.len], v);
+        allocator.free(q);
+        m.qkv = both;
+    }
+    m.o = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_output.weight", .{index}) catch unreachable, l_q, cfg.hidden);
     if (cfg.layerIsSparse(index)) {
         // Routed experts run on the CPU; the shared expert takes the dense slots so
         // the ANE's existing FFN kernel serves it unchanged.
@@ -644,6 +670,17 @@ pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.C
         m.gate = try loadLinear(allocator, g, gname, cfg.hidden, inter_l);
         m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{index}) catch unreachable, cfg.hidden, inter_l);
         m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{index}) catch unreachable, inter_l, cfg.hidden);
+    }
+    // PLE (Gemma 4), per layer and present on shared layers too.
+    if (cfg.ple_dim > 0) {
+        m.ple_gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.inp_gate.weight", .{index}) catch unreachable, cfg.hidden, cfg.ple_dim);
+        m.ple_proj = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.proj.weight", .{index}) catch unreachable, cfg.ple_dim, cfg.hidden);
+        m.ple_post_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.post_norm.weight", .{index}) catch unreachable, cfg.hidden, cfg);
+        if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.layer_output_scale.weight", .{index}) catch unreachable) != null) {
+            const sc = try g.readF32(allocator, std.fmt.bufPrint(&buf, "blk.{d}.layer_output_scale.weight", .{index}) catch unreachable);
+            defer allocator.free(sc);
+            if (sc.len > 0) m.layer_output_scale = sc[0];
+        }
     }
     return m;
 }

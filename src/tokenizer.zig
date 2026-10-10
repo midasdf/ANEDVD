@@ -298,7 +298,11 @@ pub const Tokenizer = struct {
         last_error_detail = null;
         var is_spm = false;
         if (g.getString("tokenizer.ggml.model")) |model| {
-            if (std.mem.eql(u8, model, "llama")) {
+            // The Gemma family declares the SentencePiece variant it uses by name rather than
+            // calling it "llama": Gemma 4's files say `tokenizer.ggml.model = "gemma4"`, and the
+            // layout is the one already implemented (U+2581 for a leading space, the same
+            // token_type codes). Treating it as unknown refused the whole model.
+            if (std.mem.eql(u8, model, "llama") or std.mem.startsWith(u8, model, "gemma")) {
                 is_spm = true;
             } else if (!std.mem.eql(u8, model, "gpt2") and !std.mem.eql(u8, model, "bpe")) {
                 last_error_detail = "only byte-level BPE (\"gpt2\"/\"bpe\") and SentencePiece (\"llama\") vocabularies are implemented.";
