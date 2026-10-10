@@ -1318,3 +1318,26 @@ rather than an error:
 
     Regression checked on the path that works: 137 tests pass, `anedvd cpu` still answers "Paris"
     on SmolLM2 and Qwen2.5, tiny MoE numbers unchanged.
+59. **The CPU reference segfaults on Gemma 4, and why.** `anedvd cpu` on the real checkpoint exits
+    with **139 (SIGSEGV)**, not an out-of-memory kill as I had assumed:
+
+        cpu reference: gemma4 hidden=1536 layers=35 heads=8/1 rope_adjacent=false
+        prompt (2 tokens):  hi
+        ---
+        Segmentation fault: 11
+
+    The cause is visible in the code. `refForward` in `src/main.zig` still takes its geometry from
+    the config-wide values — `cfg.qDim()` and `cfg.kvDim()` at lines 347-348, `cfg.head_dim` at
+    350 and then at 400, 406, 411-415 and 421 — and the reference's KV cache is allocated from
+    `cfg.kvDim()` as well. On Gemma 4 layer 0 is a SLIDING layer with a 256-wide head
+    (q_dim 2048) while `cfg.head_dim` is the global 512 (q_dim 4096), so the reference walks past
+    the end of the layer's q. The engine was given per-layer geometry; the reference beside it was
+    not.
+
+    That is the third place this same mistake has surfaced — the streaming loader, the eager
+    loader's `o` projection, and now the CPU reference — which is worth stating plainly: **the
+    per-layer head dimension touched four things and I updated them one failure at a time.**
+
+    Not fixed here. `refForward` is ~80 lines and verifying the fix needs a Gemma 4 CPU run that
+    takes minutes, which is not something to start at the end of a round. The line numbers above
+    are where it needs to change.
