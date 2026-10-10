@@ -47,6 +47,9 @@ const LayerKernels = struct {
     /// Rows the qkv kernel produces: `q + 2*kv` for a normal layer, `q` alone for one that
     /// borrows another layer's K/V (Gemma 4's shared tail), whose checkpoint has no K/V weights.
     qkv_rows: u32,
+    /// `blk.N.layer_output_scale`: Gemma 4 ends every layer with `h *= scale`.
+    /// 1.0 when the file has no such tensor, which is every other model here.
+    out_scale: f32 = 1.0,
     o: ane.Kernel,
     /// Fused: [hidden] -> [hidden]. Split: [hidden] -> [2*inter] (gate || up).
     /// For a sparse MoE layer this kernel computes the SHARED expert, which every
@@ -703,6 +706,10 @@ pub const Engine = struct {
                 for (0..hidden) |c| self.x[c * ch] += self.moe_out[c];
                 self.stats.moe_ns += sys.nowNs() - t_moe;
             }
+            // Gemma 4 scales the whole output of the layer; 1.0 for every other model.
+            if (k.out_scale != 1.0) {
+                for (0..hidden) |c| self.x[c * ch] *= k.out_scale;
+            }
         }
 
         // ---- final norm + lm head ----
@@ -1144,6 +1151,13 @@ pub const Engine = struct {
                         for (0..hidden) |c| self.x[c * ch + j] += self.sandwich[c];
                     }
                 }
+                // Gemma 4 scales the whole output of a layer. Prefill does every column
+                // of the chunk; decode does its single one.
+                if (k.out_scale != 1.0) {
+                    for (0..n) |j2| {
+                        for (0..hidden) |c| self.x[c * ch + j2] *= k.out_scale;
+                    }
+                }
             }
 
             // Logits for the last real column, via the width-1 head kernel.
@@ -1471,7 +1485,7 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
 
     if (opts.fuse_ffn and std.c.getenv("ANEDVD_NO_FUSED_FFN") == null) {
         if (makeFusedFfnKernel(allocator, cfg.hidden, ffn_inter, lw.gate, lw.up, lw.down, width)) |fk| {
-            return .{ .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
+            return .{ .out_scale = lw.layer_output_scale orelse 1.0, .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = fk, .ffn_split = false, .moe = moe_keep };
         } else |e| {
             if (opts.verbose) {
                 sys.print("    fused FFN rejected ({s}: {s}); falling back to split kernels\n", .{ @errorName(e), ane.lastError() });
@@ -1487,7 +1501,7 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     errdefer gu_k.deinit();
     var down_k = try makeConvKernel(allocator, ffn_inter, cfg.hidden, lw.down, "down", width);
     errdefer down_k.deinit();
-    return .{ .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep };
+    return .{ .out_scale = lw.layer_output_scale orelse 1.0, .qkv = qkv, .qkv_rows = l_qkv, .o = o, .ffn = gu_k, .ffn_split = true, .down = down_k, .moe = moe_keep };
 }
 
 // ---------------------------------------------------------------------------
