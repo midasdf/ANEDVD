@@ -1226,3 +1226,19 @@ rather than an error:
     `sqrt(ple_dim)` (256 -> 16) and the combined vector by `2^-0.5`, and the model projection by
     `hidden^-0.5`. The main embedding is scaled by `sqrt(hidden)` as Gemma 2/3 are, which this
     engine already does through `embed_scale`.
+55. **Gemma 4 step 5, progress so far.** Applied: the per-layer RoPE base (finding 53) and the
+    per-layer output scale. Loaded but not applied: PLE's `inp_gate`/`proj`/`post_norm` (finding
+    54 has the exact algorithm and its three constants).
+
+    `layer_output_scale` is a scalar every layer ends with — `hidden_states *= self.layer_scalar`
+    in the reference, where it is a buffer. `LayerKernels.out_scale` carries it and both loops
+    apply it at the end of the layer: decode to its one column, prefill to every column of the
+    chunk, the same split the residual already uses. It defaults to 1.0 and no other model here
+    has the tensor, so the multiply is skipped and nothing moves.
+
+    What is left for step 5 is PLE itself: the per-layer table lookup (23.5e9 parameters in a
+    `[262144][35*256]` table, so a row at a time, not all of it), `per_layer_model_proj` with its
+    `hidden^-0.5` scale, `per_layer_proj_norm`, the `2^-0.5` combination, and then the per-layer
+    block — `inp_gate` -> `gelu_tanh` -> times the per-layer vector -> `proj` -> `post_norm` ->
+    residual. `gemma4` stays refused until all of that is in, so a partly-applied path cannot
+    produce output.
