@@ -494,8 +494,11 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
         }
         // Qwen3: per-head q/k normalisation, needed by the CPU reference too.
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
-            lw.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
-            lw.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
+            // The layer's OWN head dimension: Gemma 4's per-head Q/K norms are 256 wide on a
+            // sliding layer and 512 on a global one, so `cfg.head_dim` would reject the smaller.
+            const l_hd: u32 = cfg.layerHeadDim(li);
+            lw.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, l_hd, cfg);
+            lw.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, l_hd, cfg);
         }
 
         // Qwen2 (and a few others) add biases to the attention projections.
@@ -602,8 +605,9 @@ pub fn loadRuntime(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model
         }
         // Qwen3 normalises each head's q/k before RoPE.
         if (g.tensor(std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable) != null) {
-            n.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
-            n.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, cfg.head_dim, cfg);
+            const l_hd: u32 = cfg.layerHeadDim(li);
+            n.q_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_q_norm.weight", .{li}) catch unreachable, l_hd, cfg);
+            n.k_norm = try loadNormFor(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.attn_k_norm.weight", .{li}) catch unreachable, l_hd, cfg);
         }
     }
     return rt;
