@@ -1297,3 +1297,24 @@ rather than an error:
 
     So: the file now parses, the tokenizer accepts it and the load gets past configuration — but a
     complete forward pass has still not run.
+58. **Running Gemma 4 through the CPU path found two more faults, with no ANE needed.** After the
+    ANE pool degraded, `anedvd cpu` was the one path still usable — it is the pure-CPU reference
+    and compiles no kernels. It found:
+
+    * `loadWeights` still used `cfg.qDim()` for the **o projection** while the streaming loader had
+      been fixed: layer 0 is a sliding layer at 8*256 = 2048 against the global 8*512 = 4096.
+      This is the mirror image of the previous round's mistake — first the streaming loader had
+      none of the per-layer work, then the eager one had all of it except `o`. **When two
+      loaders diverge once, compare them tensor family by tensor family rather than fixing the
+      one that failed.**
+    * `neox_archs` listed gemma, gemma2 and gemma3 but not **gemma4**, so its RoPE came out
+      adjacent where the reference uses `is_neox_style=True` (half-split). That convention is
+      listed in AGENTS.md as producing fluent repetition rather than garbage.
+
+    With both fixed the CPU reference loads the whole model and starts the forward pass:
+    `gemma4 hidden=1536 layers=35 heads=8/1 rope_adjacent=false`. It then exited with no output;
+    35 layers of scalar code on a 2B model is the likely cause but that has not been established,
+    so it is recorded as an open question rather than a conclusion.
+
+    Regression checked on the path that works: 137 tests pass, `anedvd cpu` still answers "Paris"
+    on SmolLM2 and Qwen2.5, tiny MoE numbers unchanged.
