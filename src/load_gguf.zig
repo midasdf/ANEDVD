@@ -62,9 +62,10 @@ pub fn isKnownArchitecture(arch: []const u8) bool {
 pub const unsupported_architectures = [_]struct { name: []const u8, why: []const u8 }{
     .{
         .name = "gemma4",
-        // Steps 1-3 are done (per-layer sliding list, per-layer FFN widths, per-layer head
-        // dims); these two remain.
-        .why = "KV sharing across 20 layers and per-layer input embeddings (PLE)",
+        // Steps 1-4 are done (per-layer sliding list, per-layer FFN widths, per-layer head
+        // dims, K/V sharing); PLE is what remains, plus the multimodal wrapper around it.
+        .why = "per-layer input embeddings (PLE: `embed_tokens_per_layer`, " ++
+            "`per_layer_model_projection`, and a per-layer `inp_gate`/`proj`)",
     },
 };
 

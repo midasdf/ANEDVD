@@ -1118,3 +1118,18 @@ rather than an error:
 
     Engine half still to do: a Q-only qkv kernel for shared layers and attention pointed at the
     donor's cache. Tests: 132 -> 133.
+51. **Gemma 4 step 4 done: K/V sharing.** The last 20 of E2B's 35 layers borrow an earlier
+    layer's keys and values. The loader builds a Q-only qkv matrix for them (the checkpoint has
+    no K/V weights — `blk.15.attn_k.weight` is absent where `blk.14.attn_k.weight` is present),
+    `LayerKernels.qkv_rows` carries what the kernel really produces, `ropeQueryOnly` normalises
+    and rotates the layer's own queries and nothing else, and attention reads
+    `cfg.kvDonor(li)`'s cache in both paths.
+
+    **A second memory bug in this feature, and it was mine.** The first version kept the
+    original `defer allocator.free(q)` and added an explicit free — a double free that corrupted
+    the heap on the first model through the path, which `verify` reported as MISMATCH for
+    SmolLM2-135M. Ownership is now stated explicitly instead of implied by a defer. Worth
+    noting that the small models caught it at once; gemma-2-2b's `check` was flaky throughout and
+    would not have.
+
+    Remaining: PLE (step 5) and the multimodal wrapper (step 6).
