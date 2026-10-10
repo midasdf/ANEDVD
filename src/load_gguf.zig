@@ -62,9 +62,10 @@ pub fn isKnownArchitecture(arch: []const u8) bool {
 pub const unsupported_architectures = [_]struct { name: []const u8, why: []const u8 }{
     .{
         .name = "gemma4",
-        .why = "per-layer head dims (512 global, 256 sliding), per-layer FFN widths, an explicit " ++
-            "per-layer sliding/full list, KV sharing across 20 layers, and per-layer input " ++
-            "embeddings (PLE)",
+        // The per-layer sliding list (step 1) and per-layer FFN widths (step 2) are done; the
+        // rest is what still blocks it.
+        .why = "per-layer head dims (512 global, 256 sliding), KV sharing across 20 layers, and " ++
+            "per-layer input embeddings (PLE)",
     },
 };
 
@@ -126,7 +127,11 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
         return Error.MissingTensor;
     };
     cfg.kv_heads = g.getU32(key(&buf, arch, "attention.head_count_kv")) orelse cfg.heads;
-    cfg.inter = g.getU32(key(&buf, arch, "feed_forward_length")) orelse {
+    // `feed_forward_length` is a scalar for most architectures and an ARRAY for Gemma 4, whose
+    // layers are not all the same width (E2B is [6144 x15, 12288 x20, ...]). The scalar read
+    // returned null on an array, so the load failed on a missing key; the max is what scratch
+    // buffers must be sized for, and each layer's own width comes from its tensor below.
+    cfg.inter = interFromMetadata(g, &buf, arch) orelse {
         sys.eprint("gguf: no {s} in this file.\n", .{key(&buf, arch, "feed_forward_length")});
         return Error.MissingTensor;
     };
@@ -260,6 +265,35 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
 }
 
 /// Load a Linear weight as fp16 in ANE conv layout [out][in].
+/// `feed_forward_length`, scalar or array, reduced to the widest layer.
+fn interFromMetadata(g: *const gguf.Gguf, buf: []u8, arch: []const u8) ?u32 {
+    const v = g.getValue(key(buf, arch, "feed_forward_length")) orelse return null;
+    if (v.asU32()) |n| return n;
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return null,
+    };
+    var max: u32 = 0;
+    for (0..arr.data.len()) |i| {
+        const n = switch (arr.data) {
+            .u32 => |d| d[i],
+            .i32 => |d| if (d[i] >= 0) @as(u32, @intCast(d[i])) else continue,
+            .u64 => |d| std.math.cast(u32, d[i]) orelse continue,
+            else => continue,
+        };
+        if (n > max) max = n;
+    }
+    return if (max == 0) null else max;
+}
+
+/// The `out_dim` a 2-D tensor actually has, given its `in_dim`. Shapes are authoritative: a
+/// model may declare one `feed_forward_length` and use several.
+fn tensorOutDim(g: *const gguf.Gguf, name: []const u8, in_dim: u32) ?u32 {
+    const t = g.tensor(name) orelse return null;
+    if (t.dims.len < 2 or t.dims[0] != in_dim) return null;
+    return std.math.cast(u32, t.dims[1]);
+}
+
 fn loadLinear(allocator: std.mem.Allocator, g: *const gguf.Gguf, name: []const u8, in_dim: u32, out_dim: u32) ![]f16 {
     const t = g.tensor(name) orelse {
         sys.eprint("gguf: no tensor {s}\n", .{name});
@@ -399,9 +433,11 @@ pub fn loadWeights(allocator: std.mem.Allocator, g: *const gguf.Gguf, progress: 
             // Sparse layer: the dense ffn_gate/up/down are the shared expert's.
             lw.moe = try loadMoeLayer(allocator, g, cfg, li);
         } else {
-            lw.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
-            lw.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{li}) catch unreachable, cfg.hidden, cfg.inter);
-            lw.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{li}) catch unreachable, cfg.inter, cfg.hidden);
+            const gname = std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{li}) catch unreachable;
+            const inter_l = tensorOutDim(g, gname, cfg.hidden) orelse cfg.inter;
+            lw.gate = try loadLinear(allocator, g, gname, cfg.hidden, inter_l);
+            lw.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{li}) catch unreachable, cfg.hidden, inter_l);
+            lw.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{li}) catch unreachable, inter_l, cfg.hidden);
         }
     }
 
@@ -497,9 +533,11 @@ pub fn loadLayer(allocator: std.mem.Allocator, g: *const gguf.Gguf, cfg: model.C
             m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down_shexp.weight", .{index}) catch unreachable, cfg.shared_inter, cfg.hidden);
         }
     } else {
-        m.gate = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
-        m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{index}) catch unreachable, cfg.hidden, cfg.inter);
-        m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{index}) catch unreachable, cfg.inter, cfg.hidden);
+        const gname = std.fmt.bufPrint(&buf, "blk.{d}.ffn_gate.weight", .{index}) catch unreachable;
+        const inter_l = tensorOutDim(g, gname, cfg.hidden) orelse cfg.inter;
+        m.gate = try loadLinear(allocator, g, gname, cfg.hidden, inter_l);
+        m.up = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_up.weight", .{index}) catch unreachable, cfg.hidden, inter_l);
+        m.down = try loadLinear(allocator, g, std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{index}) catch unreachable, inter_l, cfg.hidden);
     }
     return m;
 }
@@ -1019,4 +1057,52 @@ test "a per-layer sliding list is read from a GGUF bool array" {
     try std.testing.expect(cfg.layerIsSliding(3));
     // The scalar window and the array coexist: swa_all must not also be set.
     try std.testing.expect(!cfg.swa_all);
+}
+
+test "per-layer FFN widths: the metadata array gives the max, the tensors give each layer" {
+    // Gemma 4 declares `feed_forward_length` as an array ([6144 x15, 12288 x20, ...]) and its
+    // layers differ. The scalar read returned null on an array so the load died on a missing
+    // key; the max is what scratch buffers need, and each layer's width must come from its own
+    // tensor, which is why the loader no longer passes `cfg.inter` to `loadLinear`.
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+
+    // Two layers: layer 0 is 64 wide, layer 1 is 128, so the metadata max is 128.
+    const hidden: u32 = 32;
+    try putInt(&bytes, a, u32, 0x4655_4747);
+    try putInt(&bytes, a, u32, 3);
+    try putInt(&bytes, a, u64, 2); // two tensors
+    try putInt(&bytes, a, u64, 6);
+    try putStr(&bytes, a, "general.architecture", "llama");
+    try putU32Kv(&bytes, a, "llama.embedding_length", hidden);
+    try putU32Kv(&bytes, a, "llama.block_count", 2);
+    try putU32Kv(&bytes, a, "llama.attention.head_count", 4);
+    try putU32Kv(&bytes, a, "llama.vocab_size", 64);
+    {
+        const name = "llama.feed_forward_length";
+        try putInt(&bytes, a, u64, name.len);
+        try bytes.appendSlice(a, name);
+        try putInt(&bytes, a, u32, 9); // array
+        try putInt(&bytes, a, u32, 4); // of u32
+        try putInt(&bytes, a, u64, 2);
+        try putInt(&bytes, a, u32, 64);
+        try putInt(&bytes, a, u32, 128);
+    }
+    // tensor infos: ffn_gate for both layers, F32 so the geometry is what is being tested
+    for ([_]struct { n: []const u8, out: u32 }{ .{ .n = "blk.0.ffn_gate.weight", .out = 64 }, .{ .n = "blk.1.ffn_gate.weight", .out = 128 } }) |t| {
+        try putTensor(&bytes, a, t.n, &[_]u64{ hidden, t.out }, 0, 0);
+    }
+    while (bytes.items.len % 32 != 0) try bytes.append(a, 0);
+
+    var g = try gguf.Gguf.fromBytes(a, bytes.items);
+    defer g.deinit();
+    const cfg = try loadConfig(&g);
+    try std.testing.expectEqual(@as(u32, 128), cfg.inter); // the max, for scratch sizing
+    // ...and each layer's own width, which is what the loader now feeds to loadLinear.
+    try std.testing.expectEqual(@as(u32, 64), tensorOutDim(&g, "blk.0.ffn_gate.weight", hidden).?);
+    try std.testing.expectEqual(@as(u32, 128), tensorOutDim(&g, "blk.1.ffn_gate.weight", hidden).?);
+    // A missing tensor or a wrong in_dim must not be mistaken for a width.
+    try std.testing.expect(tensorOutDim(&g, "blk.9.ffn_gate.weight", hidden) == null);
+    try std.testing.expect(tensorOutDim(&g, "blk.0.ffn_gate.weight", 7) == null);
 }

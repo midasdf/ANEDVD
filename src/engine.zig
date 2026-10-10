@@ -1410,7 +1410,15 @@ fn buildLayerKernels(allocator: std.mem.Allocator, cfg: model.Config, lw: *const
     // `shared_inter` and need not equal `inter` (Qwen1.5-MoE: 5632 vs 5632, but the
     // routed experts are 1408). Sizing the kernel from `cfg.inter` would read past
     // the buffer.
-    const ffn_inter: u32 = if (lw.moe != null and cfg.shared_inter > 0) cfg.shared_inter else cfg.inter;
+    // Taken from the layer's own matrices rather than from `cfg.inter`, because a model may
+    // use more than one FFN width (Gemma 4 has 6144 and 12288 across its layers, and its
+    // metadata gives the max). `lw.gate.len / hidden` is the layer's width either way: for a
+    // sparse layer `gate` holds the shared expert, which is what the MoE branch wants too.
+    // For every model that has a single width this is exactly `cfg.inter`.
+    const ffn_inter: u32 = if (lw.moe != null and cfg.shared_inter > 0)
+        cfg.shared_inter
+    else
+        @intCast(lw.gate.len / cfg.hidden);
     // Ownership of the routed experts moves to the returned LayerKernels: the caller
     // frees `lw` as soon as these kernels are built, and the experts have to outlive
     // that (they are used on every token).
