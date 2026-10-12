@@ -832,7 +832,14 @@ pub const Engine = struct {
     /// Vocabulary rows per head kernel. 64k rows keeps the fp16 blob at 64k * hidden * 2
     /// bytes: 300 MB for a 2304-wide model, 128 MB for a 1024-wide one.
     fn headChunkFor(hidden: u32, vocab: u32) u32 {
-        const target: u64 = 512 * 1024 * 1024;
+        // Overridable so the multi-chunk path can be exercised on a model whose head fits in one
+        // chunk. Every model that passes `verify` has had a single-chunk head, and the two that do
+        // not pass — gemma-2-2b and gemma-4-E2B — both need several, which is worth testing
+        // directly rather than inferring from a correlation.
+        const target: u64 = if (std.c.getenv("ANEDVD_HEAD_CHUNK_MB")) |v| blk: {
+            const mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+            break :blk if (mb > 0) mb * 1024 * 1024 else 512 * 1024 * 1024;
+        } else 512 * 1024 * 1024;
         const per_row: u64 = @as(u64, hidden) * 2;
         const rows: u64 = @max(1, target / per_row);
         return @intCast(@min(rows, vocab));
