@@ -1465,3 +1465,31 @@ rather than an error:
     Still open: `diagnose`'s `lm_head` comparison on Gemma 4 is BROKEN at rel 9.06 (down from
     24.65 once PLE was applied), so something remains between `diagnose` and the engine on that
     path.
+65. **Gemma 4 on the ANE, and the exact state of the head-input puzzle.** The ANE path works:
+    107 kernels in 34 s, finite logits over the full 262144-entry vocabulary, and layer-0 kernels
+    verified (qkv 3.24e-4, o 2.65e-4, ffn 2.82e-4, all ok).
+
+    `verify` bisects by depth into gemma-2-2b's signature exactly — `--layers 0` rel 8.22e-1,
+    `--layers 1` 9.50e-2, `--layers 2` 1.77e-1 — so the error originates **before any layer**.
+    The two failing models share one feature the passing ones lack: a final logit soft-cap.
+
+    Ruled out by measurement:
+
+    * **Head chunking.** Every MATCH model happens to be single-chunk and both failures need
+      several, but forcing SmolLM2 to many small chunks (`ANEDVD_HEAD_CHUNK_MB`, an env override
+      added for this) still MATCHes.
+    * **The embedding rows.** For the same token the two sides print identical values:
+      `-1.198000e-2 -1.825000e-2 0.000000e0 9.125000e-3` with `scale=39.191837`, engine and
+      reference both, token 563.
+
+    What remains is a contradiction worth handing on rather than guessing at further:
+
+        |head in|    engine 125.881167   reference 123.791478     (1.7% apart)
+
+    and yet the pre-norm values both sides printed do not equal the embedding either — the
+    embedding's first element is `-1.198000e-2 * 39.191837 = -4.6952e-1`, while the engine printed
+    `self.h[0] = -1.510275e-1` and the reference `x[0] = 2.499133e-2`. **Both** prints disagree
+    with the embedding they were taken after, which means either the prints are reading something
+    other than what they say, or something writes to `x`/`h` between the embedding and the norm
+    in both paths. That is the next thing to check, and it is a smaller question than the one it
+    replaces: one buffer, one write, in each path.
