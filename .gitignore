@@ -3,3 +3,9 @@ zig-out/
 .zig-cache/
 .DS_Store
 probe/*.o
+
+# Other projects that live in this workspace; never part of ANEDVD.
+/zt/
+/_imozuru-port/
+/_imozuru-upstream/
+/imozuru-dsh/

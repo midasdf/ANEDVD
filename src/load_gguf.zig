@@ -156,10 +156,16 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
         // Gemma 2 adds logit soft-capping and alternating sliding-window attention.
         // Both are read from the file, not assumed.
         cfg.use_gelu = true; // gemma 2: hidden_activation = "gelu_pytorch_tanh"
-        // gemma2 uses 1/sqrt(n_embd/n_head) (llama.cpp: f_attention_scale), which is not
-        // 1/sqrt(head_dim) when key_length differs from n_embd/n_head.
-        if (std.mem.eql(u8, arch, "gemma2") and cfg.heads > 0) {
-            cfg.attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden)) / @as(f32, @floatFromInt(cfg.heads)));
+        // Gemma 2 AND Gemma 3 scale by 1/sqrt(n_embd/n_head) (llama.cpp: f_attention_scale),
+        // which is not 1/sqrt(head_dim) when the two differ. gemma-3-270m is the case that
+        // exposed the narrower condition: head_dim 256 against hidden/heads 160, so the engine
+        // was scaling every attention score by 0.0625 where 0.0791 was right — 21% low, on every
+        // layer. Gemma 4 sets its own 1.0 below and overrides this.
+        if (std.mem.startsWith(u8, arch, "gemma") and cfg.heads > 0) {
+            const per_head = @as(f32, @floatFromInt(cfg.hidden)) / @as(f32, @floatFromInt(cfg.heads));
+            if (@abs(per_head - @as(f32, @floatFromInt(cfg.head_dim))) > 0.5) {
+                cfg.attn_scale = 1.0 / @sqrt(per_head);
+            }
         }
         cfg.attn_logit_softcap = g.getF32(key(&buf, arch, "attn_logit_softcapping")) orelse 0;
         cfg.final_logit_softcap = g.getF32(key(&buf, arch, "final_logit_softcapping")) orelse 0;
@@ -209,6 +215,14 @@ pub fn loadConfig(g: *const gguf.Gguf) !model.Config {
     if (g.getU32(key(&buf, arch, "attention.key_length_swa"))) |swa_hd| {
         if (swa_hd > 0 and swa_hd != cfg.head_dim) cfg.head_dim_swa = swa_hd;
     }
+
+    // Gemma 3 uses a 5:1 sliding/global pattern, and its GGUF does NOT carry
+    // `attention.sliding_window_pattern` — measured on gemma-3-270m-it-Q8_0, whose metadata has
+    // head_count, key_length, freq_base, sliding_window and nothing about a pattern. Falling back
+    // to Gemma 2's 2 there gave alternating 1:1 instead of 5:1, so every 6th layer was global
+    // where it should have been sliding and the window was applied on the wrong layers. Inert for
+    // prompts shorter than the window (512), wrong as soon as it binds.
+    if (std.mem.eql(u8, arch, "gemma3")) cfg.swa_pattern = 6;
 
     // The pattern key overrides the architecture default in both directions: Gemma 3 needs 6
     // where Gemma 2 uses 2, and a non-Gemma model may declare one too. Two shapes exist: a
