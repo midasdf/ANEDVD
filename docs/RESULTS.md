@@ -1493,3 +1493,38 @@ rather than an error:
     other than what they say, or something writes to `x`/`h` between the embedding and the norm
     in both paths. That is the next thing to check, and it is a smaller question than the one it
     replaces: one buffer, one write, in each path.
+66. **The `verify` failures correlate exactly with `head_dim != hidden/heads`.** Across every model
+    this project has run:
+
+        model            hidden  heads  head_dim  hidden/heads   verify
+        SmolLM2-135M        576      9        64            64   MATCH
+        Qwen2.5-0.5B        896     14        64            64   MATCH
+        gemma-2-2b         2304      8       256           288   MISMATCH
+        gemma-3-270m        640      4       256           160   MISMATCH
+        gemma-4-E2B        1536      8       512           192   MISMATCH
+
+    Every model where the two are equal passes; every model where they differ fails. That is
+    precisely the condition under which the attention scale is `1/sqrt(hidden/heads)` rather than
+    `1/sqrt(head_dim)` — the gemma quirk recorded in round 10 and, until this round, applied only
+    when `arch == "gemma2"`.
+
+    It does not yet explain the failure, because fixing it did not fix `verify`. gemma3's
+    `attn_scale` is now correct (1/sqrt(160) instead of 1/sqrt(256), a 21% difference on every
+    attention score) and its `check` still passes on every kernel, yet `verify` stays broken:
+    prefill rel went 0.501 -> 0.541, and the engine still answers "the" where the reference
+    answers "Paris". So the scale was one real fault and is fixed; the disagreement has another
+    cause that shares the same trigger.
+
+    What the round established about the engine, on gemma-3-270m:
+
+    * `run --ab` reports `max|diff| = 0.000000e0`, so the engine's prefill and decode agree exactly.
+    * It nevertheless generates **no text** — four decode steps of control tokens — so the engine's
+      logits are wrong, not merely noisy.
+    * `check` passes all four kernel families at layer 0 (qkv 2.5e-4, o 3.2e-4, ffn 1.2e-4, lm_head
+      2.7e-4). `diagnose` walks the layer by hand and skips **rope, the KV cache, attention and
+      the residual add** — so those are the only engine-only code left, and they are what to
+      compare next.
+    * The reference is right: `anedvd cpu` answers "Paris." on the same prompt.
+
+    A perfect correlation across five models is a strong lead but it is not a diagnosis, and this
+    round is a reminder that it can survive one fix and still be pointing at the right family.
