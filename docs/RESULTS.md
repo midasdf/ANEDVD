@@ -1528,3 +1528,30 @@ rather than an error:
 
     A perfect correlation across five models is a strong lead but it is not a diagnosis, and this
     round is a reminder that it can survive one fix and still be pointing at the right family.
+67. **`verify`'s prefill comparison is five times worse than its decode comparison, while the engine
+    is bit-identical to itself.** That is a contradiction, and it narrows the search more than
+    anything since round 10. On gemma-3-270m at `--layers 1`:
+
+        prefill: rel 2.51588e-1   argmax 563 "▁is"      vs 210252 "StdHandle"   (differs)
+        decode:  rel 4.65434e-2   argmax 215661 both                            (agrees)
+
+    and at `--layers 2` both argmaxes agree. Meanwhile `run --ab` reports
+    `max|diff| = 0.000000e0` — the engine's prefill and decode are bit-identical for the same
+    position, on a one-word prompt as well as a five-word one.
+
+    So the engine has one answer per position, and `verify`'s decode comparison accepts it while
+    its prefill comparison does not. Since both comparisons use the same `refForward`, the
+    difference has to be in **what the two comparisons ask for**, not in the model: the prefill
+    line takes the last prompt token, the decode line takes the following token, and the reference
+    is driven once per prompt token in a loop before either. That is where the next round should
+    look — one loop, one buffer, and the position each side believes it is at.
+
+    Also instrumented first, and worth keeping because it removes the layer from suspicion: at
+    layer 0 the engine and the reference agree to fp16 precision on the values that `check` cannot
+    see — the ones after rope, after attention, and after the o projection:
+
+        eng  q0 3.649344e-2  k0 8.847770e-1  attn0 1.513384e0  o0 -2.162000e0
+        ref  q0 3.656168e-2  k0 8.845163e-1  attn0 1.512776e0  o0 -2.160434e0
+
+    0.19%, 0.03%, 0.04% and 0.07%. So rope, the KV write, attention and the residual are all
+    behaving; the disagreement is downstream of the layer, in the comparison or the head path.
