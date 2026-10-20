@@ -524,6 +524,22 @@ quantisation rather than unified memory:
   token reads its experts out of the mapping and multiplies them in scalar code.
   [`research/moe-design.md`](research/moe-design.md) has the arithmetic, the measured
   ceilings and the levers that would move it.
+* **Which models actually produce text, at a glance.** This is the practical table; the numbers
+  behind it are in `docs/RESULTS.md`.
+
+  | Model family | `anedvd cpu` (reference) | ANE engine (`run`/`chat`/`serve`) |
+  |---|---|---|
+  | Llama (SmolLM2, TinyLlama) | correct text | **correct text**, `verify` MATCH |
+  | Qwen2 / Qwen3 | correct text | **correct text**, `verify` MATCH |
+  | Qwen2-MoE (incl. tiny MoE) | correct text | correct text; experts on the CPU |
+  | Gemma 2 / 3 / 4 | **correct text** | **no text** — open numerical fault |
+
+  So for a Gemma model today, use `anedvd cpu` (slow, scalar, correct) or wait for the fault to be
+  found; for Llama and Qwen the ANE path is the one to use and it is verified bit-for-bit against
+  the reference. The Gemma engine fault is recorded in RESULTS.md 67: the kernels all pass, layer
+  0's o-projection agrees to 0.07%, and layer 0's *output* differs 2.8x, which puts the divergence
+  in the FFN or the sandwich norm rather than anywhere upstream of them.
+
 * **Not all architectures are supported, and the two lists below are different.**
   *Run on a real model here* (whole-model ANE-vs-CPU comparison passing, and
   coherent text): Llama (SmolLM2 in both GGUF and HF form, TinyLlama), Qwen2

@@ -479,7 +479,9 @@ fn refForward(
         // Gemma 2 normalises the attention output before it joins the residual. This was
         // missing here entirely, so `verify` compared the engine against a model with two
         // norms per layer fewer and reported MISMATCH for a model that answers correctly.
-        if (lw.post_attn_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
+        if (lw.post_attn_norm) |w| {
+            cpu.rmsnorm(proj, proj, w, cfg.eps);
+        }
         cpu.addInPlace(x, proj);
 
         cpu.rmsnorm(h, x, lw.ffn_norm, cfg.eps);
@@ -513,16 +515,6 @@ fn refForward(
                 const scale = cpu.sigmoid(g);
                 for (proj, shared_out) |*o, s2| o.* += scale * s2;
             }
-            if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
-            cpu.addInPlace(x, proj);
-        } else {
-            // From the matrix, like the engine does: `lw.gate.len / hidden` is this layer's
-            // width, not the config's maximum.
-            const l_inter: usize = lw.gate.len / hidden;
-            matmulF16(gate, lw.gate, h, @intCast(l_inter), hidden);
-            matmulF16(up, lw.up, h, @intCast(l_inter), hidden);
-            cpu.gateMul(act, gate, up, cfg.use_gelu);
-            matmulF16(proj, lw.down, act, hidden, @intCast(l_inter));
             if (lw.post_ffw_norm) |w| cpu.rmsnorm(proj, proj, w, cfg.eps);
             cpu.addInPlace(x, proj);
         }
