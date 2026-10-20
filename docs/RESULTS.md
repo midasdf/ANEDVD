@@ -1555,3 +1555,26 @@ rather than an error:
 
     0.19%, 0.03%, 0.04% and 0.07%. So rope, the KV write, attention and the residual are all
     behaving; the disagreement is downstream of the layer, in the comparison or the head path.
+68. **Two things found, one regression I cannot explain.** Both from instrumenting layer 0 of
+    gemma-3-270m and printing the same buffers on both sides in one run:
+
+    * **The attention half of layer 0 agrees; the FFN half does not.** After the attention residual
+      the engine reads `x[0] = -1.447741e-1` and the reference `-1.447547e-1` — 0.013% apart, fp16
+      noise — and their sandwich-normed attention outputs agree to 0.06%
+      (`-3.099461e-2` against `-3.097521e-2`). By the end of the layer the engine is at
+      `-4.038583e-1` and the reference at `-1.447547e-1`. So rope, the KV write, attention, the
+      o-projection and the post-attention norm are all behaving, and the divergence is in the
+      feed-forward path or the residual that closes it.
+    * A caution about that second number: the reference printed the same value before and after
+      its FFN (`-1.447547e-1` both times), which cannot be right for a model that answers correctly.
+      So one of those two prints is not where I think it is, and the FFN claim above should be read
+      as "the post-attention value agrees and something after it does not" rather than as a located
+      fault.
+
+    **The regression.** `anedvd cpu` on gemma-3-270m answered ` Paris.**Paris**` earlier in this
+    session, right after the attention-scale fix was committed, and prints an empty completion now
+    — top-5 ids `138 236743 107 108 514` at logits around 10, where it used to be `9079` at 39.
+    The working tree is identical to the commit that produced the good answer (`git checkout -- src`
+    and a clean build), `check` still passes, and I have not found the cause. Until it is found, the
+    README's practical table overstates the Gemma row: the CPU path is no longer demonstrated for
+    gemma3, only for gemma-4-E2B earlier in the session.
